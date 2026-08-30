@@ -91,6 +91,9 @@ CRON_TZ=America/New_York
 0 7 * * 1-5   /opt/tradingagents/.venv/bin/python /opt/tradingagents/daily_run.py --analyze >> /opt/tradingagents/logs/cron.log 2>&1
 0 9 * * 1-5   /opt/tradingagents/.venv/bin/python /opt/tradingagents/daily_run.py --execute >> /opt/tradingagents/logs/orders.log 2>&1
 ```
+The 09:00 execute pass **waits until 09:30 ET** (the open) before submitting
+orders — a fill can't happen before the open, and the 60s fill poll would
+otherwise cancel pre-open orders. Dry-runs (`--dry-run`) never wait.
 
 ## Kill switch
 `touch /opt/tradingagents/DISABLE_TRADING`   # analysis runs, no orders

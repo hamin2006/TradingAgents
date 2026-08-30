@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -241,6 +242,15 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     return payload
 
 
+def _seconds_until_open(now: datetime | None = None) -> float:
+    """Seconds until the 09:30 ET regular-session open (0 if already open)."""
+    now = now or datetime.now(ET)
+    open_today = datetime(now.year, now.month, now.day, 9, 30, tzinfo=ET)
+    if now < open_today:
+        return (open_today - now).total_seconds()
+    return 0.0
+
+
 def run_execute(cfg: dict, dry_run: bool = False) -> int:
     if DISABLE_TRADING_FILE.exists() or not cfg.get("trading_enabled", True):
         logger.warning("trading disabled (kill switch); no orders placed")
@@ -252,6 +262,15 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
     if _executed_path(cfg).exists():
         logger.info("orders already executed today; skipping")
         return 0
+
+    # Orders are submitted AT the open and then polled for fills (60s). A fill
+    # can't happen before 09:30 ET, so a pre-open run must wait: submitting
+    # early and polling would time out and cancel a perfectly valid order.
+    # Dry-runs never wait (they're previews).
+    wait = _seconds_until_open()
+    if wait > 0 and not dry_run:
+        logger.info("market opens in %.0fs; waiting before placing orders", wait)
+        time.sleep(wait)
 
     payload = json.loads(ratings_path.read_text(encoding="utf-8"))
     broker = create_broker(cfg)

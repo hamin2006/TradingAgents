@@ -119,6 +119,7 @@ def test_run_execute_places_orders_and_writes_log(cfg):
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
          patch("daily_run.create_broker", return_value=broker), \
          patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
          patch("daily_run.TODAY_ET") as mock_today:
         mock_today.return_value = __import__("datetime").date(2026, 8, 31)
         rc = run_execute(cfg)
@@ -138,6 +139,7 @@ def test_run_execute_idempotent_second_call_skips(cfg):
     broker = MagicMock()
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
          patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
          patch("daily_run.TODAY_ET") as mock_today:
         mock_today.return_value = __import__("datetime").date(2026, 8, 31)
         rc = run_execute(cfg)
@@ -184,3 +186,61 @@ def test_run_analyze_parallelizes(cfg):
     assert max_active >= 2  # at least two ran concurrently
     assert set(payload["ratings"]) == {"A", "B", "C", "D", "E"}
     assert payload["failures"] == []
+
+
+def test_seconds_until_open():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from daily_run import _seconds_until_open
+    ET = ZoneInfo("America/New_York")
+
+    def at(h, m):
+        return datetime(2026, 8, 31, h, m, tzinfo=ET)
+
+    assert _seconds_until_open(at(9, 0)) == 1800.0
+    assert _seconds_until_open(at(8, 30)) == 3600.0
+    assert _seconds_until_open(at(9, 30)) == 0.0
+    assert _seconds_until_open(at(14, 0)) == 0.0
+
+
+def test_run_execute_waits_for_open_when_preopen(cfg):
+    """Orders must be submitted AT the open, not polled-and-cancelled
+    pre-open (a 60s fill poll before 09:30 would cancel the order)."""
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = [{"ticker": "AAPL", "action": "BUY",
+                                                "shares": 10, "filled": 10,
+                                                "avg_price": 101.5}]
+    slept = []
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=1800.0), \
+         patch("daily_run.time.sleep", side_effect=lambda s: slept.append(s)), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg)
+    assert rc == 0
+    assert slept == [1800.0]  # waited for the open before submitting
+    broker.place_market_orders.assert_called_once()
+
+
+def test_run_execute_skips_wait_in_dry_run(cfg):
+    """--dry-run previews orders without waiting for the open."""
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = []  # real broker dry-run returns reports list
+    slept = []
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=1800.0), \
+         patch("daily_run.time.sleep", side_effect=lambda s: slept.append(s)), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg, dry_run=True)
+    assert rc == 0
+    assert slept == []
