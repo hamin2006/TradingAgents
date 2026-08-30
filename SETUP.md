@@ -87,10 +87,15 @@ Run `crontab -e` and add:
 ```cron
 CRON_TZ=America/New_York
 50 6 * * 1-5  /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --healthcheck >> /home/harsh-amin/workplace/TradingAgents/logs/health.log 2>&1
-0 18 * * 0    /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/screener.py --screen >> /home/harsh-amin/workplace/TradingAgents/logs/screener.log 2>&1
+0 6 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/screener.py --screen >> /home/harsh-amin/workplace/TradingAgents/logs/screener.log 2>&1
 0 7 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --analyze >> /home/harsh-amin/workplace/TradingAgents/logs/cron.log 2>&1
 0 9 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --execute >> /home/harsh-amin/workplace/TradingAgents/logs/orders.log 2>&1
 ```
+The 06:00 screen refreshes the momentum ranking **every trading day** before the
+07:00 analysis (the scores are deterministic but prices move daily, so a weekly
+snapshot goes stale). It's free (yfinance only, no LLM cost), takes ~10 min, and
+if it fails the analysis falls back to the last cached pool — never blocks the
+run.
 The 09:00 execute pass **waits until 09:30 ET** (the open) before submitting
 orders — a fill can't happen before the open, and the 60s fill poll would
 otherwise cancel pre-open orders. Dry-runs (`--dry-run`) never wait.

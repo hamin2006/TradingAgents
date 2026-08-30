@@ -128,7 +128,7 @@ Component responsibilities:
 
 ## 5bis. Watchlist curation
 
-**Weekly screen (Sunday 18:00 ET, `screener.py --screen`):**
+**Daily screen (06:00 ET Mon–Fri, `screener.py --screen`):**
 1. Fetch S&P 500 constituents (Wikipedia table; cached weekly in
    `results_dir/universe_sp500.json`; fail-open to last cached universe).
 2. Download ~6 months of daily OHLCV for the universe in a single batch
@@ -247,8 +247,10 @@ CRON_TZ=America/New_York
 0 9 * * 1-5   cd /opt/tradingagents && .venv/bin/python daily_run.py --execute  >> logs/orders.log 2>&1
 ```
 
-The Sunday 18:00 ET screen refreshes the candidate pool before Monday's run. A screen
-failure never blocks the week: `daily_run.py` falls back to the last cached pool with a
+The 06:00 ET daily screen refreshes the candidate pool each trading morning
+before the 07:00 analysis — scores are deterministic but prices move daily, and
+a stale weekly snapshot would rank last week's momentum. A screen failure never
+blocks the run: `daily_run.py` falls back to the last cached pool with a
 warning.
 
 Alternative: a single 07:00 entry that analyzes, sleeps until 09:30, then executes. Two
