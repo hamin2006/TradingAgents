@@ -11,7 +11,8 @@ DEFAULT_WATCHLIST_PATH = Path("watchlist.yaml")
 
 _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
     ["seed_watchlist", "capital", "max_positions", "max_order_value_cap",
-     "screener", "ibkr", "alpaca", "broker", "trading_enabled"]
+     "screener", "ibkr", "alpaca", "broker", "trading_enabled",
+     "analyze_max_workers"]
 )
 
 # App-level defaults for keys the framework does not know about. These live
@@ -24,6 +25,10 @@ APP_DEFAULTS = {
     "max_order_value_cap": None,
     "trading_enabled": True,
     "broker": "alpaca",  # active backend: "alpaca" (default) or "ibkr"
+    # Parallel ticker analyses in the 07:00 pass. The pipeline is IO-bound on
+    # LLM calls, so threads scale ~linearly; keep this modest to respect
+    # provider rate limits (4 = ~10 min per 10 tickers vs ~1.5h sequential).
+    "analyze_max_workers": 4,
     "screener": {
         "universe": "sp500",
         "pool_size": 50,

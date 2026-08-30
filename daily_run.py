@@ -4,6 +4,8 @@ import argparse
 import json
 import logging
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -135,6 +137,54 @@ def _last_close(ticker: str) -> float | None:
         return None
 
 
+# --- parallel analysis -------------------------------------------------------
+
+_MEMORY_WRITE_LOCK = threading.Lock()
+_MEMORY_PATCHED = False
+
+
+def _ensure_memory_write_lock() -> None:
+    """Serialize TradingMemoryLog appends from concurrent analyze workers.
+
+    The framework's memory log appends without internal locking; concurrent
+    propagate() calls (parallel tickers) must not interleave writes into
+    trading_memory.md. Patched once, lazily, from this module so the
+    framework package itself stays untouched.
+    """
+    global _MEMORY_PATCHED
+    if _MEMORY_PATCHED:
+        return
+    import tradingagents.agents.utils.memory as memory_mod
+
+    original = memory_mod.TradingMemoryLog.store_decision
+
+    def locked_store_decision(self, *args, **kwargs):
+        with _MEMORY_WRITE_LOCK:
+            return original(self, *args, **kwargs)
+
+    memory_mod.TradingMemoryLog.store_decision = locked_store_decision
+    _MEMORY_PATCHED = True
+
+
+def _analyze_one(ticker: str, today_str: str, cfg: dict):
+    """Run the full framework pipeline for one ticker with one retry.
+
+    Returns (ticker, rating, error). Runs inside a worker thread, so it must
+    never raise: all failures are reported through the error slot.
+    """
+    try:
+        _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, today_str)
+        return ticker, extract_rating(signal), None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analysis failed for %s: %s", ticker, exc)
+        try:
+            _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, today_str)
+            return ticker, extract_rating(signal), None
+        except Exception as exc2:  # noqa: BLE001
+            logger.error("retry also failed for %s: %s", ticker, exc2)
+            return ticker, None, exc2
+
+
 def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     set_config(cfg)
     memory_log = TradingMemoryLog(cfg)
@@ -158,21 +208,32 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
         watchlist = assemble_watchlist(holdings, pool,
                                        memory_log.load_entries(), cfg, TODAY_ET())
 
-    for ticker in watchlist:
-        try:
-            _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, _today_str())
-            ratings[ticker] = extract_rating(signal)
-            logger.info("%s -> %s", ticker, ratings[ticker])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("analysis failed for %s: %s", ticker, exc)
-            try:
-                _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, _today_str())
-                ratings[ticker] = extract_rating(signal)
-            except Exception as exc2:  # noqa: BLE001
-                logger.error("retry also failed for %s: %s", ticker, exc2)
-                failures.append(ticker)
+    _ensure_memory_write_lock()
+    max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
-    payload = {"date": _today_str(), "ratings": ratings, "failures": failures}
+    def record(result):
+        ticker, rating, error = result
+        if rating is not None:
+            ratings[ticker] = rating
+            logger.info("%s -> %s", ticker, rating)
+        else:
+            failures.append(ticker)
+
+    if max_workers <= 1 or len(watchlist) <= 1:
+        for ticker in watchlist:
+            record(_analyze_one(ticker, _today_str(), cfg))
+    else:
+        logger.info("analyzing %d tickers with %d workers", len(watchlist), max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers,
+                                thread_name_prefix="analyze") as pool:
+            futures = [pool.submit(_analyze_one, t, _today_str(), cfg)
+                       for t in watchlist]
+            for future in as_completed(futures):
+                record(future.result())
+
+    payload = {"date": _today_str(),
+               "ratings": dict(sorted(ratings.items())),
+               "failures": sorted(failures)}
     path = _ratings_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

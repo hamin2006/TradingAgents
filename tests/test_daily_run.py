@@ -150,3 +150,37 @@ def test_main_analyze_dispatch(cfg):
         rc = main(["--analyze", "--tickers", "AAPL,MSFT"])
     assert rc == 0
     mock_run.assert_called_once()
+
+
+def test_run_analyze_parallelizes(cfg):
+    """Ticker analyses run concurrently (thread pool), not sequentially."""
+    import threading
+    import time
+
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+
+    class FakeTradingAgentsGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.25)
+            with state_lock:
+                active -= 1
+            return None, "**Rating**: Hold"
+
+    cfg["analyze_max_workers"] = 4
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
+         patch("daily_run.TradingMemoryLog") as mock_log:
+        mock_log.return_value.load_entries.return_value = []
+        payload = run_analyze(cfg, tickers=["A", "B", "C", "D", "E"])
+    assert max_active >= 2  # at least two ran concurrently
+    assert set(payload["ratings"]) == {"A", "B", "C", "D", "E"}
+    assert payload["failures"] == []
