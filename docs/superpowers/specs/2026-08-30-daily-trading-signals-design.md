@@ -1,6 +1,6 @@
 # Daily Paper-Trading Signals System — Design
 
-Date: 2026-08-30 (rev. 2: automated IBKR paper-trading execution; rev. 3: autonomous watchlist curation)
+Date: 2026-08-30 (rev. 2: automated IBKR paper-trading execution; rev. 3: autonomous watchlist curation; rev. 4: ranked pool queue + protection-capped entry orders)
 Status: Draft
 Framework: TradingAgents v0.3.1 (cloned repo in this directory, used as a library, NOT modified)
 
@@ -28,8 +28,11 @@ kill switch. No live money is ever involved.
   successor to `ib_insync`) talking to IB Gateway running on the VM.
 - **Position tracking is owned by IBKR** — holdings are read from the account at run start;
   the system keeps no separate portfolio bookkeeping.
-- **Entry rule**: a ticker not currently held gets a market-on-open buy when today's rating
-  is Buy or Overweight.
+- **Entry rule**: a ticker not currently held gets a buy order at the market open when
+  today's rating is Buy or Overweight. Buys are **MKT orders with a protection cap**
+  (aux price = previous close × 1.02): filled at the open unless the stock gaps up more
+  than 2%, in which case the order is cancelled rather than overpaid. **Sell orders are
+  plain MKT at the open** (clean exit, no cap).
 - **Exit rule**: a held position is sold at the open when today's rating is Sell or
   Underweight. Rating-based only — no intraday monitoring, no stop-loss/target/time rules
   (deferred, see §3).
@@ -104,8 +107,9 @@ Component responsibilities:
   - `seed_watchlist` (static fallback list for the first run before any screen exists),
     `llm_provider`, `quick_think_llm`, `deep_think_llm`, `output_language`.
   - `capital`, `max_positions` (default 10), `max_order_value_cap`.
-  - `screener`: `universe` ("sp500"), `pool_size` (default 10), `candidate_slots` (default
-    3), `min_watchlist_size` (default 5, test mode 1), `exclusion_days` (default 7).
+  - `screener`: `universe` ("sp500"), `pool_size` (default 50 — a ranked queue, see
+    §5bis), `candidate_slots` (default 3), `min_watchlist_size` (default 5, test mode 1),
+    `exclusion_days` (default 7), `entry_protection_pct` (default 2.0).
   - `ibkr`: `host`, `port` (default 7497 paper), `client_id`.
   - Kill switch: `trading_enabled: true` + the file `DISABLE_TRADING` in the repo root
     overrides it to false at runtime.
@@ -115,8 +119,10 @@ Component responsibilities:
   - `score_universe()` — liquidity filter (avg dollar volume ≥ $10M) then momentum
     z-score composite (1m/3m/6m trailing returns + price-vs-50d-SMA + proximity to 52w
     high), ranking the filtered universe.
-  - `build_pool()` — persists the top `pool_size` ranked tickers + their scores to
-    `results_dir/pool_YYYY-WW.json` (week-keyed).
+  - `build_pool()` — persists the **ranked queue**: every scored ticker (not just a top-10
+    cut) plus their scores, ordered by score, to `results_dir/pool_YYYY-WW.json`
+    (week-keyed). The daily run draws from the top of this queue (§5bis), so a 3/day draw
+    with a 7-day exclusion can never exhaust the week's candidates.
   - Failure mode: if the weekly screen dies, the daily run falls back to the last cached
     pool with a warning — never blocks Monday's analysis.
 
@@ -130,17 +136,20 @@ Component responsibilities:
 3. Liquidity filter first: average dollar volume ≥ $10M (tradability guard).
 4. Momentum composite (deterministic, $0): z-scores of 1m / 3m / 6m trailing returns,
    price vs 50-day SMA spread, and proximity to the 52-week high, summed per ticker.
-5. Persist the top `pool_size` (default 10) tickers + scores to
-   `results_dir/pool_YYYY-WW.json`.
+5. Persist the **full ranked queue** (all scored tickers, ordered by score) to
+   `results_dir/pool_YYYY-WW.json`. `pool_size` (default 50) caps how deep the daily
+   run may draw from; with 3 candidates/day and a 7-day exclusion the queue cannot be
+   exhausted mid-week.
 
 **Daily assembly (`daily_run.py --analyze`, before analysis):**
-1. `candidates = top candidate_slots (default 3) pool members`, excluding:
+1. `candidates = top candidate_slots (default 3) pool members`, drawn from the ranked
+   queue in score order, excluding:
    - tickers currently held in IBKR,
    - tickers analyzed within the last `exclusion_days` (default 7) — prevents churn,
    - tickers the memory log shows rated Sell/Underweight in the last 7 days.
 2. `watchlist_today = holdings ∪ candidates`.
 3. Minimum gate: if `watchlist_today` size < `min_watchlist_size` (default 5 in
-   production, 1 in test mode), top up from the next pool members; if the pool is
+   production, 1 in test mode), top up from the next pool members; if the queue is
    exhausted and the gate still fails, abort the run loudly (no partial execution).
 4. First run before any pool exists: use `seed_watchlist` from `watchlist.yaml`.
 
@@ -155,12 +164,14 @@ Pure function — no I/O — so it is fully unit-testable:
 
 ```
 Inputs:  today's ratings {ticker: Rating}, current holdings {ticker: shares},
-         last close prices, capital, max_positions
-Outputs: order list [ {ticker, action: BUY|SELL, shares, reason} ]
+         last close prices, capital, max_positions, entry_protection_pct
+Outputs: order list [ {ticker, action: BUY|SELL, shares, reason, protection_price?} ]
 
 Rules (in order):
-1. HOLDING + rating Sell/Underweight  → SELL whole position (reason: rating exit)
-2. NOT holding + rating Buy/Overweight → BUY equal-weight slice (reason: entry)
+1. HOLDING + rating Sell/Underweight  → SELL whole position, plain MKT (reason: rating exit)
+2. NOT holding + rating Buy/Overweight → BUY equal-weight slice as MKT-with-protection
+   (aux limit = last_close × (1 + entry_protection_pct), default 2%); if the open gaps
+   beyond the cap the order is cancelled, never overpaid (reason: entry)
 3. Everything else → no order
 Sizing: slice = capital / max_positions (default 10, independent of watchlist size);
         shares = floor(slice / last_close);
@@ -190,8 +201,9 @@ Provider: `openrouter` (`OPENROUTER_API_KEY`), cheap 2-tier split:
 - `deep_think_llm` (Research Manager, Portfolio Manager judges):
   `deepseek/deepseek-v4-pro` or `z-ai/glm-4.7`.
 
-Expected cost: ~$0.10–0.50 per ticker per day → ~$15–100/month for a 7-ticker watchlist
-at one run/day. Models are configurable in `watchlist.yaml`; any OpenRouter slug works.
+Expected cost: ~$0.10–0.50 per ticker per day. With a watchlist of up to ~13 tickers
+(10 holdings + 3 candidates) at one run/day: roughly **$10–100/month**. Models are
+configurable in `watchlist.yaml`; any OpenRouter slug works.
 
 ## 8. Data layer (verified against the code)
 
@@ -276,6 +288,8 @@ fails safe with no orders if it is missing).
   - Connection to IBKR lost at execution time → no orders placed, run marked failed.
   - Order log consulted before placement → no double orders after a restart.
   - Max order value cap enforced in the decision engine.
+  - Entry protection cap: a buy that gaps past `entry_protection_pct` above the previous
+    close is cancelled (never overpaid); sells are never capped.
   - Fill timeout (e.g. 60 s) → cancel and log; never leave a stray open order.
 - Framework-level failures (e.g. a vendor outage across all tickers) leave those tickers
   without ratings; the decision engine skips tickers with no rating (no orders).
