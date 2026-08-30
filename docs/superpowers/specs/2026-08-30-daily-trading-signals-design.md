@@ -63,7 +63,9 @@ Component responsibilities:
     memory-log entry via `TradingMemoryLog.load_entries()` for downgrade detection,
     and collects "yesterday's resolved calls" from the memory log.
   - Builds the brief (see §5), writes it to disk first, then calls the notifier.
-  - Writes `daily_summary_YYYY-MM-DD.md` and appends to a per-ticker history file.
+  - Writes `daily_summary_YYYY-MM-DD.md` and appends one line per ticker
+    (date, rating, downgrade flag) to `results_dir/ticker_history.md` for cheap
+    trend spotting.
 - **watchlist.yaml**
   - `watchlist`, `llm_provider`, `quick_think_llm`, `deep_think_llm`, `output_language`,
     notifier settings (`type: console|email`, `email:`, SMTP settings once chosen).
