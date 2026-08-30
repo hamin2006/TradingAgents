@@ -60,3 +60,13 @@ def test_unknown_yaml_key_rejected(tmp_path):
     yaml_path.write_text("nonsense_key: 1\n")
     with pytest.raises(ValueError):
         load_watchlist_config(yaml_path)
+
+
+def test_shipped_watchlist_yaml_loads():
+    from config import DEFAULT_WATCHLIST_PATH, load_watchlist_config
+    cfg = load_watchlist_config(DEFAULT_WATCHLIST_PATH)
+    assert cfg["llm_provider"] == "openrouter"
+    assert cfg["quick_think_llm"].startswith("deepseek/")
+    assert cfg["deep_think_llm"].startswith("deepseek/")
+    assert cfg["screener"]["min_watchlist_size"] == 5
+    assert cfg["screener"]["pool_size"] == 50

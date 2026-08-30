@@ -1,0 +1,26 @@
+# Daily paper-trading configuration. Merge layer over tradingagents/default_config.py.
+seed_watchlist: [AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA]   # used until the first screen
+
+llm_provider: openrouter
+quick_think_llm: deepseek/deepseek-v4-flash
+deep_think_llm: deepseek/deepseek-v4-pro
+output_language: English
+
+capital: 100000            # paper capital
+max_positions: 10          # equal-weight denominator
+max_order_value_cap: 15000 # per-day total buy cap
+
+screener:
+  universe: sp500
+  pool_size: 50            # ranked queue depth the daily draw may use
+  candidate_slots: 3
+  min_watchlist_size: 5    # production gate (test: 1)
+  exclusion_days: 7
+  entry_protection_pct: 2.0
+
+ibkr:
+  host: 127.0.0.1
+  port: 7497               # paper trading port
+  client_id: 1
+
+trading_enabled: true      # false = analysis-only; DISABLE_TRADING file also works
