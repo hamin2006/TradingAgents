@@ -34,7 +34,7 @@ APP_DEFAULTS = {
         "pool_size": 50,
         "candidate_slots": 3,
         "min_watchlist_size": 5,
-        "exclusion_days": 7,
+        "exclusion_days": 4,  # churn guard; daily screens make 7 too long
         "entry_protection_pct": 2.0,
     },
     # Alpaca: secrets come from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars,
