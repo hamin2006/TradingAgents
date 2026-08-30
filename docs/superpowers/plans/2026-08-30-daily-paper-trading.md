@@ -67,6 +67,17 @@ def test_load_missing_file_returns_defaults(tmp_path):
     assert cfg["llm_provider"] == DEFAULT_CONFIG["llm_provider"]
 
 
+def test_defaults_include_app_defaults(tmp_path):
+    """App-level defaults live in config.py (the framework package is
+    unmodifiable), so they must be present even with no yaml file."""
+    cfg = load_watchlist_config(tmp_path / "nope.yaml")
+    assert cfg["screener"]["pool_size"] == 50
+    assert cfg["screener"]["min_watchlist_size"] == 5
+    assert cfg["screener"]["entry_protection_pct"] == 2.0
+    assert cfg["max_positions"] == 10
+    assert cfg["capital"] == 100_000
+
+
 def test_load_yaml_overrides_and_merges(tmp_path):
     yaml_path = tmp_path / "watchlist.yaml"
     yaml_path.write_text(
@@ -105,6 +116,26 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
      "screener", "ibkr", "trading_enabled"]
 )
 
+# App-level defaults for keys the framework does not know about. These live
+# here (not in tradingagents/default_config.py — that package is unmodifiable)
+# so the config always carries them, exactly like the framework's own defaults.
+APP_DEFAULTS = {
+    "seed_watchlist": [],
+    "capital": 100_000,
+    "max_positions": 10,
+    "max_order_value_cap": None,
+    "trading_enabled": True,
+    "screener": {
+        "universe": "sp500",
+        "pool_size": 50,
+        "candidate_slots": 3,
+        "min_watchlist_size": 5,
+        "exclusion_days": 7,
+        "entry_protection_pct": 2.0,
+    },
+    "ibkr": {"host": "127.0.0.1", "port": 7497, "client_id": 1},
+}
+
 
 def merge_over_default(base: dict, overrides: dict) -> dict:
     merged = copy.deepcopy(base)
@@ -118,14 +149,15 @@ def merge_over_default(base: dict, overrides: dict) -> dict:
 
 def load_watchlist_config(path: str | Path | None = None) -> dict:
     path = Path(path) if path else DEFAULT_WATCHLIST_PATH
+    base = merge_over_default(DEFAULT_CONFIG, APP_DEFAULTS)
     if not path.exists():
-        return copy.deepcopy(DEFAULT_CONFIG)
+        return base
     with open(path, encoding="utf-8") as f:
         overrides = yaml.safe_load(f) or {}
     unknown = set(overrides) - _KNOWN_KEYS
     if unknown:
         raise ValueError(f"Unknown watchlist.yaml keys: {sorted(unknown)}")
-    return merge_over_default(DEFAULT_CONFIG, overrides)
+    return merge_over_default(base, overrides)
 ```
 
 (Add `PyYAML` is already a transitive dependency of the framework; no pyproject change needed.)
@@ -133,7 +165,7 @@ def load_watchlist_config(path: str | Path | None = None) -> dict:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_config.py -v`
-Expected: 5 PASS
+Expected: 6 PASS
 
 - [ ] **Step 5: Commit**
 
