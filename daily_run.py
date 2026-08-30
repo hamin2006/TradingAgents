@@ -1,10 +1,22 @@
 """daily_run.py — daily pipeline orchestrator (watchlist assembly first)."""
 
+import argparse
+import json
 import logging
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import yfinance as yf
+
+from config import load_watchlist_config
+from decisions import compute_orders
+from ibkr import IBKRBroker
+from screener import load_pool
+from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.utils.rating import parse_rating
+from tradingagents.dataflows.config import set_config
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 logger = logging.getLogger(__name__)
 
@@ -93,3 +105,149 @@ def assemble_watchlist(holdings, pool, memory_entries, cfg, today):
             f"(pool exhausted, seed insufficient)")
 
     return watchlist
+
+
+# --- orchestrator ---
+
+DISABLE_TRADING_FILE = Path("DISABLE_TRADING")
+
+
+def _today_str() -> str:
+    return TODAY_ET().isoformat()
+
+
+def _ratings_path(cfg: dict) -> Path:
+    return Path(cfg["results_dir"]) / f"ratings_{_today_str()}.json"
+
+
+def _executed_path(cfg: dict) -> Path:
+    return Path(cfg["results_dir"]) / f"executed_{_today_str()}.json"
+
+
+def _last_close(ticker: str) -> float | None:
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if len(hist) < 1:
+            return None
+        return float(hist["Close"].iloc[-1])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
+    set_config(cfg)
+    memory_log = TradingMemoryLog(cfg)
+    ratings: dict[str, str] = {}
+    failures: list[str] = []
+
+    if tickers:
+        watchlist = tickers
+    else:
+        holdings = set()
+        broker = IBKRBroker(cfg)
+        try:
+            broker.connect()
+            holdings, _ = broker.get_positions_and_cash()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not fetch holdings at analyze time (%s); "
+                           "running candidates only — sells are blind today", exc)
+        finally:
+            broker.disconnect()
+        pool = load_pool(cfg)
+        watchlist = assemble_watchlist(holdings, pool,
+                                       memory_log.load_entries(), cfg, TODAY_ET())
+
+    for ticker in watchlist:
+        try:
+            _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, _today_str())
+            ratings[ticker] = extract_rating(signal)
+            logger.info("%s -> %s", ticker, ratings[ticker])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("analysis failed for %s: %s", ticker, exc)
+            try:
+                _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, _today_str())
+                ratings[ticker] = extract_rating(signal)
+            except Exception as exc2:  # noqa: BLE001
+                logger.error("retry also failed for %s: %s", ticker, exc2)
+                failures.append(ticker)
+
+    payload = {"date": _today_str(), "ratings": ratings, "failures": failures}
+    path = _ratings_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    logger.info("ratings written to %s", path)
+    return payload
+
+
+def run_execute(cfg: dict, dry_run: bool = False) -> int:
+    if DISABLE_TRADING_FILE.exists() or not cfg.get("trading_enabled", True):
+        logger.warning("trading disabled (kill switch); no orders placed")
+        return 1
+    ratings_path = _ratings_path(cfg)
+    if not ratings_path.exists():
+        logger.error("no ratings file for today (%s); refusing to execute", ratings_path)
+        return 1
+    if _executed_path(cfg).exists():
+        logger.info("orders already executed today; skipping")
+        return 0
+
+    payload = json.loads(ratings_path.read_text(encoding="utf-8"))
+    broker = IBKRBroker(cfg)
+    try:
+        broker.connect()
+        holdings, cash = broker.get_positions_and_cash()
+        last_close = {}
+        for ticker in set(holdings) | set(payload["ratings"]):
+            last_close[ticker] = _last_close(ticker) or 0.0
+        orders = compute_orders(
+            payload["ratings"], holdings, last_close,
+            capital=float(cfg.get("capital", 100_000)),
+            max_positions=int(cfg.get("max_positions", 10)),
+            max_order_value_cap=cfg.get("max_order_value_cap"),
+            entry_protection_pct=float(cfg.get("screener", {}).get(
+                "entry_protection_pct", 2.0)))
+        reports = broker.place_market_orders(orders, dry_run=dry_run)
+        log = {"date": _today_str(), "dry_run": dry_run,
+               "orders": [o.__dict__ for o in orders], "reports": reports}
+        _executed_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+        _executed_path(cfg).write_text(json.dumps(log, indent=2), encoding="utf-8")
+        return 0
+    finally:
+        broker.disconnect()
+
+
+def healthcheck(cfg: dict) -> bool:
+    broker = IBKRBroker(cfg)
+    try:
+        broker.connect()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        broker.disconnect()
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Daily trading pipeline")
+    parser.add_argument("--analyze", action="store_true", help="morning analysis pass")
+    parser.add_argument("--execute", action="store_true", help="open-time execution pass")
+    parser.add_argument("--healthcheck", action="store_true", help="check IBKR reachability")
+    parser.add_argument("--dry-run", action="store_true", help="print orders without placing")
+    parser.add_argument("--tickers", default=None, help="comma-separated tickers (analyze)")
+    args = parser.parse_args(argv)
+
+    cfg = load_watchlist_config()
+    set_config(cfg)
+
+    if args.healthcheck:
+        ok = healthcheck(cfg)
+        print("IBKR reachable" if ok else "IBKR UNREACHABLE")
+        return 0 if ok else 1
+    if args.analyze:
+        tickers = args.tickers.split(",") if args.tickers else None
+        run_analyze(cfg, tickers)
+        return 0
+    if args.execute:
+        return run_execute(cfg, dry_run=args.dry_run)
+    parser.error("pass --analyze, --execute, or --healthcheck")
+    return 2
