@@ -65,7 +65,7 @@ def test_run_analyze_includes_holdings(cfg):
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
          patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
          patch("daily_run.TradingMemoryLog") as mock_log, \
-         patch("daily_run.IBKRBroker", return_value=broker), \
+         patch("daily_run.create_broker", return_value=broker), \
          patch("daily_run.load_pool", return_value=pool):
         mock_log.return_value.load_entries.return_value = []
         payload = run_analyze(cfg)
@@ -88,7 +88,7 @@ def test_run_analyze_failure_is_isolated(cfg):
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
          patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
          patch("daily_run.TradingMemoryLog") as mock_log, \
-         patch("daily_run.IBKRBroker", return_value=broker):
+         patch("daily_run.create_broker", return_value=broker):
         mock_log.return_value.load_entries.return_value = []
         payload = run_analyze(cfg, tickers=["AAPL", "MSFT"])
     assert payload["ratings"] == {"MSFT": "Hold"}
@@ -117,7 +117,7 @@ def test_run_execute_places_orders_and_writes_log(cfg):
                                                 "shares": 10, "filled": 10,
                                                 "avg_price": 101.5}]
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
-         patch("daily_run.IBKRBroker", return_value=broker), \
+         patch("daily_run.create_broker", return_value=broker), \
          patch("daily_run._last_close", return_value=100.0), \
          patch("daily_run.TODAY_ET") as mock_today:
         mock_today.return_value = __import__("datetime").date(2026, 8, 31)
@@ -137,7 +137,7 @@ def test_run_execute_idempotent_second_call_skips(cfg):
         json.dumps({"orders": []}), encoding="utf-8")
     broker = MagicMock()
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
-         patch("daily_run.IBKRBroker", return_value=broker), \
+         patch("daily_run.create_broker", return_value=broker), \
          patch("daily_run.TODAY_ET") as mock_today:
         mock_today.return_value = __import__("datetime").date(2026, 8, 31)
         rc = run_execute(cfg)

@@ -11,7 +11,7 @@ DEFAULT_WATCHLIST_PATH = Path("watchlist.yaml")
 
 _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
     ["seed_watchlist", "capital", "max_positions", "max_order_value_cap",
-     "screener", "ibkr", "trading_enabled"]
+     "screener", "ibkr", "alpaca", "broker", "trading_enabled"]
 )
 
 # App-level defaults for keys the framework does not know about. These live
@@ -23,6 +23,7 @@ APP_DEFAULTS = {
     "max_positions": 10,
     "max_order_value_cap": None,
     "trading_enabled": True,
+    "broker": "alpaca",  # active backend: "alpaca" (default) or "ibkr"
     "screener": {
         "universe": "sp500",
         "pool_size": 50,
@@ -31,6 +32,11 @@ APP_DEFAULTS = {
         "exclusion_days": 7,
         "entry_protection_pct": 2.0,
     },
+    # Alpaca: secrets come from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars,
+    # never from yaml. paper=True is the safe default; flip only with intent.
+    "alpaca": {"paper": True},
+    # IBKR (kept for the flip to a paper Gateway): host/port of the local
+    # Gateway, not account credentials.
     "ibkr": {"host": "127.0.0.1", "port": 7497, "client_id": 1},
 }
 

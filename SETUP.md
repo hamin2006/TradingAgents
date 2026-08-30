@@ -1,6 +1,10 @@
 # Daily Paper-Trading Setup (Ubuntu 24.04)
 
-## Keys & IBKR setup (do this first)
+> **Active broker: Alpaca** (paper). IBKR stays supported via `broker: ibkr`
+> in `watchlist.yaml` for when you want the extra fill fidelity of a paper
+> Gateway — see the IBKR section at the bottom.
+
+## Keys & broker setup (do this first)
 
 ### 1. OpenRouter API key (~2 min)
 1. Sign up / log in at https://openrouter.ai (Google or GitHub works).
@@ -12,8 +16,20 @@
 1. Go to https://fred.stlouisfed.org/docs/api/api_key.html → **Request API key** → register → the key arrives in your email instantly.
 2. Paste into `.env`: `FRED_API_KEY=<32 hex chars>`.
 
-Verify both: `cd /opt/tradingagents && .venv/bin/python daily_run.py --analyze --tickers AAPL`
-should start printing per-agent analysis. (No `.env` key → OpenRouter client raises a clear "API key not set" error.)
+### 3. Alpaca paper trading (~5 min, no approval wait)
+1. Sign up at https://alpaca.markets (email + verify; no ID approval needed for paper).
+2. **Paper Trading → API Keys** — you get a key pair (`PK...` = API key, `SK...` = secret). Paper accounts are funded with $100k fake cash.
+3. Paste into `.env`: `ALPACA_API_KEY=PK...` and `ALPACA_SECRET_KEY=SK...`.
+4. Verify: `.venv/bin/python daily_run.py --healthcheck` → prints `broker (alpaca) reachable`.
+
+> Alpaca is US-equities-only — exactly the system's scope. Orders are placed
+> for the regular session (`extended_hours=false`), so market orders submitted
+> at 09:00 queue for the 09:30 open; buys carry a limit at `prev_close × 1.02`
+> and are cancelled if the open gaps beyond it — never overpaid. This mirrors
+> the IBKR path's protection-cap semantics.
+
+Verify all keys: `cd /opt/tradingagents && .venv/bin/python daily_run.py --analyze --tickers AAPL`
+should start printing per-agent analysis.
 
 ### 3. IBKR paper trading + API (~30 min, account approval can take a day)
 1. **Account**: create an individual account at https://www.interactivebrokers.com (needs government ID; approval usually 1–3 days). Skip if you already have one.
@@ -31,6 +47,13 @@ should start printing per-agent analysis. (No `.env` key → OpenRouter client r
 > Paper accounts mirror your real account's market-data subscriptions. Delayed data is
 > free and sufficient: all price data for decisions comes from yfinance; the Gateway is
 > only used for order placement at the open. No paid data subscription needed to run.
+
+## Switching to IBKR paper later (kept backend)
+The IBKR code stays in the repo; the flip is: set `broker: ibkr` in
+`watchlist.yaml`, install + log into IB Gateway (paper, port 7497, API
+enabled, auto-login + the systemd unit below), and `--healthcheck` again.
+IBKR paper is the most realistic free simulator (real routing simulation,
+opening-auction modeling) at the cost of running the Gateway daemon.
 
 ### systemd unit for IB Gateway (auto-start on boot)
 ```ini

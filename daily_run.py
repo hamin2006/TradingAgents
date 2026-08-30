@@ -9,9 +9,9 @@ from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
+from broker import create_broker
 from config import load_watchlist_config
 from decisions import compute_orders
-from ibkr import IBKRBroker
 from screener import load_pool
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.utils.rating import parse_rating
@@ -144,7 +144,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
         watchlist = tickers
     else:
         holdings = set()
-        broker = IBKRBroker(cfg)
+        broker = create_broker(cfg)
         try:
             broker.connect()
             holdings, _ = broker.get_positions_and_cash()
@@ -192,7 +192,7 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         return 0
 
     payload = json.loads(ratings_path.read_text(encoding="utf-8"))
-    broker = IBKRBroker(cfg)
+    broker = create_broker(cfg)
     try:
         broker.connect()
         holdings, cash = broker.get_positions_and_cash()
@@ -217,7 +217,7 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
 
 
 def healthcheck(cfg: dict) -> bool:
-    broker = IBKRBroker(cfg)
+    broker = create_broker(cfg)
     try:
         broker.connect()
         return True
@@ -231,7 +231,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Daily trading pipeline")
     parser.add_argument("--analyze", action="store_true", help="morning analysis pass")
     parser.add_argument("--execute", action="store_true", help="open-time execution pass")
-    parser.add_argument("--healthcheck", action="store_true", help="check IBKR reachability")
+    parser.add_argument("--healthcheck", action="store_true", help="check broker reachability")
     parser.add_argument("--dry-run", action="store_true", help="print orders without placing")
     parser.add_argument("--tickers", default=None, help="comma-separated tickers (analyze)")
     args = parser.parse_args(argv)
@@ -241,7 +241,8 @@ def main(argv=None) -> int:
 
     if args.healthcheck:
         ok = healthcheck(cfg)
-        print("IBKR reachable" if ok else "IBKR UNREACHABLE")
+        print(f"broker ({cfg.get('broker', 'alpaca')}) reachable" if ok
+              else f"broker ({cfg.get('broker', 'alpaca')}) UNREACHABLE")
         return 0 if ok else 1
     if args.analyze:
         tickers = args.tickers.split(",") if args.tickers else None

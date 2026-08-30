@@ -18,6 +18,13 @@ screener:
   exclusion_days: 7
   entry_protection_pct: 2.0
 
+# Active broker backend. "alpaca" = Alpaca paper API (instant, no daemon —
+# keys from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars). Flip to "ibkr"
+# when a paper Gateway is running (see SETUP.md); both share one interface.
+broker: alpaca
+alpaca:
+  paper: true                # ALWAYS true for this system — never live
+
 ibkr:
   host: 127.0.0.1
   port: 7497               # paper trading port
