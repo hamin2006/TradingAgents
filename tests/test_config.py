@@ -1,5 +1,6 @@
 """tests/test_config.py"""
 import pytest
+
 from config import load_watchlist_config, merge_over_default
 from tradingagents.default_config import DEFAULT_CONFIG
 
@@ -19,7 +20,7 @@ def test_merge_dict_is_one_level_deep():
 
 def test_merge_does_not_mutate_base():
     base = {"nested": {"x": 1}}
-    merged = merge_over_default(base, {"nested": {"y": 2}})
+    merge_over_default(base, {"nested": {"y": 2}})
     assert base["nested"] == {"x": 1}
     assert "y" not in base["nested"]
 
@@ -52,3 +53,10 @@ def test_load_yaml_overrides_and_merges(tmp_path):
     assert cfg["llm_provider"] == "openrouter"
     assert cfg["screener"]["candidate_slots"] == 3
     assert cfg["screener"]["pool_size"] == 50  # default kept from base
+
+
+def test_unknown_yaml_key_rejected(tmp_path):
+    yaml_path = tmp_path / "watchlist.yaml"
+    yaml_path.write_text("nonsense_key: 1\n")
+    with pytest.raises(ValueError):
+        load_watchlist_config(yaml_path)
