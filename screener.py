@@ -1,6 +1,7 @@
 """screener.py — weekly S&P 500 momentum screen producing the candidate pool."""
 
 import argparse
+import io
 import json
 import logging
 import sys
@@ -8,6 +9,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from config import load_watchlist_config
@@ -40,7 +42,15 @@ def fetch_universe(cfg: dict) -> list[str]:
         if age < timedelta(days=UNIVERSE_CACHE_TTL_DAYS):
             return json.loads(path.read_text(encoding="utf-8"))
     try:
-        tables = pd.read_html(WIKI_URL)
+        # Wikipedia 403s requests without a User-Agent; pd.read_html alone
+        # sends none, so fetch explicitly with a UA header first (#weekly-screen).
+        resp = requests.get(
+            WIKI_URL,
+            headers={"User-Agent": "Mozilla/5.0 (daily-paper-trading; +research)"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        tables = pd.read_html(io.StringIO(resp.text))
         symbols = sorted(tables[0]["Symbol"].astype(str).str.strip().tolist())
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(symbols), encoding="utf-8")

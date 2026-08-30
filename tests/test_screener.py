@@ -9,6 +9,7 @@ from screener import (
     build_pool,
     compute_raw_metrics,
     fetch_prices,
+    fetch_universe,
     load_pool,
     score_universe,
     week_key,
@@ -55,6 +56,52 @@ def test_score_universe_liquidity_filter():
     prices["THIN"]["Volume"] = [1_000] * 130  # ~$100k/day
     ranked = score_universe(prices, min_dollar_vol=10_000_000)
     assert all(r["ticker"] != "THIN" for r in ranked)
+
+
+def test_fetch_universe_sends_ua_and_caches(tmp_path, monkeypatch):
+    """Wikipedia 403s requests without a User-Agent; the fetch must send one
+    and cache the parsed universe (regression for the weekly screen)."""
+    html = """<html><body><table>
+    <tr><th>Symbol</th><th>Security</th></tr>
+    <tr><td>AAPL</td><td>Apple Inc.</td></tr>
+    <tr><td>MSFT</td><td>Microsoft Corp.</td></tr>
+    </table></body></html>"""
+
+    captured = {}
+
+    class FakeResp:
+        text = html
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeResp()
+
+    from tradingagents.default_config import DEFAULT_CONFIG
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["results_dir"] = str(tmp_path)
+
+    monkeypatch.setattr("screener.requests.get", fake_get)
+    symbols = fetch_universe(cfg)
+    assert symbols == ["AAPL", "MSFT"]
+    assert "User-Agent" in captured["kwargs"]["headers"]
+    assert (tmp_path / "universe_sp500.json").exists()  # cached
+
+
+def test_fetch_universe_falls_back_to_cache_on_error(tmp_path, monkeypatch):
+    from tradingagents.default_config import DEFAULT_CONFIG
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["results_dir"] = str(tmp_path)
+    (tmp_path / "universe_sp500.json").write_text(
+        json.dumps(["CACHED"]), encoding="utf-8")
+
+    def fake_get(url, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("screener.requests.get", fake_get)
+    assert fetch_universe(cfg) == ["CACHED"]
 
 
 def test_build_and_load_pool_roundtrip(tmp_path, monkeypatch):
