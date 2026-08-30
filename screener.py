@@ -7,6 +7,7 @@ import logging
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -20,6 +21,13 @@ logger = logging.getLogger(__name__)
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 UNIVERSE_CACHE_TTL_DAYS = 7
 MIN_ROWS = 60
+ET = ZoneInfo("America/New_York")
+
+
+def today_et() -> date:
+    """Screener dates are pinned to America/New_York, never server-local
+    (Sunday 18:00 ET may already be Monday on a non-ET host)."""
+    return datetime.now(ET).date()
 
 
 def week_key(d: date) -> str:
@@ -123,9 +131,9 @@ def build_pool(cfg: dict, limit: int | None = None) -> Path:
         universe = universe[:limit]
     prices = fetch_prices(universe)
     ranked = score_universe(prices)
-    path = _results_dir(cfg) / f"pool_{week_key(date.today())}.json"
+    path = _results_dir(cfg) / f"pool_{week_key(today_et())}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"year_week": week_key(date.today()),
+    path.write_text(json.dumps({"year_week": week_key(today_et()),
                                 "built_at": datetime.now().isoformat(),
                                 "pool": ranked}, indent=2), encoding="utf-8")
     logger.info("pool written to %s with %d tickers", path, len(ranked))

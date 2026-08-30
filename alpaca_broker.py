@@ -50,6 +50,11 @@ class AlpacaBroker:
         return api_key, secret_key
 
     def connect(self) -> None:
+        if not self.paper:
+            raise ConnectionError(
+                "refusing to connect: alpaca.paper is false and this system "
+                "only ever trades paper. Set alpaca.paper: true in watchlist.yaml."
+            )
         try:
             api_key, secret_key = self._credentials()
             client = TradingClient(api_key, secret_key, paper=self.paper)

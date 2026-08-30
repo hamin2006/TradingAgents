@@ -140,30 +140,37 @@ def _last_close(ticker: str) -> float | None:
 
 # --- parallel analysis -------------------------------------------------------
 
-_MEMORY_WRITE_LOCK = threading.Lock()
+_MEMORY_WRITE_LOCK = threading.RLock()  # re-entrant: wrapped methods may nest (double-patch in tests)
 _MEMORY_PATCHED = False
 
 
 def _ensure_memory_write_lock() -> None:
-    """Serialize TradingMemoryLog appends from concurrent analyze workers.
+    """Serialize TradingMemoryLog writes from concurrent analyze workers.
 
-    The framework's memory log appends without internal locking; concurrent
-    propagate() calls (parallel tickers) must not interleave writes into
-    trading_memory.md. Patched once, lazily, from this module so the
-    framework package itself stays untouched.
+    The framework's memory log has no internal locking; concurrent
+    propagate() calls (parallel tickers) must not interleave appends into
+    trading_memory.md nor race read-modify-rename outcome updates (a lost
+    atomic replace). Patched once, lazily, from this module so the framework
+    package itself stays untouched.
     """
     global _MEMORY_PATCHED
     if _MEMORY_PATCHED:
         return
     import tradingagents.agents.utils.memory as memory_mod
 
-    original = memory_mod.TradingMemoryLog.store_decision
+    wrapped_methods = [
+        "store_decision",
+        "update_with_outcome",
+        "batch_update_with_outcomes",
+    ]
+    for name in wrapped_methods:
+        original = getattr(memory_mod.TradingMemoryLog, name)
 
-    def locked_store_decision(self, *args, **kwargs):
-        with _MEMORY_WRITE_LOCK:
-            return original(self, *args, **kwargs)
+        def locked(self, *args, _orig=original, **kwargs):
+            with _MEMORY_WRITE_LOCK:
+                return _orig(self, *args, **kwargs)
 
-    memory_mod.TradingMemoryLog.store_decision = locked_store_decision
+        setattr(memory_mod.TradingMemoryLog, name, locked)
     _MEMORY_PATCHED = True
 
 
@@ -279,19 +286,44 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         holdings, cash = broker.get_positions_and_cash()
         last_close = {}
         for ticker in set(holdings) | set(payload["ratings"]):
-            last_close[ticker] = _last_close(ticker) or 0.0
+            price = _last_close(ticker)
+            if price is None:
+                logger.warning("no last close for %s; skipping any order for it", ticker)
+            last_close[ticker] = price or 0.0
+
+        # Never size against configured capital the account cannot cover;
+        # a rejected order is a silent no-op, a capped size is visible.
+        capital = float(cfg.get("capital", 100_000))
+        if cash < capital:
+            logger.warning("account cash (%.2f) below configured capital (%.2f); "
+                           "sizing against cash", cash, capital)
+            capital = cash
+
         orders = compute_orders(
             payload["ratings"], holdings, last_close,
-            capital=float(cfg.get("capital", 100_000)),
+            capital=capital,
             max_positions=int(cfg.get("max_positions", 10)),
             max_order_value_cap=cfg.get("max_order_value_cap"),
             entry_protection_pct=float(cfg.get("screener", {}).get(
                 "entry_protection_pct", 2.0)))
+
+        # Two-phase execution log: write the "submitted" mark BEFORE placing
+        # orders so a crash mid-submit can never double-execute on rerun
+        # (the idempotency check at the top sees the mark). Dry-runs never
+        # write it: a preview must not block the day's real execution.
+        log_path = _executed_path(cfg)
+        if not dry_run:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(json.dumps({
+                "date": _today_str(), "dry_run": False, "status": "submitted",
+                "orders": [o.__dict__ for o in orders], "reports": [],
+            }, indent=2), encoding="utf-8")
+
         reports = broker.place_market_orders(orders, dry_run=dry_run)
-        log = {"date": _today_str(), "dry_run": dry_run,
+        log = {"date": _today_str(), "dry_run": dry_run, "status": "completed",
                "orders": [o.__dict__ for o in orders], "reports": reports}
-        _executed_path(cfg).parent.mkdir(parents=True, exist_ok=True)
-        _executed_path(cfg).write_text(json.dumps(log, indent=2), encoding="utf-8")
+        if not dry_run:
+            log_path.write_text(json.dumps(log, indent=2), encoding="utf-8")
         return 0
     finally:
         broker.disconnect()
@@ -326,7 +358,8 @@ def main(argv=None) -> int:
               else f"broker ({cfg.get('broker', 'alpaca')}) UNREACHABLE")
         return 0 if ok else 1
     if args.analyze:
-        tickers = args.tickers.split(",") if args.tickers else None
+        tickers = [t.strip() for t in args.tickers.split(",") if t.strip()] \
+            if args.tickers else None
         run_analyze(cfg, tickers)
         return 0
     if args.execute:

@@ -244,3 +244,109 @@ def test_run_execute_skips_wait_in_dry_run(cfg):
         rc = run_execute(cfg, dry_run=True)
     assert rc == 0
     assert slept == []
+
+
+def test_memory_lock_covers_all_write_paths():
+    """Concurrent resolves also write the memory log (batch updates); the
+    lock must wrap every read-modify-write method, not just store_decision."""
+    import daily_run
+    import tradingagents.agents.utils.memory as memory_mod
+
+    original_store = memory_mod.TradingMemoryLog.store_decision
+    original_batch = memory_mod.TradingMemoryLog.batch_update_with_outcomes
+    original_single = memory_mod.TradingMemoryLog.update_with_outcome
+
+    daily_run._MEMORY_PATCHED = False  # force re-patch in this process
+    daily_run._ensure_memory_write_lock()
+
+    assert memory_mod.TradingMemoryLog.store_decision is not original_store
+    assert (memory_mod.TradingMemoryLog.batch_update_with_outcomes
+            is not original_batch)
+    assert (memory_mod.TradingMemoryLog.update_with_outcome
+            is not original_single)
+
+
+def test_run_execute_marks_before_submitting(cfg):
+    """If the process dies between placing orders and writing the final log,
+    a rerun must not double-execute: the mark exists before submission."""
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.side_effect = RuntimeError("crashed mid-submit")
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError), \
+         patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        run_execute(cfg)
+    import pathlib
+    marks = list(pathlib.Path(cfg["results_dir"]).glob("executed_*.json"))
+    assert len(marks) == 1
+    assert json.loads(marks[0].read_text())["status"] == "submitted"
+
+
+def test_run_execute_dry_run_writes_no_idempotency_file(cfg):
+    """A dry-run preview must not mark the day as executed."""
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = []
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=1800.0), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg, dry_run=True)
+    assert rc == 0
+    import pathlib
+    assert not list(pathlib.Path(cfg["results_dir"]).glob("executed_*.json"))
+
+
+def test_run_execute_caps_capital_by_actual_cash(cfg, caplog):
+    """Configured capital must not exceed the account's real cash."""
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    cfg["capital"] = 1_000_000
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = []
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg)
+    assert rc == 0
+    orders = broker.place_market_orders.call_args[0][0]
+    assert orders[0].shares == 100  # 100_000 cash / 10 positions / 100.0
+    assert any("cash" in r.message.lower() for r in caplog.records)
+
+
+def test_run_execute_missing_last_close_warns_and_skips(cfg, caplog):
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = []
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=None), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg)
+    assert rc == 0
+    orders = broker.place_market_orders.call_args[0][0]
+    assert orders == []  # no price -> no order (but warn, don't go silent)
+    assert any("last close" in r.message.lower() for r in caplog.records)
+
+
+def test_main_strips_ticker_whitespace():
+    with patch("daily_run.run_analyze") as mock_run:
+        rc = main(["--analyze", "--tickers", " AAPL , MSFT "])
+    assert rc == 0
+    mock_run.assert_called_once()
+    assert mock_run.call_args[0][1] == ["AAPL", "MSFT"]

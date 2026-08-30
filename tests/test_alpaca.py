@@ -124,3 +124,12 @@ def test_dry_run_touches_nothing(broker):
 def test_disconnect_is_noop(broker):
     b, _, _ = broker
     b.disconnect()  # must not raise
+
+
+def test_live_mode_hard_rejected(monkeypatch):
+    """paper=False would trade real money — must be refused outright."""
+    monkeypatch.setenv("ALPACA_API_KEY", "test-key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "test-secret")
+    b = AlpacaBroker({"alpaca": {"paper": False}})
+    with pytest.raises(ConnectionError):
+        b.connect()

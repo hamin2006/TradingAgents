@@ -145,3 +145,21 @@ def test_fetch_prices_batched(monkeypatch):
     prices = fetch_prices(["AAA", "BBB"])
     assert captured["tickers"] == "AAA BBB"
     assert isinstance(prices, dict)
+
+
+def test_build_pool_uses_et_week_key(tmp_path, monkeypatch):
+    """Pool files must be keyed by the ET week, not the server-local date
+    (a non-ET host at Sunday 18:00 ET may already be Monday locally)."""
+    from datetime import date
+
+    import config as config_mod
+    from tradingagents.default_config import DEFAULT_CONFIG
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["results_dir"] = str(tmp_path)
+    monkeypatch.setattr(config_mod, "load_watchlist_config", lambda *a, **k: cfg)
+    monkeypatch.setattr("screener.fetch_universe", lambda cfg: ["AAA"])
+    monkeypatch.setattr("screener.fetch_prices", lambda u, period="6mo": {
+        "AAA": _hist(drift=0.002)})
+    monkeypatch.setattr("screener.today_et", lambda: date(2026, 8, 30))  # Sunday
+    path = build_pool(cfg)
+    assert path.name == "pool_2026-35.json"
