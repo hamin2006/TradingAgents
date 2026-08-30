@@ -86,11 +86,15 @@ interactively to store credentials; the service restarts the saved session after
 Run `crontab -e` and add:
 ```cron
 CRON_TZ=America/New_York
-50 6 * * 1-5  /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --healthcheck >> /home/harsh-amin/workplace/TradingAgents/logs/health.log 2>&1
-0 6 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/screener.py --screen >> /home/harsh-amin/workplace/TradingAgents/logs/screener.log 2>&1
-0 7 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --analyze >> /home/harsh-amin/workplace/TradingAgents/logs/cron.log 2>&1
-0 9 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --execute >> /home/harsh-amin/workplace/TradingAgents/logs/orders.log 2>&1
+50 6 * * 1-5  cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --healthcheck >> logs/health.log 2>&1
+0 6 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python screener.py --screen >> logs/screener.log 2>&1
+0 7 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --analyze >> logs/cron.log 2>&1
+0 9 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --execute >> logs/orders.log 2>&1
 ```
+Every job `cd`s into the repo first: cron runs commands from the user's home,
+and the framework loads `.env` from the working directory — without the `cd`
+the API keys would never load. `CRON_TZ=America/New_York` pins all times to ET
+regardless of the host's local timezone (this host is America/Edmonton, 2h behind).
 The 06:00 screen refreshes the momentum ranking **every trading day** before the
 07:00 analysis (the scores are deterministic but prices move daily, so a weekly
 snapshot goes stale). It's free (yfinance only, no LLM cost), takes ~10 min, and
