@@ -37,7 +37,6 @@
 
 ```python
 """tests/test_config.py"""
-import pytest
 from config import load_watchlist_config, merge_over_default
 from tradingagents.default_config import DEFAULT_CONFIG
 
@@ -57,7 +56,7 @@ def test_merge_dict_is_one_level_deep():
 
 def test_merge_does_not_mutate_base():
     base = {"nested": {"x": 1}}
-    merged = merge_over_default(base, {"nested": {"y": 2}})
+    merge_over_default(base, {"nested": {"y": 2}})
     assert base["nested"] == {"x": 1}
     assert "y" not in base["nested"]
 
@@ -90,6 +89,14 @@ def test_load_yaml_overrides_and_merges(tmp_path):
     assert cfg["llm_provider"] == "openrouter"
     assert cfg["screener"]["candidate_slots"] == 3
     assert cfg["screener"]["pool_size"] == 50  # default kept from base
+
+
+def test_unknown_yaml_key_rejected(tmp_path):
+    yaml_path = tmp_path / "watchlist.yaml"
+    yaml_path.write_text("nonsense_key: 1\n")
+    import pytest
+    with pytest.raises(ValueError):
+        load_watchlist_config(yaml_path)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -165,7 +172,7 @@ def load_watchlist_config(path: str | Path | None = None) -> dict:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_config.py -v`
-Expected: 6 PASS
+Expected: 7 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -198,8 +205,7 @@ Cap: total BUY value must not exceed `max_order_value_cap`; if it would, drop th
 
 ```python
 """tests/test_decisions.py"""
-import pytest
-from decisions import Order, compute_orders
+from decisions import compute_orders
 
 RATINGS = {"AAPL": "Buy", "MSFT": "Hold", "NVDA": "Overweight", "TSLA": "Sell"}
 HOLDINGS = {"TSLA": 40}
@@ -245,14 +251,15 @@ def test_shares_lt_1_skips_buy():
 
 def test_max_order_value_cap_drops_largest_buy():
     ratings = {"AAPL": "Buy", "NVDA": "Buy"}
+    # slice = 10_000 each -> AAPL 100@100 = 10_000, NVDA 66@150 = 9_900; total 19_900
+    orders = compute_orders(ratings, {}, CLOSE, capital=100_000, max_positions=10,
+                            max_order_value_cap=20_000)
+    assert len([o for o in orders if o.action == "BUY"]) == 2  # total under cap
     orders = compute_orders(ratings, {}, CLOSE, capital=100_000, max_positions=10,
                             max_order_value_cap=12_000)
-    # slice = 10_000 each; both fit under 12_000
-    assert len([o for o in orders if o.action == "BUY"]) == 2
-    orders = compute_orders(ratings, {}, CLOSE, capital=100_000, max_positions=10,
-                            max_order_value_cap=10_500)
-    # one of them must be dropped (slice value 10_000 each, but cap applies to total)
+    # total 19_900 > 12_000 -> drop the largest-ticket buy (AAPL)
     assert len([o for o in orders if o.action == "BUY"]) == 1
+    assert orders[0].ticker == "NVDA"
 
 
 def test_missing_rating_or_price_skipped():
