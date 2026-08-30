@@ -174,6 +174,35 @@ def _ensure_memory_write_lock() -> None:
     _MEMORY_PATCHED = True
 
 
+_REDDIT_LOCK = threading.RLock()
+_REDDIT_PATCHED = False
+
+
+def _ensure_reddit_pacing() -> None:
+    """Serialize Reddit fetches across parallel analyze workers.
+
+    Parallel ticker analyses would otherwise burst Reddit's anonymous
+    per-IP rate limit (~10 req/min): 4 workers x 3 subreddits interleaved
+    trips 429s on every ticker. Serializing through one lock turns the
+    burst into ~1 request per 1s+ pacing (the framework already sleeps 1s
+    between subreddits), making 429s rare. Framework package untouched —
+    the patch is applied lazily from this module, like the memory-log lock.
+    """
+    global _REDDIT_PATCHED
+    if _REDDIT_PATCHED:
+        return
+    import tradingagents.dataflows.reddit as reddit_mod
+
+    original = reddit_mod._fetch_subreddit_rss
+
+    def locked_rss(*args, **kwargs):
+        with _REDDIT_LOCK:
+            return original(*args, **kwargs)
+
+    reddit_mod._fetch_subreddit_rss = locked_rss
+    _REDDIT_PATCHED = True
+
+
 def _analyze_one(ticker: str, today_str: str, cfg: dict):
     """Run the full framework pipeline for one ticker with one retry.
 
@@ -217,6 +246,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
                                        memory_log.load_entries(), cfg, TODAY_ET())
 
     _ensure_memory_write_lock()
+    _ensure_reddit_pacing()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):

@@ -350,3 +350,44 @@ def test_main_strips_ticker_whitespace():
     assert rc == 0
     mock_run.assert_called_once()
     assert mock_run.call_args[0][1] == ["AAPL", "MSFT"]
+
+
+def test_reddit_fetches_serialize_across_threads():
+    """Parallel tickers must not burst Reddit's anonymous per-IP rate limit:
+    all Reddit fetches across analyze workers serialize through one lock."""
+    import threading
+    import time
+
+    import daily_run
+    import tradingagents.dataflows.reddit as reddit_mod
+
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+
+    def fake_rss(ticker, sub, limit, timeout):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.1)
+        with state_lock:
+            active -= 1
+        return []
+
+    previous = reddit_mod._fetch_subreddit_rss  # real fetcher or earlier wrapper
+    reddit_mod._fetch_subreddit_rss = fake_rss  # replace real fetcher first
+    daily_run._REDDIT_PATCHED = False
+    daily_run._ensure_reddit_pacing()           # wrapper now captures fake_rss
+    try:
+        def worker(i):
+            reddit_mod._fetch_subreddit_rss(f"T{i}", "stocks", 5, 10)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert max_active == 1  # fully serialized
+    finally:
+        reddit_mod._fetch_subreddit_rss = previous  # restore pre-test state
