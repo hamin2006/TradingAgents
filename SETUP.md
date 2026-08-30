@@ -28,7 +28,7 @@
 > and are cancelled if the open gaps beyond it — never overpaid. This mirrors
 > the IBKR path's protection-cap semantics.
 
-Verify all keys: `cd /opt/tradingagents && .venv/bin/python daily_run.py --analyze --tickers AAPL`
+Verify all keys: `cd ~/workplace/TradingAgents && .venv/bin/python daily_run.py --analyze --tickers AAPL`
 should start printing per-agent analysis.
 
 ### 3. IBKR paper trading + API (~30 min, account approval can take a day)
@@ -77,7 +77,7 @@ interactively to store credentials; the service restarts the saved session after
 
 ## One-time install
 1. `sudo apt install -y python3.12 python3.12-venv cron`
-2. `git clone <repo> /opt/tradingagents && cd /opt/tradingagents`
+2. `git clone <repo> ~/workplace/TradingAgents && cd ~/workplace/TradingAgents`
 3. `python3.12 -m venv .venv && .venv/bin/pip install . ib_async pyyaml`
 4. Copy the `.env` template into place and fill in `OPENROUTER_API_KEY` + `FRED_API_KEY` (dotenv is loaded by the framework).
 5. Copy `watchlist.yaml` into place; verify `trading_enabled: true`.
@@ -86,21 +86,21 @@ interactively to store credentials; the service restarts the saved session after
 Run `crontab -e` and add:
 ```cron
 CRON_TZ=America/New_York
-50 6 * * 1-5  /opt/tradingagents/.venv/bin/python /opt/tradingagents/daily_run.py --healthcheck >> /opt/tradingagents/logs/health.log 2>&1
-0 18 * * 0    /opt/tradingagents/.venv/bin/python /opt/tradingagents/screener.py --screen >> /opt/tradingagents/logs/screener.log 2>&1
-0 7 * * 1-5   /opt/tradingagents/.venv/bin/python /opt/tradingagents/daily_run.py --analyze >> /opt/tradingagents/logs/cron.log 2>&1
-0 9 * * 1-5   /opt/tradingagents/.venv/bin/python /opt/tradingagents/daily_run.py --execute >> /opt/tradingagents/logs/orders.log 2>&1
+50 6 * * 1-5  /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --healthcheck >> /home/harsh-amin/workplace/TradingAgents/logs/health.log 2>&1
+0 18 * * 0    /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/screener.py --screen >> /home/harsh-amin/workplace/TradingAgents/logs/screener.log 2>&1
+0 7 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --analyze >> /home/harsh-amin/workplace/TradingAgents/logs/cron.log 2>&1
+0 9 * * 1-5   /home/harsh-amin/workplace/TradingAgents/.venv/bin/python /home/harsh-amin/workplace/TradingAgents/daily_run.py --execute >> /home/harsh-amin/workplace/TradingAgents/logs/orders.log 2>&1
 ```
 The 09:00 execute pass **waits until 09:30 ET** (the open) before submitting
 orders — a fill can't happen before the open, and the 60s fill poll would
 otherwise cancel pre-open orders. Dry-runs (`--dry-run`) never wait.
 
 ## Kill switch
-`touch /opt/tradingagents/DISABLE_TRADING`   # analysis runs, no orders
-`rm /opt/tradingagents/DISABLE_TRADING`      # re-enable
+`touch ~/workplace/TradingAgents/DISABLE_TRADING`   # analysis runs, no orders
+`rm ~/workplace/TradingAgents/DISABLE_TRADING`      # re-enable
 
 ## Smoke test (before trusting cron)
-1. `cd /opt/tradingagents && .venv/bin/python screener.py --screen`   # full weekly screen
+1. `cd ~/workplace/TradingAgents && .venv/bin/python screener.py --screen`   # full weekly screen
 2. `.venv/bin/python daily_run.py --analyze --tickers AAPL`           # one-ticker analysis
 3. `.venv/bin/python daily_run.py --execute --dry-run`                # prints orders, places none
 4. `.venv/bin/python daily_run.py --healthcheck`                      # IBKR reachable
