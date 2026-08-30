@@ -640,7 +640,7 @@ git commit -m "feat: add weekly S&P 500 momentum screener"
   - `assemble_watchlist(holdings: set[str], pool: list[dict], memory_entries: list[dict], cfg: dict, today: date) -> list[str]`
   - `TODAY_ET() -> date` — `datetime.now(ZoneInfo("America/New_York")).date()`.
 
-Assembly rules (spec §5bis): draw candidates from pool in score order, skipping (a) held tickers, (b) tickers with any memory entry dated >= `today - exclusion_days`, (c) tickers with a Sell/Underweight memory entry dated >= `today - exclusion_days`. Take up to `candidate_slots`. `watchlist = sorted(set(holdings) | set(candidates))`. If len < `min_watchlist_size`, top up with further pool members (same exclusions) until the minimum; if the pool is exhausted and the gate still fails, raise `WatchlistShortError`. If `pool` is empty, return `cfg["seed_watchlist"]`.
+Assembly rules (spec §5bis): draw candidates from pool in score order, skipping (a) held tickers, (b) tickers with any memory entry dated >= `today - exclusion_days`, (c) tickers with a Sell/Underweight memory entry dated >= `today - exclusion_days`. Take up to `candidate_slots`. `watchlist = sorted(set(holdings) | set(candidates))`. If len < `min_watchlist_size`, top up with further pool members (same exclusions) until the minimum; the `seed_watchlist` is a last-resort top-up when the pool cannot meet the minimum (covers the first run before any pool exists); if the gate still fails, raise `WatchlistShortError`. Note: Task 6 and the shipped `watchlist.yaml` always provide an explicit `min_watchlist_size`, so tests must too — the code's fallback default (5) is only for ad-hoc calls.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -674,7 +674,8 @@ def test_holdings_always_included():
 
 
 def test_top_candidates_taken():
-    got = assemble_watchlist(set(), POOL, [], {"candidate_slots": 2}, TODAY)
+    got = assemble_watchlist(set(), POOL, [], {"candidate_slots": 2,
+                                               "min_watchlist_size": 2}, TODAY)
     assert got[:2] == sorted(["NVDA", "AAPL"])
 
 
