@@ -715,7 +715,7 @@ class WatchlistShortError(Exception):
     pass
 
 
-def _excluded(entry, today, exclusion_days):
+def _recently_touched(entry, today, exclusion_days):
     try:
         entry_date = date.fromisoformat(entry["date"])
     except (KeyError, ValueError, TypeError):
@@ -737,12 +737,16 @@ def assemble_watchlist(holdings, pool, memory_entries, cfg, today):
 
     by_ticker = {e["ticker"]: e for e in memory_entries if e.get("ticker")}
 
-    def eligible(entry):
-        if entry["ticker"] in holdings:
+    def eligible(ticker):
+        # Excluded: held, or any memory entry within the exclusion window
+        # (recent analysis = churn; a recent Sell/Underweight is covered by
+        # the same rule per spec §5bis).
+        if ticker in holdings:
             return False
-        if not _excluded(entry, today, exclusion_days):
+        entry = by_ticker.get(ticker)
+        if entry is None:
             return True
-        return entry.get("rating") not in {"Sell", "Underweight"}
+        return not _recently_touched(entry, today, exclusion_days)
 
     candidates = []
     for item in pool:
@@ -750,8 +754,7 @@ def assemble_watchlist(holdings, pool, memory_entries, cfg, today):
             break
         if item["ticker"] in {c["ticker"] for c in candidates}:
             continue
-        entry = by_ticker.get(item["ticker"])
-        if entry is None or eligible(entry):
+        if eligible(item["ticker"]):
             candidates.append({"ticker": item["ticker"]})
 
     watchlist = sorted(set(holdings) | {c["ticker"] for c in candidates})
@@ -761,10 +764,7 @@ def assemble_watchlist(holdings, pool, memory_entries, cfg, today):
             if len(watchlist) >= min_size:
                 break
             ticker = item["ticker"]
-            if ticker in watchlist:
-                continue
-            entry = by_ticker.get(ticker)
-            if entry is not None and not eligible(entry):
+            if ticker in watchlist or not eligible(ticker):
                 continue
             watchlist.append(ticker)
             watchlist.sort()
