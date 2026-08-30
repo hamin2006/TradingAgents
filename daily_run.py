@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -252,3 +253,7 @@ def main(argv=None) -> int:
         return run_execute(cfg, dry_run=args.dry_run)
     parser.error("pass --analyze, --execute, or --healthcheck")
     return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

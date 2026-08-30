@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -141,3 +142,7 @@ def main(argv=None) -> int:
     set_config(cfg)
     build_pool(cfg, limit=args.universe_size or None)
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
