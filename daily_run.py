@@ -16,7 +16,7 @@ import yfinance as yf
 from broker import create_broker
 from config import load_watchlist_config
 from decisions import compute_orders
-from screener import load_pool
+from screener import load_pool, load_regime
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.utils.rating import parse_rating
 from tradingagents.dataflows.config import set_config
@@ -386,6 +386,15 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 "entry_protection_pct", 2.0)),
             stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
             conviction_weights=cfg.get("conviction_weights"))
+
+        # Regime gate (execute side): STRESS suppresses new BUY orders —
+        # rating-based exits still execute. Mirrors the pool-side pause.
+        if load_regime(cfg) == "STRESS":
+            buys = [o for o in orders if o.action == "BUY"]
+            if buys:
+                logger.warning("regime STRESS: suppressing %d new buy order(s); "
+                               "exit orders only", len(buys))
+            orders = [o for o in orders if o.action == "SELL"]
 
         # Two-phase execution log: write the "submitted" mark BEFORE placing
         # orders so a crash mid-submit can never double-execute on rerun

@@ -175,8 +175,9 @@ crashes the highest-momentum names mean-revert hardest. Upgrades, in rollout ord
    (bounds score blow-ups like the z≈+30 outlier observed in testing), optional
    5-day rank-stability check. **Measured: worst return on every gate, no drawdown
    edge over vol → drop.**
-3. ⏳ **Index-level regime gate**: SPY vs 200-day SMA × VIX percentile →
-   CALM/WARN/STRESS; WARN drops the top-decile 1m-momentum tail, STRESS pauses buys.
+3. ✅ **Index-level regime gate** (implemented as the production default pair with #6
+   below): SPY vs 200-day SMA × VIX percentile → CALM/WARN/STRESS; WARN drops the
+   top-decile 1m-momentum tail, STRESS pauses buys (execute-side suppression too).
    **Measured (crash-in-sample): the ONLY change that cut max DD on every strategy
    (raw −25.7→−21.0, vol −26.0→−18.6, rank −18.9→−12.0) — the system's drawdown hedge.**
 4. ⏳ **Absolute (dual) momentum gate**: ticker must beat T-bills over 12m and be
@@ -184,10 +185,11 @@ crashes the highest-momentum names mean-revert hardest. Upgrades, in rollout ord
    **Measured: no drawdown benefit over the regime gate, clear return cost → defer.**
 5. ⏳ **Anti-lottery overlay**: penalize MAX (largest 1-day gain) or exclude the
    blow-off signature `z(1m)>+3 & z(6m)<+1`. **Not in the backtest matrix — untested.**
-
-**Measured default decision (5y): switch the screener to `raw_momentum + regime_gate`**
-— best return-per-drawdown in the matrix (3.93%/20d alpha, max DD −21% vs −25.7% raw-alone).
-Production defaults change only with user approval.
+6. ✅ **Default strategy switch**: `raw_momentum` is the production scoring default
+   (raw z-score composite), paired with the regime gate — best return-per-drawdown in
+   the matrix (3.93%/20d alpha, max DD −21% vs −25.7% raw-alone). `vol_adjusted` and
+   `rank_based` remain selectable registry strategies (set `strategy` in
+   `score_universe` / config); vol_adjusted is no longer the default.
 
 ## 5. Decision engine
 

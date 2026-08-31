@@ -22,6 +22,7 @@ screener:
   min_watchlist_size: 5    # production gate (test: 1)
   exclusion_days: 3        # churn guard; keep candidates as fresh as possible
   entry_protection_pct: 2.0
+  regime_gate: true        # SPY/SMA200 x VIX: WARN drops 1m tail, STRESS pauses buys
 
 # Active broker backend. "alpaca" = Alpaca paper API (instant, no daemon —
 # keys from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars). Flip to "ibkr"

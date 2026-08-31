@@ -518,3 +518,24 @@ def test_reddit_resilient_wrapper_applied_without_creds(monkeypatch):
         sa.fetch_reddit_posts = _unwrap_reddit_fetch(original)
         daily_run._REDDIT_OAUTH_PATCHED = False
         daily_run._REDDIT_OAUTH_ACTIVE = False
+
+
+def test_run_execute_stress_pauses_buys_but_exits(cfg, caplog):
+    """Regime STRESS suppresses new BUY orders; rating exits still execute."""
+    _ratings_file(cfg, {"AAPL": "Buy", "TSLA": "Sell"})
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"TSLA": 40}, 100_000.0)
+    broker.place_market_orders.return_value = []
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.load_regime", return_value="STRESS"), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg)
+    assert rc == 0
+    orders = broker.place_market_orders.call_args[0][0]
+    assert [o.action for o in orders] == ["SELL"]
+    assert all(o.ticker == "TSLA" for o in orders)
+    assert any("STRESS" in r.message for r in caplog.records)

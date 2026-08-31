@@ -40,8 +40,11 @@ APP_DEFAULTS = {
         "pool_size": 50,
         "candidate_slots": 3,
         "min_watchlist_size": 5,
-        "exclusion_days": 3,  # churn guard; keep candidates as fresh as possible
+        "exclusion_days": 3,
         "entry_protection_pct": 2.0,
+        # Regime gate (5y backtest: the only defense that survived the 2022
+        # crash in-sample). STRESS pauses new buys; WARN drops the 1m tail.
+        "regime_gate": True,
     },
     # Alpaca: secrets come from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars,
     # never from yaml. paper=True is the safe default; flip only with intent.

@@ -5,12 +5,15 @@ from datetime import date
 import pandas as pd
 import pytest
 
+import screener
 from screener import (
     build_pool,
     compute_raw_metrics,
     fetch_prices,
     fetch_universe,
     load_pool,
+    load_regime,
+    regime_at,
     score_universe,
     week_key,
 )
@@ -132,7 +135,6 @@ def test_load_pool_missing_returns_empty(tmp_path):
 
 
 def test_fetch_prices_batched(monkeypatch):
-    import screener
     captured = {}
 
     class FakeFrame(pd.DataFrame):
@@ -204,3 +206,107 @@ def test_vol_floor_bounds_tiny_vol_names():
     ranked = score_universe({"SMOOTH": hist})
     import math
     assert math.isfinite(ranked[0]["score"])
+
+
+def test_score_universe_default_strategy_is_raw():
+    """Production default switched to raw_momentum + regime gate (5y backtest)."""
+    prices = {"STEADY": _hist(drift=0.001), "PARABOLIC": _oscillating_hist()}
+    assert score_universe(prices) == score_universe(prices, strategy="raw_momentum")
+
+
+def test_vol_adjusted_still_demotes_parabolic():
+    """The vol-adjusted property remains available as a registry strategy."""
+    prices = {"STEADY": _hist(drift=0.001), "PARABOLIC": _oscillating_hist()}
+    ranked = score_universe(prices, strategy="vol_adjusted")
+    by_ticker = {r["ticker"]: r["score"] for r in ranked}
+    assert by_ticker["STEADY"] > by_ticker["PARABOLIC"]
+
+
+def _frame(closes, volume=2_000_000):
+    idx = pd.date_range(end=pd.Timestamp.today().normalize(), periods=len(closes),
+                        freq="B")
+    return pd.DataFrame({"Close": closes, "Volume": [volume] * len(closes)},
+                        index=idx)
+
+
+def test_regime_at_stress_when_spy_below_sma200():
+    closes = [100 + i * 0.1 for i in range(200)] + [100 - i * 1.0 for i in range(1, 21)]
+    spy = _frame(closes)
+    vix = _frame([15.0] * len(closes))
+    assert regime_at(spy, vix) == "STRESS"
+
+
+def test_regime_at_warn_on_vix_spike():
+    closes = [100 + i * 0.05 for i in range(250)]
+    spy = _frame(closes)
+    vix = _frame([15.0] * 245 + [40.0] * 5)  # spike into the top percentile
+    assert regime_at(spy, vix) == "WARN"
+
+
+def test_regime_at_calm_by_default():
+    spy = _frame([100 + i * 0.05 for i in range(250)])
+    vix = _frame([20.0 - i * 0.01 for i in range(250)])  # declining: last value = lowest pct
+    assert regime_at(spy, vix) == "CALM"
+
+
+def test_regime_at_insufficient_data_fails_open():
+    spy = _frame([100.0] * 50)  # < 200 days
+    vix = _frame([15.0] * 50)
+    assert regime_at(spy, vix) == "CALM"
+
+
+def _gate_cfg(tmp_path, monkeypatch, spy, vix, n=12):
+    import config as config_mod
+    from tradingagents.default_config import DEFAULT_CONFIG
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["results_dir"] = str(tmp_path)
+    monkeypatch.setattr(config_mod, "load_watchlist_config", lambda *a, **k: cfg)
+    monkeypatch.setattr("screener.fetch_universe", lambda cfg: [f"T{i:02d}" for i in range(n)])
+    monkeypatch.setattr("screener.fetch_prices",
+                        lambda u, period="6mo": {t: _hist(drift=0.001) for t in u})
+    monkeypatch.setattr("screener.fetch_gate_data", lambda cfg: (spy, vix))
+    return cfg
+
+
+def test_build_pool_stress_pauses_buys(tmp_path, monkeypatch):
+    closes = [100 + i * 0.1 for i in range(200)] + [100 - i * 1.0 for i in range(1, 21)]
+    cfg = _gate_cfg(tmp_path, monkeypatch, _frame(closes), _frame([15.0] * 220))
+    path = build_pool(cfg)
+    payload = json.loads(path.read_text())
+    assert payload["regime"] == "STRESS"
+    assert payload["pool"] == []
+
+
+def test_build_pool_warn_drops_top_decile_1m_tail(tmp_path, monkeypatch):
+    closes = [100 + i * 0.05 for i in range(250)]
+    spy, vix = _frame(closes), _frame([15.0] * 245 + [40.0] * 5)  # WARN
+    cfg = _gate_cfg(tmp_path, monkeypatch, spy, vix)
+    # one ticker with a parabolic 1m spike -> clearly the top-decile 1m name
+    spiked = _hist(drift=0.001)
+    spiked["Close"] = spiked["Close"].astype(float)
+    spiked.loc[spiked.index[-21]:] *= 2.0
+    prices = {t: _hist(drift=0.001) for t in [f"T{i:02d}" for i in range(12)]}
+    prices["T05"] = spiked
+    monkeypatch.setattr("screener.fetch_prices",
+                        lambda u, period="6mo": prices)
+    path = build_pool(cfg)
+    payload = json.loads(path.read_text())
+    assert payload["regime"] == "WARN"
+    assert "T05" not in [r["ticker"] for r in payload["pool"]]
+    assert len(payload["pool"]) == 11
+
+
+def test_build_pool_calm_keeps_all(tmp_path, monkeypatch):
+    spy = _frame([100 + i * 0.05 for i in range(250)])
+    vix = _frame([20.0 - i * 0.01 for i in range(250)])  # declining VIX -> CALM
+    cfg = _gate_cfg(tmp_path, monkeypatch, spy, vix)
+    payload = json.loads(build_pool(cfg).read_text())
+    assert payload["regime"] == "CALM"
+    assert len(payload["pool"]) == 12
+
+
+def test_load_regime_defaults_calm(tmp_path):
+    from tradingagents.default_config import DEFAULT_CONFIG
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["results_dir"] = str(tmp_path)
+    assert load_regime(cfg) == "CALM"

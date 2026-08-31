@@ -6,7 +6,7 @@ Guidance for agent sessions working in this repository.
 
 A fork of **TauricResearch/TradingAgents** (multi-agent LLM trading framework, LangGraph) extended with a daily paper-trading automation layer:
 
-1. A deterministic **S&P 500 momentum screener** generates buy candidates every trading morning (volatility-adjusted momentum composite + liquidity filter).
+1. A deterministic **S&P 500 momentum screener** generates buy candidates every trading morning (raw-momentum composite + liquidity filter + **regime gate**: SPY-vs-200d-SMA × VIX → CALM/WARN/STRESS — WARN drops the 1m-momentum tail, STRESS pauses new buys; measured via a 5y crash-in-sample backtest, see spec §5bis).
 2. A **parallel multi-agent analysis pass** (4 analysts → bull/bear debate → trader → 3-way risk debate → portfolio manager) rates each watchlist ticker Buy/Overweight/Hold/Underweight/Sell.
 3. Ratings execute **automatically on an Alpaca paper account** at the 09:30 ET market open, with broker-side entry protection caps and stop-losses.
 4. A decision **memory log** records every call with realized returns and LLM reflections; an **analytics script** measures hit rates by rating tier over time.
@@ -63,4 +63,4 @@ Daily pipeline data flow: `screener` (06:00) → `daily_run --analyze` (07:00, p
 
 - Reddit OAuth credentials: app creation is captcha-blocked (network flag); retry later — the code path activates automatically once creds land in `.env`.
 - Drawdown circuit breaker: deferred until ~2 weeks of resolved decisions exist in the memory log (threshold from evidence, not guesswork).
-- Screening robustness roadmap (spec §5bis): vol-adjusted momentum is shipped; rank-based hardening, regime gate, dual momentum, anti-lottery overlay are documented follow-ups pending outcome data.
+- Screening robustness roadmap (spec §5bis): the 5y crash-in-sample backtest settled the defaults — production = **raw_momentum + regime gate** (vol_adjusted/rank_based remain selectable registry strategies); dual momentum and anti-lottery overlay are deferred pending outcome data.
