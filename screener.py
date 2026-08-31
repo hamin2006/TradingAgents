@@ -114,27 +114,63 @@ def _zscore(values: pd.Series) -> pd.Series:
     return (s - s.mean()) / s.std()
 
 
+def _winsorize_rank(values: pd.Series) -> pd.Series:
+    """Winsorize the 5–95% tails, then convert to a 0–1 percentile rank. Rank
+    transforms are robust to fat tails (squeeze names don't blow up the score);
+    z-scores are not (research doc §3.3)."""
+    s = pd.Series(values)
+    lo, hi = s.quantile([0.05, 0.95])
+    return s.clip(lo, hi).rank(pct=True)
+
+
 # Vol-adjusted momentum (Barroso–Santa-Clara 2015): rank by return relative to
 # its own realized volatility, with a floor so low-vol names can't divide to
 # infinity. Demotes lottery-like parabolic movers — the names that mean-revert
 # hardest in momentum crashes.
 VOL_FLOOR = 0.10  # 10% annualized
 
+# Screening-method registry (spec §5bis roadmap). Each strategy reshapes *who*
+# ranks high; the factors and their equal weighting are identical, so the only
+# variable is the cross-sectional transform — a clean A/B.
+SCORE_STRATEGIES = ("raw_momentum", "vol_adjusted", "rank_based")
+
+
+def composite_score(frame: pd.DataFrame, strategy: str = "vol_adjusted") -> pd.Series:
+    """Cross-sectional composite score for one screen date. `frame` is indexed by
+    ticker with columns as produced by compute_raw_metrics (ret_1m/3m/6m,
+    sma50_spread, high_proximity, realized_vol, ...). Returns a Series indexed by
+    ticker, higher = better. `raw_momentum` z-scores raw returns (pre-vol-adjust
+    baseline); `vol_adjusted` z-scores return ÷ realized vol (current default);
+    `rank_based` winsorizes and percentile-ranks the vol-adjusted terms."""
+    if strategy not in SCORE_STRATEGIES:
+        raise ValueError(f"unknown strategy {strategy!r}; choose from {SCORE_STRATEGIES}")
+    if strategy == "raw_momentum":
+        ret_cols = ("ret_1m", "ret_3m", "ret_6m")
+        f = frame
+    else:  # vol_adjusted, rank_based — both scale momentum by realized vol
+        f = frame.copy()
+        vol = f["realized_vol"].clip(lower=VOL_FLOOR)
+        for c in ("ret_1m", "ret_3m", "ret_6m"):
+            f[f"{c}_adj"] = f[c] / vol
+        ret_cols = ("ret_1m_adj", "ret_3m_adj", "ret_6m_adj")
+    score_cols = ret_cols + ("sma50_spread", "high_proximity")
+    if strategy == "rank_based":
+        parts = [_winsorize_rank(f[c]).fillna(0.0) for c in score_cols]
+    else:
+        parts = [_zscore(f[c]).fillna(0.0) for c in score_cols]
+    return sum(parts)
+
 
 def score_universe(prices: dict[str, pd.DataFrame],
-                   min_dollar_vol: float = 10_000_000) -> list[dict]:
+                   min_dollar_vol: float = 10_000_000,
+                   strategy: str = "vol_adjusted") -> list[dict]:
     metrics = {t: m for t, m in ((t, compute_raw_metrics(h)) for t, h in prices.items())
                if m is not None}
     rows = {t: m for t, m in metrics.items() if m["avg_dollar_vol"] >= min_dollar_vol}
     if not rows:
         return []
     frame = pd.DataFrame(rows).T
-    vol = frame["realized_vol"].clip(lower=VOL_FLOOR)
-    for ret_col in ("ret_1m", "ret_3m", "ret_6m"):
-        frame[f"{ret_col}_adj"] = frame[ret_col] / vol
-    score_cols = ("ret_1m_adj", "ret_3m_adj", "ret_6m_adj",
-                  "sma50_spread", "high_proximity")
-    score = sum(_zscore(frame[col]).fillna(0.0) for col in score_cols)
+    score = composite_score(frame, strategy)
     ranked = score.sort_values(ascending=False)
     return [{"ticker": t, "score": round(float(s), 4)} for t, s in ranked.items()]
 

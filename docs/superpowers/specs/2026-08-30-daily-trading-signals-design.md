@@ -164,22 +164,28 @@ dual momentum, Bali et al. MAX effect). Momentum ranking is regime-fragile — i
 crashes the highest-momentum names mean-revert hardest. Upgrades, in rollout order
 (each validated against `analyze_results.py` outcomes before the next lands):
 
-1. ✅ **Volatility-adjusted momentum** (implemented): the three return z-scores are
+1. ✅ **Volatility-adjusted momentum** (implemented, measured: `docs/research/backtest-results.md`): the three return z-scores are
    computed on `return ÷ annualized realized vol` (126d, 10% floor) instead of raw
    returns — Barroso–Santa-Clara's volatility-managed momentum ("~2× Sharpe,
    virtually eliminates crashes"). Demotes lottery-like parabolic movers in every
-   regime; no on/off state, so candidate recall is preserved.
+   regime; no on/off state, so candidate recall is preserved. **Measured 2023–26: a
+   drawdown reducer (max DD −15.4% vs raw −24.7%), not a return booster (3.10%/20d vs
+   raw 4.62%) in this bull-only sample — keep as default.**
 2. ⏳ **Rank-based composite + winsorization**: percentile ranks replace z-scores
    (bounds score blow-ups like the z≈+30 outlier observed in testing), optional
-   5-day rank-stability check.
+   5-day rank-stability check. **Measured: worst return (1.64%/20d) with no drawdown
+   advantage over vol_adjusted (−14.7% vs −15.4%) → drop/deprioritize, keep in registry.**
 3. ⏳ **Index-level regime gate**: SPY vs 200-day SMA × VIX percentile →
    CALM/WARN/STRESS; WARN drops the top-decile 1m-momentum tail, STRESS pauses buys.
    Only after `analyze_results.py` shows real drawdown behavior — the gate pays a
-   whipsaw tax on ordinary days.
+   whipsaw tax on ordinary days. **Measured: cut max DD on every strategy (raw
+   −24.7→−17.8, vol −15.4→−14.7, rank −14.7→−14.2) at the smallest return cost →
+   highest-value next rollout.**
 4. ⏳ **Absolute (dual) momentum gate**: ticker must beat T-bills over 12m and be
    positive over 6m (Antonacci); suppress buys if SPY fails its own trend test.
+   **Measured: inconsistent drawdown benefit, clear return cost → defer.**
 5. ⏳ **Anti-lottery overlay**: penalize MAX (largest 1-day gain) or exclude the
-   blow-off signature `z(1m)>+3 & z(6m)<+1`.
+   blow-off signature `z(1m)>+3 & z(6m)<+1`. **Not in the backtest matrix — untested.**
 
 ## 5. Decision engine
 
