@@ -105,14 +105,20 @@ interactively to store credentials; the service restarts the saved session after
 4. Copy the `.env` template into place and fill in `OPENROUTER_API_KEY` + `FRED_API_KEY` (dotenv is loaded by the framework).
 5. Copy `watchlist.yaml` into place; verify `trading_enabled: true`.
 
-## Cron (CRON_TZ avoids DST bugs)
-Run `crontab -e` and add:
+## Cron (expressed in the host's LOCAL timezone — America/Edmonton)
+
+**Important: Ubuntu's cron ignores `CRON_TZ`** (verified 2026-08-31 — jobs silently
+run 2h late). Edmonton and New York share DST dates, so the offset is a stable 2
+hours year-round: the ET schedule is expressed as local times minus 2h. Cron jobs
+`cd` into the repo first (the framework loads `.env` from the working directory).
+
 ```cron
-CRON_TZ=America/New_York
-50 6 * * 1-5  cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --healthcheck >> logs/health.log 2>&1
-0 6 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python screener.py --screen >> logs/screener.log 2>&1
-0 7 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --analyze >> logs/cron.log 2>&1
-0 9 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --execute >> logs/orders.log 2>&1
+# Local (MDT/MST) mapping: 04:00=06:00ET screen | 04:50=06:50ET healthcheck
+#                           05:00=07:00ET analyze | 07:00=09:00ET execute
+50 4 * * 1-5  cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --healthcheck >> logs/health.log 2>&1
+0 4 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python screener.py --screen >> logs/screener.log 2>&1
+0 5 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --analyze >> logs/cron.log 2>&1
+0 7 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --execute >> logs/orders.log 2>&1
 ```
 Every job `cd`s into the repo first: cron runs commands from the user's home,
 and the framework loads `.env` from the working directory — without the `cd`
