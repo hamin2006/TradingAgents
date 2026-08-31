@@ -174,32 +174,42 @@ def _ensure_memory_write_lock() -> None:
     _MEMORY_PATCHED = True
 
 
-_REDDIT_LOCK = threading.RLock()
+_REDDIT_LOCK = threading.RLock()  # re-entrant: reddit.py's own 429 retry re-invokes the module attr,
+# which is our wrapper — a plain Lock would deadlock the same-thread re-entry.
 _REDDIT_PATCHED = False
+_REDDIT_MIN_INTERVAL = 8.0  # seconds between Reddit requests (anonymous ~10/min)
+_REDDIT_LAST_TS = 0.0  # monotonic timestamp of the last request, guarded by _REDDIT_LOCK
 
 
 def _ensure_reddit_pacing() -> None:
-    """Serialize Reddit fetches across parallel analyze workers.
+    """Rate-limit Reddit fetches across parallel analyze workers.
 
     Parallel ticker analyses would otherwise burst Reddit's anonymous
     per-IP rate limit (~10 req/min): 4 workers x 3 subreddits interleaved
-    trips 429s on every ticker. Serializing through one lock turns the
-    burst into ~1 request per 1s+ pacing (the framework already sleeps 1s
-    between subreddits), making 429s rare. Framework package untouched —
-    the patch is applied lazily from this module, like the memory-log lock.
+    trips 429s on every ticker. Serializing alone is insufficient — the
+    framework's 1s inter-sub pacing still sustains ~1 req/sec — so this
+    enforces a minimum interval between requests, held under the lock so
+    concurrent workers queue instead of firing together. Framework package
+    untouched: the patch is applied lazily from this module.
     """
-    global _REDDIT_PATCHED
+    global _REDDIT_PATCHED, _REDDIT_LAST_TS
     if _REDDIT_PATCHED:
         return
     import tradingagents.dataflows.reddit as reddit_mod
 
     original = reddit_mod._fetch_subreddit_rss
 
-    def locked_rss(*args, **kwargs):
+    def paced_rss(*args, **kwargs):
+        global _REDDIT_LAST_TS
         with _REDDIT_LOCK:
+            elapsed = time.monotonic() - _REDDIT_LAST_TS
+            if elapsed < _REDDIT_MIN_INTERVAL:
+                time.sleep(_REDDIT_MIN_INTERVAL - elapsed)
+            _REDDIT_LAST_TS = time.monotonic()
             return original(*args, **kwargs)
 
-    reddit_mod._fetch_subreddit_rss = locked_rss
+    paced_rss._wrapped_original = original  # tests unwrap to the real fetcher
+    reddit_mod._fetch_subreddit_rss = paced_rss
     _REDDIT_PATCHED = True
 
 

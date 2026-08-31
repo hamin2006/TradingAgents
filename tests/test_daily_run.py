@@ -352,6 +352,17 @@ def test_main_strips_ticker_whitespace():
     assert mock_run.call_args[0][1] == ["AAPL", "MSFT"]
 
 
+def _unwrap_reddit_fetch(fn):
+    """Walk wrapper chains (paced_rss._wrapped_original) back to the real
+    framework fetcher so tests leave the module pristine for later suites."""
+    for _ in range(10):
+        inner = getattr(fn, "_wrapped_original", None)
+        if inner is None:
+            return fn
+        fn = inner
+    return fn
+
+
 def test_reddit_fetches_serialize_across_threads():
     """Parallel tickers must not burst Reddit's anonymous per-IP rate limit:
     all Reddit fetches across analyze workers serialize through one lock."""
@@ -376,6 +387,8 @@ def test_reddit_fetches_serialize_across_threads():
         return []
 
     previous = reddit_mod._fetch_subreddit_rss  # real fetcher or earlier wrapper
+    daily_run._REDDIT_MIN_INTERVAL = 0.0        # serialization test only
+    daily_run._REDDIT_LAST_TS = 0.0             # clear pacing clock
     reddit_mod._fetch_subreddit_rss = fake_rss  # replace real fetcher first
     daily_run._REDDIT_PATCHED = False
     daily_run._ensure_reddit_pacing()           # wrapper now captures fake_rss
@@ -390,4 +403,75 @@ def test_reddit_fetches_serialize_across_threads():
             t.join()
         assert max_active == 1  # fully serialized
     finally:
-        reddit_mod._fetch_subreddit_rss = previous  # restore pre-test state
+        reddit_mod._fetch_subreddit_rss = _unwrap_reddit_fetch(previous)
+        daily_run._REDDIT_PATCHED = False           # fully undo the patch
+        daily_run._REDDIT_LAST_TS = 0.0
+        daily_run._REDDIT_MIN_INTERVAL = 8.0
+
+
+def test_reddit_requests_are_rate_limited():
+    """The wrapper must pace requests globally (min interval), not just
+    serialize them: Reddit's anonymous limit is ~10 req/min, and the
+    framework's 1s inter-sub pacing alone sustains ~1 req/sec."""
+
+    import daily_run
+    import tradingagents.dataflows.reddit as reddit_mod
+
+    sleeps = []
+
+    def fake_rss(ticker, sub, limit, timeout):
+        return []
+
+    original_attr = reddit_mod._fetch_subreddit_rss
+    reddit_mod._fetch_subreddit_rss = fake_rss
+    daily_run._REDDIT_PATCHED = False
+    daily_run._REDDIT_MIN_INTERVAL = 0.2  # speed up the test
+    daily_run._REDDIT_LAST_TS = 0.0       # clear pacing clock from earlier tests
+    try:
+        daily_run._ensure_reddit_pacing()
+        with patch("daily_run.time.sleep",
+                   side_effect=lambda s: sleeps.append(s)):
+            for i in range(5):
+                reddit_mod._fetch_subreddit_rss(f"T{i}", "stocks", 5, 10)
+        # 4 pauses between 5 requests, each ~ the min interval (first is free)
+        assert len(sleeps) == 4, sleeps
+        assert all(g >= 0.15 for g in sleeps), sleeps
+    finally:
+        reddit_mod._fetch_subreddit_rss = _unwrap_reddit_fetch(original_attr)
+        daily_run._REDDIT_PATCHED = False      # fully undo the patch
+        daily_run._REDDIT_LAST_TS = 0.0
+        daily_run._REDDIT_MIN_INTERVAL = 8.0
+
+
+def test_reddit_pacing_survives_internal_retry_recursion():
+    """reddit.py's 429 retry re-invokes the module attribute (itself), which
+    is our wrapper: the same thread re-enters the pacing lock. A plain Lock
+    would deadlock; RLock must let the retry through."""
+
+    import daily_run
+    import tradingagents.dataflows.reddit as reddit_mod
+
+    calls = []
+
+    def recursive_fake(ticker, sub, limit, timeout, _retry=True):
+        calls.append(_retry)
+        if _retry:
+            return reddit_mod._fetch_subreddit_rss(ticker, sub, limit, timeout,
+                                                   _retry=False)
+        return ["ok"]
+
+    original_attr = reddit_mod._fetch_subreddit_rss
+    reddit_mod._fetch_subreddit_rss = recursive_fake
+    daily_run._REDDIT_PATCHED = False
+    daily_run._REDDIT_MIN_INTERVAL = 0.0
+    daily_run._REDDIT_LAST_TS = 0.0
+    try:
+        daily_run._ensure_reddit_pacing()
+        result = reddit_mod._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
+        assert result == ["ok"]
+        assert calls == [True, False]  # outer + internal retry via wrapper
+    finally:
+        reddit_mod._fetch_subreddit_rss = _unwrap_reddit_fetch(original_attr)
+        daily_run._REDDIT_PATCHED = False
+        daily_run._REDDIT_LAST_TS = 0.0
+        daily_run._REDDIT_MIN_INTERVAL = 8.0
