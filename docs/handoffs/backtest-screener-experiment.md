@@ -38,7 +38,7 @@ All in `/home/harsh-amin/workplace/TradingAgents`:
 
 - **Backtest window:** 3 years of daily OHLCV, one batched download (`yf.download`, includes SPY + ^VIX for gates), cached to `~/.tradingagents/logs/backtest_prices.csv` (data cost $0, ~5 min).
 - **Universe note:** today's S&P 500 list used for all past dates → survivorship bias inflates absolute numbers but affects all methods equally → **comparisons valid**; document in the report.
-- **Simulated cadence:** the screen is replayed **every trading day** (~756 dates over 3 years — matching production's daily cadence). Horizons **5d and 20d** forward alpha vs SPY, top **N=10** picks per date (~7,500 forward-return observations per method per horizon; overlapping windows acknowledged).
+- **Simulated cadence:** the screen is replayed **every trading day** (~756 dates over 3 years — matching production's daily cadence). Horizons **5d and 20d** forward alpha vs SPY; candidate selection mirrors production (see parity checklist).
 - **Combo matrix (~9 rows):** scoring ∈ {`raw_momentum` (pre-vol-adjust baseline), `vol_adjusted` (current default), `rank_based` (percentile ranks + winsorization)} × gate ∈ {none, `regime_gate` (SPY vs 200-day SMA × realized-vol state → CALM/WARN/STRESS: WARN drops the top-decile 1m-momentum tail, STRESS pauses buys), `dual_momentum` (ticker beats a T-bill proxy over 12m AND positive 6m)}.
 - **Per-combo metrics:** avg 5d/20d alpha, hit rate (alpha>0), 5th-percentile alpha (tail), worst window, turnover; **split by half-periods** for robustness (no parameter tuning — validation, not overfitting). See "Sell simulation" below for the portfolio layer.
 - **Output:** `docs/research/backtest-results.md` — comparison table + per-combo notes + caveats section.
@@ -66,6 +66,23 @@ the fixed-horizon **forward-alpha table** (pure entry quality) **plus a simulate
 equity curve per method** — total return, max drawdown, trade win rate — which is
 the "count the gains" comparison. Caveat: absolute P&L will not match live (no
 LLM layer, no costs); the method *ranking* is the deliverable.
+
+### Production-parity checklist (align the sim to `watchlist.yaml`)
+
+| Production | Backtest treatment |
+|---|---|
+| `candidate_slots: 3` / day from the ranked queue | sim picks **top 3/day** (not a fixed top-10), skipping current holdings |
+| `exclusion_days: 3` | a ticker re-picked within 3 trading days of its analysis is skipped |
+| `min_watchlist_size: 5` + top-up | sim tops up from deeper queue ranks when candidates < the gate |
+| `entry_protection_pct: 2.0` | entry at the **next open** after the screen date; if the open gaps past `prev_close × 1.02`, **no fill** (skip) — not same-day-close |
+| `stop_loss_pct: 8.0` GTC, broker-enforced intraday | sim checks **daily bars**: if day low ≤ stop → fill at `min(open, stop)` (gap realism); if day open < stop → fill at open |
+| exit = agent Sell/Underweight rating | **deliberate divergence:** sim's proxy exit = drops out of the top-N pool (documented above). Production holds a position on Hold ratings regardless of pool membership — the proxy exits earlier; note it in the report |
+| `max_order_value_cap: 15000`/day | not modeled — comparison-level impact minor; note in report |
+| capital = min(config $100k, real cash $10k) | sim uses config capital — sizing scale affects absolute P&L, not the method ranking; note in report |
+| data warm-up | the 6m-return metric needs 126 trading days of history — **simulation starts ~126 days after the download window opens**; mention in report |
+
+**Forward-alpha tables** additionally measure entry quality over 5d/20d horizons
+measured from the **entry fill date** (next open), not the screen date.
 
 ## 6. Implementation tasks (follow in order)
 
