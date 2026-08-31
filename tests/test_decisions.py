@@ -18,7 +18,7 @@ def test_buy_not_held_on_buy_rating_with_protection():
     orders = compute_orders(RATINGS, HOLDINGS, CLOSE, capital=100_000, max_positions=10)
     buys = {o.ticker: o for o in orders if o.action == "BUY"}
     assert set(buys) == {"AAPL", "NVDA"}
-    assert buys["AAPL"].shares == 100  # 100_000 / 10 / 100.0
+    assert buys["AAPL"].shares == 150   # 100_000 / 10 x 1.5 / 100.0 (conviction Buy)
     assert buys["AAPL"].protection_price == 102.0  # +2%
     assert buys["AAPL"].reason == "entry"
 
@@ -45,13 +45,13 @@ def test_shares_lt_1_skips_buy():
 
 def test_max_order_value_cap_drops_largest_buy():
     ratings = {"AAPL": "Buy", "NVDA": "Buy"}
-    # slice = 10_000 each -> AAPL 100@100 = 10_000, NVDA 66@150 = 9_900; total 19_900
+    # slice 15_000 each (conviction x1.5) -> AAPL 150@100 = 15_000, NVDA 100@150 = 15_000
     orders = compute_orders(ratings, {}, CLOSE, capital=100_000, max_positions=10,
-                            max_order_value_cap=20_000)
+                            max_order_value_cap=31_000)
     assert len([o for o in orders if o.action == "BUY"]) == 2  # total under cap
     orders = compute_orders(ratings, {}, CLOSE, capital=100_000, max_positions=10,
-                            max_order_value_cap=12_000)
-    # total 19_900 > 12_000 -> drop the largest-ticket buy (AAPL)
+                            max_order_value_cap=20_000)
+    # total 30_000 > 20_000 -> drop the largest-ticket buy (AAPL)
     assert len([o for o in orders if o.action == "BUY"]) == 1
     assert orders[0].ticker == "NVDA"
 
@@ -79,3 +79,28 @@ def test_sell_has_no_stop():
                             capital=100_000, max_positions=10)
     assert orders[0].action == "SELL"
     assert orders[0].stop_price is None
+
+
+def test_conviction_scaling_buy_outranks_overweight():
+    orders = compute_orders({"AAPL": "Buy", "NVDA": "Overweight"}, {},
+                            {"AAPL": 100.0, "NVDA": 100.0},
+                            capital=100_000, max_positions=10)
+    by_ticker = {o.ticker: o for o in orders}
+    assert by_ticker["AAPL"].shares == 150   # base slice 10k x 1.5 / 100
+    assert by_ticker["NVDA"].shares == 100   # base slice x 1.0
+
+
+def test_conviction_weights_configurable():
+    orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0},
+                            capital=100_000, max_positions=10,
+                            conviction_weights={"Buy": 2.0})
+    assert orders[0].shares == 200
+
+
+def test_conviction_cap_still_enforced():
+    orders = compute_orders({"AAPL": "Buy", "NVDA": "Overweight"}, {},
+                            {"AAPL": 100.0, "NVDA": 100.0},
+                            capital=100_000, max_positions=10,
+                            max_order_value_cap=16_000)
+    # AAPL 15_000 + NVDA 10_000 = 25_000 > 16_000 -> drop largest (AAPL)
+    assert [o.ticker for o in orders] == ["NVDA"]

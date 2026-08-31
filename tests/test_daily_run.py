@@ -322,7 +322,7 @@ def test_run_execute_caps_capital_by_actual_cash(cfg, caplog):
         rc = run_execute(cfg)
     assert rc == 0
     orders = broker.place_market_orders.call_args[0][0]
-    assert orders[0].shares == 100  # 100_000 cash / 10 positions / 100.0
+    assert orders[0].shares == 150  # 100_000 cash cap / 10 positions x 1.5 (Buy) / 100.0
     assert any("cash" in r.message.lower() for r in caplog.records)
 
 

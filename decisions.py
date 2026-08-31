@@ -16,11 +16,15 @@ class Order:
     stop_price: float | None = None        # set on BUY orders (broker-side stop)
 
 
+DEFAULT_CONVICTIION_WEIGHTS = {"Buy": 1.5, "Overweight": 1.0}
+
+
 def compute_orders(ratings, holdings, last_close, capital, max_positions,
                    max_order_value_cap=None, entry_protection_pct=2.0,
-                   stop_loss_pct=8.0):
+                   stop_loss_pct=8.0, conviction_weights=None):
     orders = []
-    slice_value = capital / max_positions
+    weights = conviction_weights or DEFAULT_CONVICTIION_WEIGHTS
+    base_slice = capital / max_positions
 
     for ticker, shares in holdings.items():
         if ticker in ratings and ratings[ticker] in SELL_RATINGS:
@@ -34,6 +38,7 @@ def compute_orders(ratings, holdings, last_close, capital, max_positions,
         price = last_close.get(ticker)
         if not price:
             continue
+        slice_value = base_slice * weights.get(rating, 1.0)
         shares = int(slice_value / price)
         if shares < 1:
             continue

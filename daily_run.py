@@ -384,7 +384,8 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
             max_order_value_cap=cfg.get("max_order_value_cap"),
             entry_protection_pct=float(cfg.get("screener", {}).get(
                 "entry_protection_pct", 2.0)),
-            stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)))
+            stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
+            conviction_weights=cfg.get("conviction_weights"))
 
         # Two-phase execution log: write the "submitted" mark BEFORE placing
         # orders so a crash mid-submit can never double-execute on rerun
