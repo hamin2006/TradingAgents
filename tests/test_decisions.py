@@ -104,3 +104,31 @@ def test_conviction_cap_still_enforced():
                             max_order_value_cap=16_000)
     # AAPL 15_000 + NVDA 10_000 = 25_000 > 16_000 -> drop largest (AAPL)
     assert [o.ticker for o in orders] == ["NVDA"]
+
+
+def test_position_cap_trims_buys():
+    """max_positions caps total positions: 7 held + 8 Buy-rated candidates
+    -> only 3 new buys."""
+    ratings = {f"C{i}": "Buy" for i in range(8)}
+    holdings = {f"H{i}": 10 for i in range(7)}
+    close = {**{f"C{i}": 100.0 for i in range(8)}, **{f"H{i}": 50.0 for i in range(7)}}
+    orders = compute_orders(ratings, holdings, close, capital=100_000, max_positions=10)
+    buys = [o for o in orders if o.action == "BUY"]
+    assert len(buys) == 3  # 10 - 7 slots
+
+
+def test_position_cap_no_buys_when_full():
+    ratings = {"C0": "Buy", "C1": "Buy"}
+    holdings = {f"H{i}": 10 for i in range(10)}
+    close = {"C0": 100.0, "C1": 100.0, **{f"H{i}": 50.0 for i in range(10)}}
+    orders = compute_orders(ratings, holdings, close, capital=100_000, max_positions=10)
+    assert [o for o in orders if o.action == "BUY"] == []
+
+
+def test_position_cap_prioritizes_buy_over_overweight():
+    ratings = {"A": "Overweight", "B": "Buy"}
+    holdings = {f"H{i}": 10 for i in range(9)}  # 1 slot left
+    close = {"A": 100.0, "B": 100.0, **{f"H{i}": 50.0 for i in range(9)}}
+    orders = compute_orders(ratings, holdings, close, capital=100_000, max_positions=10)
+    buys = [o.ticker for o in orders if o.action == "BUY"]
+    assert buys == ["B"]  # conviction wins the last slot

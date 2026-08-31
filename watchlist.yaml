@@ -7,7 +7,7 @@ deep_think_llm: deepseek/deepseek-v4-pro
 output_language: English
 
 capital: 100000            # paper capital
-max_positions: 10          # equal-weight denominator
+max_positions: 10          # position-count cap AND equal-weight denominator
 max_order_value_cap: 15000 # per-day total buy cap
 stop_loss_pct: 8.0         # broker-side GTC stop on every buy (0 disables)
 conviction_weights:        # slice multiplier per rating (base = capital / max_positions)
@@ -18,7 +18,7 @@ analyze_max_workers: 4     # parallel ticker analyses in the morning pass
 screener:
   universe: sp500
   pool_size: 50            # ranked queue depth the daily draw may use
-  candidate_slots: 3
+  candidate_slots: 8       # candidates drawn daily from the ranked queue
   min_watchlist_size: 5    # production gate (test: 1)
   exclusion_days: 3        # churn guard; keep candidates as fresh as possible
   entry_protection_pct: 2.0

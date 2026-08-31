@@ -55,4 +55,13 @@ def compute_orders(ratings, holdings, last_close, capital, max_positions,
                 break
             buys.remove(max(buys, key=lambda o: o.shares * last_close[o.ticker]))
 
+    # Position-count cap: never hold more than max_positions. Slots are won by
+    # conviction first (Buy before Overweight), then deterministically by ticker.
+    slots = max_positions - len(holdings)
+    if len(buys) > slots:
+        buys.sort(key=lambda o: (0 if o.reason == "entry" and o.ticker in
+                                 {t for t, r in ratings.items()
+                                  if r == "Buy"} else 1, o.ticker))
+        buys = buys[:max(0, slots)]
+
     return orders + buys
