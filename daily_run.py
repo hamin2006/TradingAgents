@@ -179,6 +179,7 @@ _REDDIT_LOCK = threading.RLock()  # re-entrant: reddit.py's own 429 retry re-inv
 _REDDIT_PATCHED = False
 _REDDIT_MIN_INTERVAL = 8.0  # seconds between Reddit requests (anonymous ~10/min)
 _REDDIT_LAST_TS = 0.0  # monotonic timestamp of the last request, guarded by _REDDIT_LOCK
+_REDDIT_OAUTH_PATCHED = False
 
 
 def _ensure_reddit_pacing() -> None:
@@ -211,6 +212,29 @@ def _ensure_reddit_pacing() -> None:
     paced_rss._wrapped_original = original  # tests unwrap to the real fetcher
     reddit_mod._fetch_subreddit_rss = paced_rss
     _REDDIT_PATCHED = True
+
+
+def _ensure_reddit_oauth() -> bool:
+    """Swap the sentiment analyst's Reddit fetch to the OAuth path when
+    REDDIT_CLIENT_ID / REDDIT_SECRET are set (100 QPM vs ~10 anonymous).
+
+    Returns True when OAuth is active (or was already), False when the creds
+    are absent — the caller then keeps the paced anonymous RSS path.
+    """
+    global _REDDIT_OAUTH_PATCHED
+    if _REDDIT_OAUTH_PATCHED:
+        return True
+    import reddit_auth
+    if not reddit_auth.credentials_available():
+        return False
+    # sentiment_analyst binds fetch_reddit_posts at import time; swap its
+    # module global so the analyst's calls use our OAuth fetcher. Signature
+    # and output block format are drop-in identical.
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+    sa.fetch_reddit_posts = reddit_auth.fetch_reddit_posts
+    _REDDIT_OAUTH_PATCHED = True
+    logger.info("Reddit: using OAuth fetcher (100 QPM)")
+    return True
 
 
 def _analyze_one(ticker: str, today_str: str, cfg: dict):
@@ -256,7 +280,8 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
                                        memory_log.load_entries(), cfg, TODAY_ET())
 
     _ensure_memory_write_lock()
-    _ensure_reddit_pacing()
+    if not _ensure_reddit_oauth():
+        _ensure_reddit_pacing()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):

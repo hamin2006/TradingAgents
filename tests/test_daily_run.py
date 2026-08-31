@@ -475,3 +475,37 @@ def test_reddit_pacing_survives_internal_retry_recursion():
         daily_run._REDDIT_PATCHED = False
         daily_run._REDDIT_LAST_TS = 0.0
         daily_run._REDDIT_MIN_INTERVAL = 8.0
+
+
+def test_reddit_oauth_swapped_when_creds_present(monkeypatch):
+    import daily_run
+    import reddit_auth
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    monkeypatch.setenv("REDDIT_CLIENT_ID", "c")
+    monkeypatch.setenv("REDDIT_SECRET", "s")
+    original = sa.fetch_reddit_posts
+    daily_run._REDDIT_OAUTH_PATCHED = False
+    try:
+        swapped = daily_run._ensure_reddit_oauth()
+        assert swapped is True
+        assert sa.fetch_reddit_posts is reddit_auth.fetch_reddit_posts
+    finally:
+        sa.fetch_reddit_posts = original
+        daily_run._REDDIT_OAUTH_PATCHED = False
+
+
+def test_reddit_oauth_not_swapped_without_creds(monkeypatch):
+    import daily_run
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    monkeypatch.delenv("REDDIT_CLIENT_ID", raising=False)
+    monkeypatch.delenv("REDDIT_SECRET", raising=False)
+    original = sa.fetch_reddit_posts
+    daily_run._REDDIT_OAUTH_PATCHED = False
+    try:
+        swapped = daily_run._ensure_reddit_oauth()
+        assert swapped is False
+        assert sa.fetch_reddit_posts is original
+    finally:
+        daily_run._REDDIT_OAUTH_PATCHED = False

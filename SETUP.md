@@ -31,6 +31,29 @@
 Verify all keys: `cd ~/workplace/TradingAgents && .venv/bin/python daily_run.py --analyze --tickers AAPL`
 should start printing per-agent analysis.
 
+### 4. Reddit OAuth (optional, 10x the rate limit — recommended)
+The anonymous RSS path is rate-limited to ~10 req/min (429s under parallel
+analysis). A free script app raises that to 100 req/min and returns real
+scores/comment counts.
+
+1. Log in to Reddit, then open **https://www.reddit.com/prefs/apps** (if it
+   says "page not found", you're logged out — sign in first, the page lives
+   under your account settings).
+2. Scroll to the bottom → **"are you a developer? create an app..."**.
+3. Fill in: name `daily-trading`, **type: script**, description anything,
+   redirect uri `http://localhost:8080` (unused for script apps but required).
+   → **create app**.
+4. Under your new app: the line under "personal use script" is the
+   **client ID** (~14 chars, not secret); **secret** is the other field.
+5. Paste both into `.env`: `REDDIT_CLIENT_ID=...` and `REDDIT_SECRET=...`.
+6. Verify (uses the live API, reads only):
+   `cd ~/workplace/TradingAgents && .venv/bin/python -c "
+   import reddit_auth; print(reddit_auth.fetch_reddit_posts('AAPL', subreddits=('stocks',)))"`
+
+With creds set, the analysis uses the OAuth fetcher automatically (you'll see
+`Reddit: using OAuth fetcher (100 QPM)` in the logs); without them it falls
+back to the paced RSS path.
+
 ### 3. IBKR paper trading + API (~30 min, account approval can take a day)
 1. **Account**: create an individual account at https://www.interactivebrokers.com (needs government ID; approval usually 1–3 days). Skip if you already have one.
 2. **Paper account**: log into the IBKR Client Portal → **Settings → Account Settings → Trading Configuration → Paper Trading Account** → enable it. IBKR mirrors your account as a paper environment (funded with $1M fake cash, no live money ever).
