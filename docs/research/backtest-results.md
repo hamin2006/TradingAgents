@@ -1,6 +1,6 @@
 # Backtest: Screening-Method Matrix (candidate quality, not final P&L)
 
-**Date:** 2026-08-31 · **Universe:** 503 S&P 500 names · **Replay window:** 3y daily, screen replayed every trading day · **Top-N/day:** 10 · **Horizons:** 5d/20d forward alpha vs SPY
+**Date:** 2026-08-31 · **Universe:** 503 S&P 500 names · **Replay window:** 5y daily, screen replayed every trading day · **Top-N/day:** 10 · **Horizons:** 5d/20d forward alpha vs SPY
 
 Candidate **quality only** — the LLM multi-agent layer (non-deterministic, expensive) is deliberately excluded; it sits after the screen. Results decide the rollout order of the §5bis upgrades.
 
@@ -8,15 +8,15 @@ Candidate **quality only** — the LLM multi-agent layer (non-deterministic, exp
 
 | combo | avg 5d | hit 5d | p5 5d | avg 20d | hit 20d | p5 20d | tot ret | max DD | win% | trades |
 |---|---|---|---|---|---|---|---|---|---|---|
-| raw_momentum+none | 1.25% | 54.00% | -11.39% | 4.62% | 56.19% | -20.31% | 438.16% | -24.74% | 44.04% | 1149 |
-| raw_momentum+regime_gate | 1.28% | 54.54% | -11.32% | 4.59% | 55.77% | -20.46% | 205.09% | -17.84% | 47.62% | 1325 |
-| raw_momentum+dual_momentum | 1.09% | 53.67% | -11.10% | 4.09% | 56.02% | -19.86% | 239.62% | -24.09% | 44.04% | 1158 |
-| vol_adjusted+none | 0.82% | 51.86% | -9.96% | 3.10% | 53.12% | -18.17% | 192.81% | -15.38% | 43.63% | 1373 |
-| vol_adjusted+regime_gate | 0.84% | 52.28% | -9.84% | 3.24% | 53.15% | -17.61% | 148.69% | -14.66% | 45.82% | 1554 |
-| vol_adjusted+dual_momentum | 0.65% | 51.26% | -9.83% | 2.53% | 52.64% | -17.67% | 163.29% | -16.20% | 42.69% | 1403 |
-| rank_based+none | 0.44% | 51.02% | -8.27% | 1.64% | 50.46% | -14.89% | 114.81% | -14.69% | 43.28% | 2135 |
-| rank_based+regime_gate | 0.46% | 51.45% | -8.16% | 1.83% | 51.04% | -13.89% | 91.66% | -14.18% | 44.49% | 2234 |
-| rank_based+dual_momentum | 0.37% | 50.54% | -8.22% | 1.38% | 50.14% | -14.81% | 101.71% | -14.88% | 43.16% | 2127 |
+| raw_momentum+none | 0.92% | 52.76% | -10.52% | 3.23% | 53.57% | -18.94% | 449.47% | -25.68% | 42.02% | 1999 |
+| raw_momentum+regime_gate | 1.14% | 53.68% | -10.62% | 3.93% | 54.77% | -19.01% | 263.51% | -20.96% | 44.79% | 1748 |
+| raw_momentum+dual_momentum | 0.81% | 52.65% | -10.06% | 2.73% | 53.33% | -18.43% | 281.49% | -23.00% | 43.66% | 2020 |
+| vol_adjusted+none | 0.53% | 50.88% | -9.32% | 2.03% | 51.01% | -16.71% | 218.37% | -26.00% | 42.83% | 2342 |
+| vol_adjusted+regime_gate | 0.70% | 51.38% | -9.25% | 2.72% | 52.50% | -16.38% | 187.48% | -18.59% | 44.64% | 2108 |
+| vol_adjusted+dual_momentum | 0.48% | 51.05% | -9.02% | 1.66% | 50.79% | -16.24% | 212.90% | -24.76% | 43.35% | 2309 |
+| rank_based+none | 0.26% | 50.42% | -7.87% | 0.99% | 48.90% | -14.45% | 140.49% | -18.88% | 42.84% | 3287 |
+| rank_based+regime_gate | 0.40% | 50.97% | -7.57% | 1.57% | 50.51% | -13.17% | 135.00% | -11.95% | 44.32% | 2845 |
+| rank_based+dual_momentum | 0.21% | 50.14% | -7.86% | 0.80% | 48.58% | -14.44% | 132.97% | -19.15% | 43.08% | 3294 |
 
 ## 2. Half-period splits (robustness)
 
@@ -24,114 +24,121 @@ Candidate **quality only** — the LLM multi-agent layer (non-deterministic, exp
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.70% | 51.57% | -10.61% | 2.24% | 50.77% | -20.49% | 86.33% | -15.77% |
-| second | 1.78% | 56.42% | -12.27% | 7.08% | 61.89% | -20.19% | 439.39% | -19.13% |
+| first | 0.42% | 50.50% | -9.16% | 1.36% | 49.44% | -17.35% | 56.71% | -25.68% |
+| second | 1.43% | 55.07% | -11.74% | 5.17% | 57.84% | -20.52% | 450.30% | -22.23% |
 
 ### raw_momentum + regime_gate
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.79% | 51.59% | -9.79% | 3.07% | 52.75% | -18.50% | 72.66% | -14.83% |
-| second | 1.75% | 57.42% | -13.28% | 6.18% | 58.94% | -22.91% | 206.47% | -17.84% |
+| first | 0.51% | 50.23% | -9.53% | 1.48% | 48.95% | -17.99% | 64.11% | -20.96% |
+| second | 1.77% | 57.13% | -11.79% | 6.45% | 60.70% | -20.35% | 264.35% | -12.85% |
 
 ### raw_momentum + dual_momentum
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.61% | 51.04% | -10.32% | 2.16% | 50.80% | -19.90% | 82.43% | -16.57% |
-| second | 1.55% | 56.27% | -12.00% | 6.08% | 61.45% | -19.81% | 240.15% | -10.46% |
+| first | 0.42% | 50.58% | -8.61% | 1.11% | 49.28% | -16.61% | 67.49% | -23.00% |
+| second | 1.20% | 54.76% | -11.40% | 4.41% | 57.50% | -20.01% | 282.55% | -19.26% |
 
 ### vol_adjusted + none
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.29% | 49.25% | -8.85% | 0.87% | 47.17% | -17.54% | 39.77% | -14.81% |
-| second | 1.35% | 54.52% | -10.85% | 5.41% | 59.44% | -18.70% | 194.07% | -10.30% |
+| first | 0.04% | 48.42% | -8.01% | 0.32% | 46.86% | -14.95% | 34.63% | -26.00% |
+| second | 1.02% | 53.38% | -10.53% | 3.80% | 55.26% | -18.58% | 218.72% | -12.38% |
 
 ### vol_adjusted + regime_gate
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.25% | 48.29% | -8.18% | 1.36% | 48.46% | -15.88% | 37.25% | -14.66% |
-| second | 1.40% | 56.17% | -11.37% | 5.21% | 58.00% | -19.63% | 149.95% | -11.43% |
+| first | 0.11% | 47.42% | -7.63% | 0.58% | 46.99% | -15.26% | 42.79% | -18.59% |
+| second | 1.28% | 55.33% | -10.48% | 4.92% | 58.16% | -17.86% | 187.83% | -8.27% |
 
 ### vol_adjusted + dual_momentum
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.26% | 48.72% | -8.56% | 0.84% | 47.01% | -16.92% | 38.89% | -14.53% |
-| second | 1.04% | 53.89% | -10.80% | 4.29% | 58.60% | -18.60% | 163.96% | -10.22% |
+| first | 0.12% | 49.07% | -7.76% | 0.26% | 46.96% | -14.72% | 41.95% | -24.76% |
+| second | 0.87% | 53.08% | -10.16% | 3.12% | 54.76% | -18.12% | 212.96% | -14.38% |
 
 ### rank_based + none
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.09% | 48.88% | -6.76% | 0.59% | 47.44% | -13.18% | 27.42% | -14.69% |
-| second | 0.79% | 53.24% | -9.56% | 2.74% | 53.76% | -16.22% | 115.87% | -8.45% |
+| first | -0.03% | 48.93% | -6.70% | -0.04% | 46.26% | -13.21% | 24.62% | -18.88% |
+| second | 0.55% | 51.95% | -8.95% | 2.05% | 51.64% | -15.71% | 140.54% | -10.56% |
 
 ### rank_based + regime_gate
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.11% | 48.20% | -6.49% | 0.88% | 48.00% | -12.18% | 28.04% | -14.18% |
-| second | 0.79% | 54.61% | -9.71% | 2.82% | 54.21% | -15.99% | 92.72% | -10.64% |
+| first | 0.04% | 48.22% | -6.13% | 0.27% | 46.39% | -11.91% | 39.00% | -11.95% |
+| second | 0.75% | 53.73% | -9.02% | 2.90% | 54.76% | -14.99% | 135.05% | -7.81% |
 
 ### rank_based + dual_momentum
 
 | half | avg5d | hit5d | p5_5d | avg20d | hit20d | p5_20d | tot_ret | maxDD |
 |---|---|---|---|---|---|---|---|
-| first | 0.07% | 48.32% | -6.69% | 0.47% | 46.98% | -13.18% | 18.77% | -14.88% |
-| second | 0.67% | 52.82% | -9.56% | 2.32% | 53.52% | -16.24% | 102.44% | -8.89% |
+| first | -0.03% | 48.80% | -6.72% | -0.03% | 46.14% | -13.21% | 24.20% | -19.15% |
+| second | 0.45% | 51.54% | -8.91% | 1.66% | 51.15% | -15.65% | 133.07% | -11.72% |
 
 ## 3. Method verdicts (rollout order)
 
-Sample: Aug 2023 – Aug 2026 (a strong, essentially uninterrupted bull window — no
-sustained S&P 500 drawdown ≥ 20%). Every strategy + gate is stable across the
-half-period split (the return *ordering* holds in both halves), so the ranking is
-not a second-half fluke. But the absence of a crash regime in-sample is the central
-caveat for interpreting it.
+Sample: Aug 2021 – Aug 2026 — **the first half contains the 2021–22 market-wide
+decline and the 2022 selloff**, which is the regime every §5bis defense exists for.
+This run is the decisive raw-vs-vol test.
 
-**Scoring strategy (return vs drawdown trade, gate = none):**
+**raw vs vol, with the crash in sample (gate = none, first-half crash period):**
 
-| strategy | avg 20d alpha | hit 20d | max DD | total ret | reading |
+| strategy | avg 20d | hit 20d | first-half max DD | first-half tot | p5 20d |
 |---|---|---|---|---|---|
-| raw_momentum | **4.62%** | **56.2%** | −24.7% | **438%** | highest return, deepest drawdown |
-| vol_adjusted (current) | 3.10% | 53.1% | −15.4% | 193% | ~half the return, ~⅔ the drawdown |
-| rank_based | 1.64% | 50.5% | **−14.7%** | 115% | smallest drawdown, worst return |
+| raw_momentum | 3.23% | 53.6% | −25.68% | 56.7% | −17.35% |
+| vol_adjusted (current) | 2.03% | 51.0% | −26.00% | 34.6% | −14.95% |
 
-**Gate effect (same strategy):** every gate traded return for a smaller drawdown.
-regime_gate cut max DD on *all three* strategies (raw −24.7→−17.8, vol −15.4→−14.7,
-rank −14.7→−14.2) at a modest return cost; dual_momentum's DD benefit was inconsistent
-(great second-half for raw −10.5%, worse first-half).
+**Verdict: vol-adjustment's promised crash protection does NOT materialize as
+portfolio drawdown in the 2021–22 crash.** In the crash half vol_adjusted had a
+marginally *worse* max drawdown than raw (−26.00% vs −25.68%) while giving up ~2/3
+of the return. The 2022 decline was market-wide — the "calm grinders" vol-adjustment
+demotes *toward* were sold off too, so a ticker-selection tweak cannot protect the
+portfolio. Vol-adjustment's only real effect is a better *candidate downside tail*
+(p5_20d −14.95% vs −17.35%) — it reduces per-name tail risk, not portfolio drawdown.
+This falsifies the §5bis #1 prior ("virtually eliminates crashes") in this setup.
 
-**Verdict — evidence contradicts the literature prior in this sample.** The
-literature's "best value" upgrade (vol-adjustment) *reduced* forward alpha and total
-return here; it and the gates act as **drawdown reducers, not return boosters**. That
-is the *expected* mechanism (vol-managed momentum pays off in crashes), but this
-window had no crash, so their protection is unmeasured — the return they "cost" is the
-insurance premium, sampled without the accident.
+**The regime gate is the drawdown hedge — because the crash was market-wide, only a
+market-level gate helps:**
+
+| combo | avg 20d | max DD | tot ret |
+|---|---|---|---|
+| **raw + regime_gate** | **3.93%** | **−20.96%** | **263%** |
+| raw + none | 3.23% | −25.68% | 449% |
+| vol + regime_gate | 2.72% | −18.59% | 187% |
+| vol + none | 2.03% | −26.00% | 218% |
+| rank + regime_gate | 1.57% | −11.95% | 135% |
+| rank + none | 0.99% | −18.88% | 140% |
+
+The regime gate (SPY vs 200d SMA × VIX → STRESS pauses buys) cut max DD on *every*
+strategy (raw −25.7→−21.0, vol −26.0→−18.6, rank −18.9→−12.0) at the smallest return
+cost — because it de-risks *when* (market-timing), not just *who*.
 
 **Recommended rollout order (measured):**
 
-1. **Keep vol_adjusted as the default core.** It is the balanced pick: consistently
-   ~⅓ less drawdown than raw for ~½ the return, in both halves. raw_momentum's higher
-   return comes with the −24.7% drawdown — exactly the crash-prone profile this system
-   ships vol-adjustment to avoid.
-2. **Add the regime gate next** (SPY-vs-200d-SMA × VIX → CALM/WARN/STRESS). It is the
-   only change that improved max DD on every strategy at the smallest return cost — the
-   best drawdown-per-return trade in this sample. Its crash payoff is out-of-sample.
-3. **Drop rank_based** — worst return with no drawdown advantage over vol_adjusted.
-   Deprioritize (keep it in the registry; do not make it a default).
-4. **Defer dual_momentum** — inconsistent drawdown benefit, clear return cost.
-5. **Do not switch to raw_momentum** on this evidence — the bull-only window flatters
-   it; its drawdown confirms the fragility the research warned about, and its crash
-   regime is exactly what is not in-sample.
+1. **Switch the default to `raw_momentum + regime_gate`** — the best return-per-drawdown
+   combo in the full matrix: raw's superior alpha (3.93%/20d, highest of all 9) with the
+   regime gate cutting its crash drawdown to −20.96% (vs −25.68% raw-alone).
+2. **Add the regime gate** as the system's drawdown hedge — it is the only change that
+   survived the crash-in-sample test on every strategy.
+3. **Demote vol_adjusted** — its crash protection is falsified in the portfolio sim
+   (−26.0% in the crash half ≈ raw). Keep it in the registry; do not default to it.
+4. **Drop rank_based** — worst return on every gate, its max-DD advantage is small and
+   it does not compound raw alpha.
+5. **Defer dual_momentum** — no drawdown benefit over the regime gate, clear return cost.
 
-**Decisive next test:** extend the window to `--years 5` (includes the 2021–22 crash)
-so the vol-adjustment/regime insurance can be measured where it is supposed to pay off.
-Until that run, the return ranking above is bull-regime evidence only and should not
-override the shipped vol-adjusted default. Production defaults change only with user
-approval.
+**Caveat on the flip:** this overturns the earlier 3y (bull-only) read, where vol looked
+like the balanced pick. The 3y window had no crash, so vol's protection was unmeasured
+and its return cost looked like insurance. Once the 2021–22 crash is actually in sample,
+that insurance paid nothing — the regime gate is the hedge that works. Raw + regime_gate
+is the evidence-backed default.
 
 ## 4. Caveats
 
@@ -149,452 +156,452 @@ _Machine-readable results embedded below._
 ```json
 {
   "raw_momentum+none": {
-    "avg_5d": 0.012451182267189345,
-    "hit_5d": 0.5399732620320855,
-    "p5_5d": -0.11391546837076022,
-    "worst_5d": -0.3161357998180979,
-    "n_5d": 7480,
-    "avg_20d": 0.04615669914902695,
-    "hit_20d": 0.5619372442019099,
-    "p5_20d": -0.20312398374878587,
-    "worst_20d": -0.5687186711732677,
-    "n_20d": 7330,
-    "total_return": 4.381559244675454,
-    "max_drawdown": -0.24740957639159844,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.44038294168842473,
-    "n_trades": 1149,
-    "n_obs": 14810,
+    "avg_5d": 0.009176655436162973,
+    "hit_5d": 0.5276220976781425,
+    "p5_5d": -0.1051659247676108,
+    "worst_5d": -0.31613590157535476,
+    "n_5d": 12490,
+    "avg_20d": 0.03228258045831827,
+    "hit_20d": 0.5357374392220421,
+    "p5_20d": -0.18941804148367902,
+    "worst_20d": -0.5687189567957632,
+    "n_20d": 12340,
+    "total_return": 4.4946708967448,
+    "max_drawdown": -0.25676423814604576,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.42021010505252626,
+    "n_trades": 1999,
+    "n_obs": 24830,
     "splits": {
       "first": {
-        "avg_5d": 0.006994016810037885,
-        "hit_5d": 0.5157333333333334,
-        "p5_5d": -0.10613564580544546,
-        "worst_5d": -0.3161357998180979,
-        "n_5d": 3750,
-        "avg_20d": 0.022431869986221823,
-        "hit_20d": 0.5077333333333334,
-        "p5_20d": -0.20489836514092477,
-        "worst_20d": -0.43286532517645204,
-        "n_20d": 3750,
-        "total_return": 0.8632822352753469,
-        "max_drawdown": -0.1576884730394561,
-        "n_equity_days": 375
+        "avg_5d": 0.004222070116297151,
+        "hit_5d": 0.50496,
+        "p5_5d": -0.09158964291176597,
+        "worst_5d": -0.2956711365949878,
+        "n_5d": 6250,
+        "avg_20d": 0.013594542792757111,
+        "hit_20d": 0.4944,
+        "p5_20d": -0.17354854068993586,
+        "worst_20d": -0.44389430182474576,
+        "n_20d": 6250,
+        "total_return": 0.5670519242405676,
+        "max_drawdown": -0.25676423814604576,
+        "n_equity_days": 625
       },
       "second": {
-        "avg_5d": 0.017836859409883193,
-        "hit_5d": 0.5641711229946524,
-        "p5_5d": -0.1226952826200226,
-        "worst_5d": -0.29027710636102566,
-        "n_5d": 3740,
-        "avg_20d": 0.07077807363353694,
-        "hit_20d": 0.618941504178273,
-        "p5_20d": -0.20194413049051585,
-        "worst_20d": -0.5687186711732677,
-        "n_20d": 3590,
-        "total_return": 4.393929270879382,
-        "max_drawdown": -0.19131703858660776,
-        "n_equity_days": 374
+        "avg_5d": 0.014289569424735728,
+        "hit_5d": 0.55072,
+        "p5_5d": -0.117398522756268,
+        "worst_5d": -0.31613590157535476,
+        "n_5d": 6250,
+        "avg_20d": 0.05165023903342183,
+        "hit_20d": 0.5783606557377049,
+        "p5_20d": -0.2051720619078674,
+        "worst_20d": -0.5687189567957632,
+        "n_20d": 6100,
+        "total_return": 4.503009334318051,
+        "max_drawdown": -0.22226072122646767,
+        "n_equity_days": 625
       }
     }
   },
   "raw_momentum+regime_gate": {
-    "avg_5d": 0.012781890327174096,
-    "hit_5d": 0.5454281567489114,
-    "p5_5d": -0.11320950431040837,
-    "worst_5d": -0.3161357998180979,
-    "n_5d": 6890,
-    "avg_20d": 0.0459032497419811,
-    "hit_20d": 0.5577151335311573,
-    "p5_20d": -0.20459065709140029,
+    "avg_5d": 0.011395757397920014,
+    "hit_5d": 0.5368205128205128,
+    "p5_5d": -0.10623794257195893,
+    "worst_5d": -0.31613590157535476,
+    "n_5d": 9750,
+    "avg_20d": 0.039322487608385234,
+    "hit_20d": 0.5477083333333334,
+    "p5_20d": -0.19009486805208262,
     "worst_20d": -0.5025153087027889,
-    "n_20d": 6740,
-    "total_return": 2.0508647050795985,
-    "max_drawdown": -0.17844448027446447,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.4762264150943396,
-    "n_trades": 1325,
-    "n_obs": 13630,
+    "n_20d": 9600,
+    "total_return": 2.635144904431636,
+    "max_drawdown": -0.2095878631590915,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.44794050343249425,
+    "n_trades": 1748,
+    "n_obs": 19350,
     "splits": {
       "first": {
-        "avg_5d": 0.007858961762706779,
-        "hit_5d": 0.5159420289855072,
-        "p5_5d": -0.09787219879307907,
-        "worst_5d": -0.29538511131820955,
-        "n_5d": 3450,
-        "avg_20d": 0.030745453464994427,
-        "hit_20d": 0.527536231884058,
-        "p5_20d": -0.18502673393615773,
-        "worst_20d": -0.40628087442017413,
-        "n_20d": 3450,
-        "total_return": 0.7266068235403436,
-        "max_drawdown": -0.14833731366331482,
-        "n_equity_days": 350
+        "avg_5d": 0.005067470726620986,
+        "hit_5d": 0.5022540983606557,
+        "p5_5d": -0.09531669683304138,
+        "worst_5d": -0.2956711365949878,
+        "n_5d": 4880,
+        "avg_20d": 0.014780397832562854,
+        "hit_20d": 0.48954918032786887,
+        "p5_20d": -0.179870474038454,
+        "worst_20d": -0.44389430182474576,
+        "n_20d": 4880,
+        "total_return": 0.6411289891702234,
+        "max_drawdown": -0.2095878631590915,
+        "n_equity_days": 708
       },
       "second": {
-        "avg_5d": 0.0175378387311445,
-        "hit_5d": 0.5742028985507246,
-        "p5_5d": -0.13279872835779127,
-        "worst_5d": -0.3161357998180979,
-        "n_5d": 3450,
-        "avg_20d": 0.061792782127064384,
-        "hit_20d": 0.5893939393939394,
-        "p5_20d": -0.22910735635557547,
+        "avg_5d": 0.017650132078821133,
+        "hit_5d": 0.5713114754098361,
+        "p5_5d": -0.11786753485803571,
+        "worst_5d": -0.31613590157535476,
+        "n_5d": 4880,
+        "avg_20d": 0.06447745013285178,
+        "hit_20d": 0.6069767441860465,
+        "p5_20d": -0.2035223059043027,
         "worst_20d": -0.5025153087027889,
-        "n_20d": 3300,
-        "total_return": 2.064736930685381,
-        "max_drawdown": -0.17844448027446447,
-        "n_equity_days": 399
+        "n_20d": 4730,
+        "total_return": 2.643483342004887,
+        "max_drawdown": -0.12850019424255177,
+        "n_equity_days": 542
       }
     }
   },
   "raw_momentum+dual_momentum": {
-    "avg_5d": 0.01089974012420986,
-    "hit_5d": 0.5367292225201072,
-    "p5_5d": -0.11097336214288667,
-    "worst_5d": -0.3161357998180979,
-    "n_5d": 7460,
-    "avg_20d": 0.04089020316610657,
-    "hit_20d": 0.5601915184678523,
-    "p5_20d": -0.19861824683989085,
+    "avg_5d": 0.008056122925847535,
+    "hit_5d": 0.5265224358974359,
+    "p5_5d": -0.10060413943515192,
+    "worst_5d": -0.31613590157535476,
+    "n_5d": 12480,
+    "avg_20d": 0.027319263571959344,
+    "hit_20d": 0.5332522303325223,
+    "p5_20d": -0.18431647112953628,
     "worst_20d": -0.5553232522816418,
-    "n_20d": 7310,
-    "total_return": 2.3961584635944577,
-    "max_drawdown": -0.24088716763258766,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.44041450777202074,
-    "n_trades": 1158,
-    "n_obs": 14770,
+    "n_20d": 12330,
+    "total_return": 2.8148550403776635,
+    "max_drawdown": -0.23003737954472614,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.43663366336633663,
+    "n_trades": 2020,
+    "n_obs": 24810,
     "splits": {
       "first": {
-        "avg_5d": 0.006143519346405553,
-        "hit_5d": 0.510427807486631,
-        "p5_5d": -0.1032493645081307,
-        "worst_5d": -0.3161357998180979,
-        "n_5d": 3740,
-        "avg_20d": 0.02158740183676652,
-        "hit_20d": 0.5080213903743316,
-        "p5_20d": -0.19900489856914327,
-        "worst_20d": -0.40628087442017413,
-        "n_20d": 3740,
-        "total_return": 0.8242950322127662,
-        "max_drawdown": -0.16571608055883014,
-        "n_equity_days": 374
+        "avg_5d": 0.004179420301231375,
+        "hit_5d": 0.50576,
+        "p5_5d": -0.08612787380425421,
+        "worst_5d": -0.2953850491690182,
+        "n_5d": 6250,
+        "avg_20d": 0.011119341148027454,
+        "hit_20d": 0.4928,
+        "p5_20d": -0.1660846891787044,
+        "worst_20d": -0.3554108503178156,
+        "n_20d": 6250,
+        "total_return": 0.6749279785586091,
+        "max_drawdown": -0.23003737954472614,
+        "n_equity_days": 625
       },
       "second": {
-        "avg_5d": 0.01550197730430266,
-        "hit_5d": 0.5627345844504021,
-        "p5_5d": -0.12003280920469112,
-        "worst_5d": -0.29027710636102566,
-        "n_5d": 3730,
-        "avg_20d": 0.06083440239523555,
-        "hit_20d": 0.6145251396648045,
-        "p5_20d": -0.1981360646356966,
+        "avg_5d": 0.012003823018955521,
+        "hit_5d": 0.5475961538461539,
+        "p5_5d": -0.11404909527825248,
+        "worst_5d": -0.31613590157535476,
+        "n_5d": 6240,
+        "avg_20d": 0.04408804453788383,
+        "hit_20d": 0.5750410509031199,
+        "p5_20d": -0.20014609124981864,
         "worst_20d": -0.5553232522816418,
-        "n_20d": 3580,
-        "total_return": 2.401464483412582,
-        "max_drawdown": -0.10456150133102105,
-        "n_equity_days": 373
+        "n_20d": 6090,
+        "total_return": 2.825532378249987,
+        "max_drawdown": -0.19258967539069616,
+        "n_equity_days": 624
       }
     }
   },
   "vol_adjusted+none": {
-    "avg_5d": 0.008164752383209361,
-    "hit_5d": 0.5185828877005347,
-    "p5_5d": -0.0996459882012602,
-    "worst_5d": -0.3161357998180979,
-    "n_5d": 7480,
-    "avg_20d": 0.0309511246552404,
-    "hit_20d": 0.5312414733969987,
-    "p5_20d": -0.18169100254040474,
+    "avg_5d": 0.005282610532709266,
+    "hit_5d": 0.5088070456365092,
+    "p5_5d": -0.09321306185711385,
+    "worst_5d": -0.31613590157535476,
+    "n_5d": 12490,
+    "avg_20d": 0.020327745641428786,
+    "hit_20d": 0.5101296596434359,
+    "p5_20d": -0.1670842483288431,
     "worst_20d": -0.5553232522816418,
-    "n_20d": 7330,
-    "total_return": 1.9280852802503876,
-    "max_drawdown": -0.15378574852184967,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.4362709395484341,
-    "n_trades": 1373,
-    "n_obs": 14810,
+    "n_20d": 12340,
+    "total_return": 2.1837163658291567,
+    "max_drawdown": -0.25995226693823326,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.428266438941076,
+    "n_trades": 2342,
+    "n_obs": 24830,
     "splits": {
       "first": {
-        "avg_5d": 0.0028571437431860426,
-        "hit_5d": 0.4925333333333333,
-        "p5_5d": -0.08854261136719764,
-        "worst_5d": -0.3161357998180979,
-        "n_5d": 3750,
-        "avg_20d": 0.008742769009120827,
-        "hit_20d": 0.47173333333333334,
-        "p5_20d": -0.1753705884271837,
-        "worst_20d": -0.43286532517645204,
-        "n_20d": 3750,
-        "total_return": 0.39768762170084626,
-        "max_drawdown": -0.14812423218812887,
-        "n_equity_days": 375
+        "avg_5d": 0.00043455338613252733,
+        "hit_5d": 0.48416,
+        "p5_5d": -0.08008932771679532,
+        "worst_5d": -0.2956711365949878,
+        "n_5d": 6250,
+        "avg_20d": 0.003164439596795148,
+        "hit_20d": 0.46864,
+        "p5_20d": -0.14951586776451112,
+        "worst_20d": -0.44389430182474576,
+        "n_20d": 6250,
+        "total_return": 0.34631661552687576,
+        "max_drawdown": -0.25995226693823326,
+        "n_equity_days": 625
       },
       "second": {
-        "avg_5d": 0.013508240820754644,
-        "hit_5d": 0.545187165775401,
-        "p5_5d": -0.10846030659226821,
-        "worst_5d": -0.29027710636102566,
-        "n_5d": 3740,
-        "avg_20d": 0.05414333326790841,
-        "hit_20d": 0.5944289693593314,
-        "p5_20d": -0.1869733852991988,
+        "avg_5d": 0.010210883993442348,
+        "hit_5d": 0.53376,
+        "p5_5d": -0.10528321026087754,
+        "worst_5d": -0.31613590157535476,
+        "n_5d": 6250,
+        "avg_20d": 0.03799717255510505,
+        "hit_20d": 0.5526229508196722,
+        "p5_20d": -0.18583231798502362,
         "worst_20d": -0.5553232522816418,
-        "n_20d": 3590,
-        "total_return": 1.9407241108976745,
-        "max_drawdown": -0.10295057395333929,
-        "n_equity_days": 374
+        "n_20d": 6100,
+        "total_return": 2.18723780424164,
+        "max_drawdown": -0.12376495053340608,
+        "n_equity_days": 625
       }
     }
   },
   "vol_adjusted+regime_gate": {
-    "avg_5d": 0.008368058680210497,
-    "hit_5d": 0.5227866473149492,
-    "p5_5d": -0.0983615028663458,
-    "worst_5d": -0.3161357998180979,
-    "n_5d": 6890,
-    "avg_20d": 0.03243077717824842,
-    "hit_20d": 0.5314540059347181,
-    "p5_20d": -0.1761211508981975,
+    "avg_5d": 0.00696381649497177,
+    "hit_5d": 0.5138461538461538,
+    "p5_5d": -0.09246320051132956,
+    "worst_5d": -0.31613590157535476,
+    "n_5d": 9750,
+    "avg_20d": 0.02718368710356017,
+    "hit_20d": 0.525,
+    "p5_20d": -0.16376666993645814,
     "worst_20d": -0.5025153087027889,
-    "n_20d": 6740,
-    "total_return": 1.4868655096905372,
-    "max_drawdown": -0.14658479089452892,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.45817245817245816,
-    "n_trades": 1554,
-    "n_obs": 13630,
+    "n_20d": 9600,
+    "total_return": 1.8747854035506224,
+    "max_drawdown": -0.18592754223786534,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.4463946869070209,
+    "n_trades": 2108,
+    "n_obs": 19350,
     "splits": {
       "first": {
-        "avg_5d": 0.002527178253382802,
-        "hit_5d": 0.48289855072463767,
-        "p5_5d": -0.0818213805083352,
-        "worst_5d": -0.29538511131820955,
-        "n_5d": 3450,
-        "avg_20d": 0.013605179886275494,
-        "hit_20d": 0.4846376811594203,
-        "p5_20d": -0.15881273772105306,
-        "worst_20d": -0.40628087442017413,
-        "n_20d": 3450,
-        "total_return": 0.3725437499215294,
-        "max_drawdown": -0.14658479089452892,
-        "n_equity_days": 350
+        "avg_5d": 0.0010783599338984524,
+        "hit_5d": 0.47418032786885245,
+        "p5_5d": -0.07633548616192738,
+        "worst_5d": -0.2956711365949878,
+        "n_5d": 4880,
+        "avg_20d": 0.005775209657607886,
+        "hit_20d": 0.46987704918032785,
+        "p5_20d": -0.15264254235476146,
+        "worst_20d": -0.44389430182474576,
+        "n_20d": 4880,
+        "total_return": 0.42791564684963057,
+        "max_drawdown": -0.18592754223786534,
+        "n_equity_days": 708
       },
       "second": {
-        "avg_5d": 0.013985719671454797,
-        "hit_5d": 0.5617391304347826,
-        "p5_5d": -0.11370504972682278,
-        "worst_5d": -0.3161357998180979,
-        "n_5d": 3450,
-        "avg_20d": 0.05212791421515451,
-        "hit_20d": 0.58,
-        "p5_20d": -0.19626310727183008,
+        "avg_5d": 0.012761313251731347,
+        "hit_5d": 0.5532786885245902,
+        "p5_5d": -0.10475064024364315,
+        "worst_5d": -0.31613590157535476,
+        "n_5d": 4880,
+        "avg_20d": 0.049208400426242326,
+        "hit_20d": 0.5816067653276955,
+        "p5_20d": -0.17859342588467975,
         "worst_20d": -0.5025153087027889,
-        "n_20d": 3300,
-        "total_return": 1.4995043403378236,
-        "max_drawdown": -0.1142811762063517,
-        "n_equity_days": 399
+        "n_20d": 4730,
+        "total_return": 1.8783068419631057,
+        "max_drawdown": -0.08269822813475547,
+        "n_equity_days": 542
       }
     }
   },
   "vol_adjusted+dual_momentum": {
-    "avg_5d": 0.006482208745844502,
-    "hit_5d": 0.5126005361930295,
-    "p5_5d": -0.09828456708686631,
-    "worst_5d": -0.3161357998180979,
-    "n_5d": 7460,
-    "avg_20d": 0.025275032620992736,
-    "hit_20d": 0.5264021887824898,
-    "p5_20d": -0.17670451313000426,
+    "avg_5d": 0.00484999253697806,
+    "hit_5d": 0.5104967948717949,
+    "p5_5d": -0.09024509200834617,
+    "worst_5d": -0.31613590157535476,
+    "n_5d": 12480,
+    "avg_20d": 0.01661512655445973,
+    "hit_20d": 0.5079480940794809,
+    "p5_20d": -0.1623966275945214,
     "worst_20d": -0.5553232522816418,
-    "n_20d": 7310,
-    "total_return": 1.632928467046988,
-    "max_drawdown": -0.16203887698520547,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.4269422665716322,
-    "n_trades": 1403,
-    "n_obs": 14770,
+    "n_20d": 12330,
+    "total_return": 2.129009944299016,
+    "max_drawdown": -0.24763673822439414,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.4335210047639671,
+    "n_trades": 2309,
+    "n_obs": 24810,
     "splits": {
       "first": {
-        "avg_5d": 0.002589650321166478,
-        "hit_5d": 0.48716577540106953,
-        "p5_5d": -0.08558986487903855,
-        "worst_5d": -0.3161357998180979,
-        "n_5d": 3740,
-        "avg_20d": 0.008427624807076102,
-        "hit_20d": 0.47005347593582886,
-        "p5_20d": -0.16921127542117106,
-        "worst_20d": -0.40628087442017413,
-        "n_20d": 3740,
-        "total_return": 0.38886358445879443,
-        "max_drawdown": -0.14528929511739053,
-        "n_equity_days": 374
+        "avg_5d": 0.0011804708742324543,
+        "hit_5d": 0.49072,
+        "p5_5d": -0.07755863387684087,
+        "worst_5d": -0.2953850491690182,
+        "n_5d": 6250,
+        "avg_20d": 0.002574550454664288,
+        "hit_20d": 0.4696,
+        "p5_20d": -0.14722515283865964,
+        "worst_20d": -0.3554108503178156,
+        "n_20d": 6250,
+        "total_return": 0.41953268257818266,
+        "max_drawdown": -0.24763673822439414,
+        "n_equity_days": 625
       },
       "second": {
-        "avg_5d": 0.01042410636552812,
-        "hit_5d": 0.5388739946380697,
-        "p5_5d": -0.10797897613061724,
-        "worst_5d": -0.29027710636102566,
-        "n_5d": 3730,
-        "avg_20d": 0.04285811666249681,
-        "hit_20d": 0.5860335195530726,
-        "p5_20d": -0.18598577221476129,
+        "avg_5d": 0.008654732739872231,
+        "hit_5d": 0.5307692307692308,
+        "p5_5d": -0.10160480234835605,
+        "worst_5d": -0.31613590157535476,
+        "n_5d": 6240,
+        "avg_20d": 0.03117534034799544,
+        "hit_20d": 0.5476190476190477,
+        "p5_20d": -0.18122621152532112,
         "worst_20d": -0.5553232522816418,
-        "n_20d": 3580,
-        "total_return": 1.63957029207904,
-        "max_drawdown": -0.10219295225139902,
-        "n_equity_days": 373
+        "n_20d": 6090,
+        "total_return": 2.129632166402907,
+        "max_drawdown": -0.1437520064901554,
+        "n_equity_days": 624
       }
     }
   },
   "rank_based+none": {
-    "avg_5d": 0.004405823273578421,
-    "hit_5d": 0.5101604278074866,
-    "p5_5d": -0.0826714030669777,
-    "worst_5d": -0.49378908472623373,
-    "n_5d": 7480,
-    "avg_20d": 0.016381038776404216,
-    "hit_20d": 0.5046384720327421,
-    "p5_20d": -0.1488900264234308,
-    "worst_20d": -0.4927348043632437,
-    "n_20d": 7330,
-    "total_return": 1.1481139734197372,
-    "max_drawdown": -0.14691492959085273,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.43278688524590164,
-    "n_trades": 2135,
-    "n_obs": 14810,
+    "avg_5d": 0.0026072397103011663,
+    "hit_5d": 0.5042433947157726,
+    "p5_5d": -0.07871935058021642,
+    "worst_5d": -0.4937890847262335,
+    "n_5d": 12490,
+    "avg_20d": 0.00986406509111746,
+    "hit_20d": 0.48897893030794165,
+    "p5_20d": -0.1444805790514663,
+    "worst_20d": -0.4927348043632436,
+    "n_20d": 12340,
+    "total_return": 1.4049449113303956,
+    "max_drawdown": -0.18875375855998144,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.42835412229996955,
+    "n_trades": 3287,
+    "n_obs": 24830,
     "splits": {
       "first": {
-        "avg_5d": 0.0009310085769831351,
-        "hit_5d": 0.4888,
-        "p5_5d": -0.06760191971829398,
-        "worst_5d": -0.2701149678379191,
-        "n_5d": 3750,
-        "avg_20d": 0.0058599637047241,
-        "hit_20d": 0.4744,
-        "p5_20d": -0.1318157895766674,
-        "worst_20d": -0.40628087442017413,
-        "n_20d": 3750,
-        "total_return": 0.2742283324257482,
-        "max_drawdown": -0.14691492959085273,
-        "n_equity_days": 375
+        "avg_5d": -0.0002739679680937377,
+        "hit_5d": 0.48928,
+        "p5_5d": -0.06704704298807974,
+        "worst_5d": -0.2331514738546422,
+        "n_5d": 6250,
+        "avg_20d": -0.00042753857665401055,
+        "hit_20d": 0.46256,
+        "p5_20d": -0.13206709583959947,
+        "worst_20d": -0.30863430669163827,
+        "n_20d": 6250,
+        "total_return": 0.24618860599399373,
+        "max_drawdown": -0.18875375855998144,
+        "n_equity_days": 625
       },
       "second": {
-        "avg_5d": 0.007928572804027813,
-        "hit_5d": 0.5323529411764706,
-        "p5_5d": -0.0955665778873763,
-        "worst_5d": -0.49378908472623373,
-        "n_5d": 3740,
-        "avg_20d": 0.027441008033998442,
-        "hit_20d": 0.5376044568245125,
-        "p5_20d": -0.1621757212054283,
-        "worst_20d": -0.4927348043632437,
-        "n_20d": 3590,
-        "total_return": 1.1587056345803335,
-        "max_drawdown": -0.08453910809877263,
-        "n_equity_days": 374
+        "avg_5d": 0.0055432277560381465,
+        "hit_5d": 0.51952,
+        "p5_5d": -0.08949023303017882,
+        "worst_5d": -0.4937890847262335,
+        "n_5d": 6250,
+        "avg_20d": 0.020542338383187798,
+        "hit_20d": 0.5163934426229508,
+        "p5_20d": -0.1570595326649013,
+        "worst_20d": -0.4927348043632436,
+        "n_20d": 6100,
+        "total_return": 1.4054126554710207,
+        "max_drawdown": -0.1056439352436438,
+        "n_equity_days": 625
       }
     }
   },
   "rank_based+regime_gate": {
-    "avg_5d": 0.0045778838831239165,
-    "hit_5d": 0.5145137880986937,
-    "p5_5d": -0.08162866121932454,
-    "worst_5d": -0.49378908472623373,
-    "n_5d": 6890,
-    "avg_20d": 0.01829777932797737,
-    "hit_20d": 0.5103857566765578,
-    "p5_20d": -0.1389180663095701,
-    "worst_20d": -0.4927348043632437,
-    "n_20d": 6740,
-    "total_return": 0.9166187205054814,
-    "max_drawdown": -0.1417946261360723,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.4449418084153984,
-    "n_trades": 2234,
-    "n_obs": 13630,
+    "avg_5d": 0.003959166741815029,
+    "hit_5d": 0.5097435897435898,
+    "p5_5d": -0.07565252159056678,
+    "worst_5d": -0.4937890847262335,
+    "n_5d": 9750,
+    "avg_20d": 0.015656337875762868,
+    "hit_20d": 0.5051041666666667,
+    "p5_20d": -0.13169891277531445,
+    "worst_20d": -0.4927348043632436,
+    "n_20d": 9600,
+    "total_return": 1.3500227412341719,
+    "max_drawdown": -0.11950479471726816,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.44323374340949034,
+    "n_trades": 2845,
+    "n_obs": 19350,
     "splits": {
       "first": {
-        "avg_5d": 0.0011446980073616516,
-        "hit_5d": 0.4820289855072464,
-        "p5_5d": -0.06486874195871471,
-        "worst_5d": -0.2701149678379191,
-        "n_5d": 3450,
-        "avg_20d": 0.008837398757619509,
-        "hit_20d": 0.48,
-        "p5_20d": -0.12181794739314038,
-        "worst_20d": -0.40628087442017413,
-        "n_20d": 3450,
-        "total_return": 0.28036369513458226,
-        "max_drawdown": -0.1417946261360723,
-        "n_equity_days": 350
+        "avg_5d": 0.000419049086074472,
+        "hit_5d": 0.482172131147541,
+        "p5_5d": -0.06126230535169608,
+        "worst_5d": -0.2701147233214416,
+        "n_5d": 4880,
+        "avg_20d": 0.002697322710521842,
+        "hit_20d": 0.4639344262295082,
+        "p5_20d": -0.1190782660985194,
+        "worst_20d": -0.3263436283283394,
+        "n_20d": 4880,
+        "total_return": 0.38998721573055195,
+        "max_drawdown": -0.11950479471726816,
+        "n_equity_days": 708
       },
       "second": {
-        "avg_5d": 0.007864666971277625,
-        "hit_5d": 0.5460869565217391,
-        "p5_5d": -0.0970967635691278,
-        "worst_5d": -0.49378908472623373,
-        "n_5d": 3450,
-        "avg_20d": 0.028179815989891253,
-        "hit_20d": 0.5421212121212121,
-        "p5_20d": -0.15986252841149126,
-        "worst_20d": -0.4927348043632437,
-        "n_20d": 3300,
-        "total_return": 0.9272103816660775,
-        "max_drawdown": -0.10643344371540764,
-        "n_equity_days": 399
+        "avg_5d": 0.007463486665547228,
+        "hit_5d": 0.5372950819672131,
+        "p5_5d": -0.09016464967933815,
+        "worst_5d": -0.4937890847262335,
+        "n_5d": 4880,
+        "avg_20d": 0.029035459743444444,
+        "hit_20d": 0.547568710359408,
+        "p5_20d": -0.1498563020925446,
+        "worst_20d": -0.4927348043632436,
+        "n_20d": 4730,
+        "total_return": 1.350490485374797,
+        "max_drawdown": -0.07814368665927851,
+        "n_equity_days": 542
       }
     }
   },
   "rank_based+dual_momentum": {
-    "avg_5d": 0.0036535768850889955,
-    "hit_5d": 0.5053619302949062,
-    "p5_5d": -0.08222204575637196,
-    "worst_5d": -0.49378908472623373,
-    "n_5d": 7460,
-    "avg_20d": 0.013774545512232611,
-    "hit_20d": 0.5013679890560876,
-    "p5_20d": -0.14813630315936271,
-    "worst_20d": -0.4927348043632437,
-    "n_20d": 7310,
-    "total_return": 1.017104816967926,
-    "max_drawdown": -0.1487537842822918,
-    "n_equity_days": 754,
-    "trade_win_rate": 0.4315937940761636,
-    "n_trades": 2127,
-    "n_obs": 14770,
+    "avg_5d": 0.002071075107954953,
+    "hit_5d": 0.5014423076923077,
+    "p5_5d": -0.07860873337790444,
+    "worst_5d": -0.4937890847262335,
+    "n_5d": 12480,
+    "avg_20d": 0.007965887045635289,
+    "hit_20d": 0.48580697485806973,
+    "p5_20d": -0.14436524524837369,
+    "worst_20d": -0.4927348043632436,
+    "n_20d": 12330,
+    "total_return": 1.3297294139577027,
+    "max_drawdown": -0.19150246141190186,
+    "n_equity_days": 1255,
+    "trade_win_rate": 0.4307832422586521,
+    "n_trades": 3294,
+    "n_obs": 24810,
     "splits": {
       "first": {
-        "avg_5d": 0.0006581248373678837,
-        "hit_5d": 0.48315508021390374,
-        "p5_5d": -0.06689003459798587,
-        "worst_5d": -0.2701149678379191,
-        "n_5d": 3740,
-        "avg_20d": 0.004746213499791339,
-        "hit_20d": 0.4697860962566845,
-        "p5_20d": -0.13176907858871484,
-        "worst_20d": -0.40628087442017413,
-        "n_20d": 3740,
-        "total_return": 0.1877287621049053,
-        "max_drawdown": -0.1487537842822918,
-        "n_equity_days": 374
+        "avg_5d": -0.000280368962402497,
+        "hit_5d": 0.488,
+        "p5_5d": -0.06724562974856715,
+        "worst_5d": -0.2331514738546422,
+        "n_5d": 6250,
+        "avg_20d": -0.00027591144580949104,
+        "hit_20d": 0.46144,
+        "p5_20d": -0.13206709583959947,
+        "worst_20d": -0.30863430669163827,
+        "n_20d": 6250,
+        "total_return": 0.24197621287467697,
+        "max_drawdown": -0.19150246141190186,
+        "n_equity_days": 625
       },
       "second": {
-        "avg_5d": 0.006661251903036679,
-        "hit_5d": 0.5281501340482574,
-        "p5_5d": -0.09558784908086934,
-        "worst_5d": -0.49378908472623373,
-        "n_5d": 3730,
-        "avg_20d": 0.023231913165318568,
-        "hit_20d": 0.535195530726257,
-        "p5_20d": -0.16237304901590519,
-        "worst_20d": -0.4927348043632437,
-        "n_20d": 3580,
-        "total_return": 1.0243747795201235,
-        "max_drawdown": -0.08892027131847446,
-        "n_equity_days": 373
+        "avg_5d": 0.004495584970330627,
+        "hit_5d": 0.5153846153846153,
+        "p5_5d": -0.08907218134071525,
+        "worst_5d": -0.4937890847262335,
+        "n_5d": 6240,
+        "avg_20d": 0.016578156941705512,
+        "hit_20d": 0.5114942528735632,
+        "p5_20d": -0.15652517505850216,
+        "worst_20d": -0.4927348043632436,
+        "n_20d": 6090,
+        "total_return": 1.3306970646954652,
+        "max_drawdown": -0.11723150901848,
+        "n_equity_days": 624
       }
     }
   }

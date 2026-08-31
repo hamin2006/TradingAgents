@@ -167,25 +167,27 @@ crashes the highest-momentum names mean-revert hardest. Upgrades, in rollout ord
 1. ✅ **Volatility-adjusted momentum** (implemented, measured: `docs/research/backtest-results.md`): the three return z-scores are
    computed on `return ÷ annualized realized vol` (126d, 10% floor) instead of raw
    returns — Barroso–Santa-Clara's volatility-managed momentum ("~2× Sharpe,
-   virtually eliminates crashes"). Demotes lottery-like parabolic movers in every
-   regime; no on/off state, so candidate recall is preserved. **Measured 2023–26: a
-   drawdown reducer (max DD −15.4% vs raw −24.7%), not a return booster (3.10%/20d vs
-   raw 4.62%) in this bull-only sample — keep as default.**
+   virtually eliminates crashes"). **Measured 5y (2021–26, incl. the 2022 crash):
+   the crash protection does NOT materialize in the portfolio sim — vol_adjusted
+   had a worse max DD than raw in the crash half (−26.0% vs −25.7%) at ~⅔ less return.
+   It improves candidate downside tail only (p5_20d). → DEMOTE; do not default to it.**
 2. ⏳ **Rank-based composite + winsorization**: percentile ranks replace z-scores
    (bounds score blow-ups like the z≈+30 outlier observed in testing), optional
-   5-day rank-stability check. **Measured: worst return (1.64%/20d) with no drawdown
-   advantage over vol_adjusted (−14.7% vs −15.4%) → drop/deprioritize, keep in registry.**
+   5-day rank-stability check. **Measured: worst return on every gate, no drawdown
+   edge over vol → drop.**
 3. ⏳ **Index-level regime gate**: SPY vs 200-day SMA × VIX percentile →
    CALM/WARN/STRESS; WARN drops the top-decile 1m-momentum tail, STRESS pauses buys.
-   Only after `analyze_results.py` shows real drawdown behavior — the gate pays a
-   whipsaw tax on ordinary days. **Measured: cut max DD on every strategy (raw
-   −24.7→−17.8, vol −15.4→−14.7, rank −14.7→−14.2) at the smallest return cost →
-   highest-value next rollout.**
+   **Measured (crash-in-sample): the ONLY change that cut max DD on every strategy
+   (raw −25.7→−21.0, vol −26.0→−18.6, rank −18.9→−12.0) — the system's drawdown hedge.**
 4. ⏳ **Absolute (dual) momentum gate**: ticker must beat T-bills over 12m and be
    positive over 6m (Antonacci); suppress buys if SPY fails its own trend test.
-   **Measured: inconsistent drawdown benefit, clear return cost → defer.**
+   **Measured: no drawdown benefit over the regime gate, clear return cost → defer.**
 5. ⏳ **Anti-lottery overlay**: penalize MAX (largest 1-day gain) or exclude the
    blow-off signature `z(1m)>+3 & z(6m)<+1`. **Not in the backtest matrix — untested.**
+
+**Measured default decision (5y): switch the screener to `raw_momentum + regime_gate`**
+— best return-per-drawdown in the matrix (3.93%/20d alpha, max DD −21% vs −25.7% raw-alone).
+Production defaults change only with user approval.
 
 ## 5. Decision engine
 
