@@ -9,7 +9,8 @@ output_language: English
 # Pin OpenRouter routing per model slug (multiple hosts serve the same model;
 # pin to the first-party provider). Unknown models route unpinned.
 openrouter_provider_pins:
-  deepseek/deepseek-v4-flash-0731: DeepSeek
+  deepseek/deepseek-v4-flash-0731: Fireworks
+  deepseek/deepseek-v4-pro: Fireworks
   deepseek/deepseek-v4-pro: DeepSeek
 
 capital: 100000            # paper capital
