@@ -38,7 +38,7 @@ All in `/home/harsh-amin/workplace/TradingAgents`:
 
 - **Backtest window:** 3 years of daily OHLCV, one batched download (`yf.download`, includes SPY + ^VIX for gates), cached to `~/.tradingagents/logs/backtest_prices.csv` (data cost $0, ~5 min).
 - **Universe note:** today's S&P 500 list used for all past dates → survivorship bias inflates absolute numbers but affects all methods equally → **comparisons valid**; document in the report.
-- **Simulated cadence:** step every 5 trading days (~250 dates over 3y), horizons **5d and 20d** forward alpha vs SPY, top **N=10** picks per date (overlapping windows acknowledged).
+- **Simulated cadence:** the screen is replayed **every trading day** (~756 dates over 3 years — matching production's daily cadence). Horizons **5d and 20d** forward alpha vs SPY, top **N=10** picks per date (~7,500 forward-return observations per method per horizon; overlapping windows acknowledged).
 - **Combo matrix (~9 rows):** scoring ∈ {`raw_momentum` (pre-vol-adjust baseline), `vol_adjusted` (current default), `rank_based` (percentile ranks + winsorization)} × gate ∈ {none, `regime_gate` (SPY vs 200-day SMA × realized-vol state → CALM/WARN/STRESS: WARN drops the top-decile 1m-momentum tail, STRESS pauses buys), `dual_momentum` (ticker beats a T-bill proxy over 12m AND positive 6m)}.
 - **Per-combo metrics:** avg 5d/20d alpha, hit rate (alpha>0), 5th-percentile alpha (tail), worst window, turnover; **split by half-periods** for robustness (no parameter tuning — validation, not overfitting). See "Sell simulation" below for the portfolio layer.
 - **Output:** `docs/research/backtest-results.md` — comparison table + per-combo notes + caveats section.
@@ -71,7 +71,7 @@ LLM layer, no costs); the method *ranking* is the deliverable.
 
 1. **Data + harness:** new file `backtest_screener.py`:
    - `fetch_history(universe, years=3)` — batched download incl. SPY + ^VIX, cached to `~/.tradingagents/logs/backtest_prices.csv`.
-   - `simulate(prices, strategy, gate, step=5, horizons=[5,20])` — per-step top-N picks + forward alphas **plus the portfolio simulation with proxy exits** (pool exit, stop-loss with gap fill, optional time stop) producing a per-method equity curve. **Strict date-slicing: metrics for date D use data ≤ D only.** This is the correctness core of the experiment.
+   - `simulate(prices, strategy, gate, step=1, horizons=[5,20])` — the screen replays every trading day; per-date top-N picks + forward alphas **plus the portfolio simulation with proxy exits** (pool exit, stop-loss with gap fill, optional time stop) producing a per-method equity curve. **Strict date-slicing: metrics for date D use data ≤ D only.** This is the correctness core of the experiment.
    - CLI: `python backtest_screener.py --run` executes the full matrix and writes the report; `--tickers`/`--years` knobs for quick reruns.
 2. **Strategy registry:** refactor `screener.py` — a `SCORE_STRATEGIES` registry {`raw_momentum`, `vol_adjusted` (current default), `rank_based` (percentile ranks + winsorization)}; `score_universe(prices, strategy="vol_adjusted")`. Default behavior must remain byte-identical (the existing repo test suite still passes — run `pytest -q` once after the refactor; it is the repo's mechanical gate even for experiments).
 3. **Run the matrix on the PC:** `cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python backtest_screener.py --run` (~15 min incl. download).
