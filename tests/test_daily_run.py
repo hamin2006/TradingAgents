@@ -539,3 +539,36 @@ def test_run_execute_stress_pauses_buys_but_exits(cfg, caplog):
     assert [o.action for o in orders] == ["SELL"]
     assert all(o.ticker == "TSLA" for o in orders)
     assert any("STRESS" in r.message for r in caplog.records)
+
+
+def test_openrouter_pin_injects_provider_body():
+    """Pinned model slugs get OpenRouter provider routing via extra_body;
+    unpinned models are untouched; non-OpenRouter providers never get the body."""
+    import daily_run
+    import tradingagents.llm_clients.openai_client as oc
+    from tradingagents.llm_clients.openai_client import OpenAIClient
+
+    original_attr = oc.OpenAIClient.get_llm
+    daily_run._OPENROUTER_PINS_APPLIED = False
+    daily_run._OPENROUTER_PINS = {"deepseek/deepseek-v4-flash-0731": "DeepSeek",
+                                  "deepseek/deepseek-v4-pro": "DeepSeek"}
+    try:
+        daily_run._ensure_openrouter_pins(daily_run._OPENROUTER_PINS)
+
+        pinned = OpenAIClient(model="deepseek/deepseek-v4-flash-0731",
+                              provider="openrouter").get_llm()
+        assert pinned.extra_body == {"provider": {"order": ["DeepSeek"],
+                                                  "allow_fallbacks": False}}
+
+        pinned_pro = OpenAIClient(model="deepseek/deepseek-v4-pro",
+                                  provider="openrouter").get_llm()
+        assert pinned_pro.extra_body == {"provider": {"order": ["DeepSeek"],
+                                                      "allow_fallbacks": False}}
+
+        native = OpenAIClient(model="deepseek/deepseek-v4-flash-0731",
+                              provider="deepseek").get_llm()  # non-OpenRouter
+        assert not getattr(native, "extra_body", None)
+    finally:
+        oc.OpenAIClient.get_llm = original_attr
+        daily_run._OPENROUTER_PINS = {}
+        daily_run._OPENROUTER_PINS_APPLIED = False

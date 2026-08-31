@@ -2,9 +2,15 @@
 seed_watchlist: [AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA]   # used until the first screen
 
 llm_provider: openrouter
-quick_think_llm: deepseek/deepseek-v4-flash
+quick_think_llm: deepseek/deepseek-v4-flash-0731   # dated snapshot, cheaper prompt pricing
 deep_think_llm: deepseek/deepseek-v4-pro
 output_language: English
+
+# Pin OpenRouter routing per model slug (multiple hosts serve the same model;
+# pin to the first-party provider). Unknown models route unpinned.
+openrouter_provider_pins:
+  deepseek/deepseek-v4-flash-0731: DeepSeek
+  deepseek/deepseek-v4-pro: DeepSeek
 
 capital: 100000            # paper capital
 max_positions: 10          # position-count cap AND equal-weight denominator

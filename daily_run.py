@@ -215,6 +215,44 @@ def _ensure_reddit_pacing() -> None:
     _REDDIT_PATCHED = True
 
 
+# --- OpenRouter provider pinning ---------------------------------------------
+
+_OPENROUTER_PINS: dict[str, str] = {}
+_OPENROUTER_PINS_APPLIED = False
+
+
+def _ensure_openrouter_pins(pins: dict[str, str] | None = None) -> None:
+    """Pin OpenRouter routing per model slug (Relace, DeepSeek, ...).
+
+    OpenRouter serves many slugs from multiple hosting providers and rotates
+    between them by default; a pin forces the request to the named provider
+    (``allow_fallbacks=false``) by injecting OpenRouter's ``provider`` routing
+    body through the OpenAI-compatible request. Framework untouched: the
+    ``OpenAIClient.get_llm`` method is wrapped lazily from this module.
+    """
+    global _OPENROUTER_PINS, _OPENROUTER_PINS_APPLIED
+    if _OPENROUTER_PINS_APPLIED:
+        return
+    _OPENROUTER_PINS = dict(pins or {})
+    import tradingagents.llm_clients.openai_client as oc
+
+    original = oc.OpenAIClient.get_llm
+
+    def pinned_get_llm(self):
+        llm = original(self)
+        provider = _OPENROUTER_PINS.get(getattr(llm, "model_name", ""))
+        if provider and getattr(self, "provider", "") == "openrouter":
+            llm.extra_body = {**(getattr(llm, "extra_body", None) or {}),
+                              "provider": {"order": [provider],
+                                           "allow_fallbacks": False}}
+            logger.info("OpenRouter pin: %s -> %s", llm.model_name, provider)
+        return llm
+
+    pinned_get_llm._wrapped_original = original
+    oc.OpenAIClient.get_llm = pinned_get_llm
+    _OPENROUTER_PINS_APPLIED = True
+
+
 def _ensure_reddit_oauth() -> bool:
     """Ensure the sentiment analyst always gets Reddit data.
 
@@ -293,6 +331,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
                                        memory_log.load_entries(), cfg, TODAY_ET())
 
     _ensure_memory_write_lock()
+    _ensure_openrouter_pins(cfg.get("openrouter_provider_pins"))
     if not _ensure_reddit_oauth():
         _ensure_reddit_pacing()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
