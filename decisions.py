@@ -12,11 +12,13 @@ class Order:
     action: str  # "BUY" | "SELL"
     shares: int
     reason: str
-    protection_price: float | None = None
+    protection_price: float | None = None  # set on BUY orders
+    stop_price: float | None = None        # set on BUY orders (broker-side stop)
 
 
 def compute_orders(ratings, holdings, last_close, capital, max_positions,
-                   max_order_value_cap=None, entry_protection_pct=2.0):
+                   max_order_value_cap=None, entry_protection_pct=2.0,
+                   stop_loss_pct=8.0):
     orders = []
     slice_value = capital / max_positions
 
@@ -36,8 +38,10 @@ def compute_orders(ratings, holdings, last_close, capital, max_positions,
         if shares < 1:
             continue
         protection = round(price * (1 + entry_protection_pct / 100), 2)
+        stop = round(price * (1 - stop_loss_pct / 100), 2)
         buys.append(Order(ticker=ticker, action="BUY", shares=shares,
-                          reason="entry", protection_price=protection))
+                          reason="entry", protection_price=protection,
+                          stop_price=stop))
 
     if max_order_value_cap is not None:
         while True:

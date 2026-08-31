@@ -4,7 +4,7 @@ import contextlib
 import logging
 import time
 
-from ib_async import IB, MarketOrder, Stock
+from ib_async import IB, MarketOrder, Stock, StopOrder
 
 from decisions import Order
 
@@ -84,12 +84,36 @@ class IBKRBroker:
                     self._ib.cancelOrder(order)
                     logger.warning("order for %s not filled in %ds; cancelled",
                                    o.ticker, FILL_TIMEOUT_S)
+
+                if filled and o.action == "SELL":
+                    self._cancel_open_stops(o.ticker)
+                elif filled and o.action == "BUY" and o.stop_price:
+                    # GTC stop so the position is protected 24/7 between
+                    # daily runs (entry day + holding period).
+                    stop = StopOrder("SELL", filled, o.stop_price)
+                    stop.outsideRth = False
+                    self._ib.placeOrder(Stock(o.ticker, "SMART", "USD"), stop)
+                    logger.info("GTC stop attached for %s at %s", o.ticker, o.stop_price)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
             reports.append({"ticker": o.ticker, "action": o.action,
                             "shares": o.shares, "filled": filled,
                             "avg_price": round(float(avg_price), 4)})
         return reports
+
+    def _cancel_open_stops(self, symbol: str) -> None:
+        """Cancel leftover stop orders for a symbol after a rating exit."""
+        try:
+            for trade in self._ib.reqOpenOrders():
+                order = trade.order
+                if (trade.contract.symbol == symbol
+                        and order.action == "SELL"
+                        and order.orderType == "STP"):
+                    self._ib.cancelOrder(order)
+                    logger.info("cancelled leftover stop #%s for %s",
+                                order.orderId, symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not cancel open stops for %s: %s", symbol, exc)
 
     def disconnect(self) -> None:
         if self._ib is not None:

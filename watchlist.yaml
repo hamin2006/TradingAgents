@@ -9,6 +9,7 @@ output_language: English
 capital: 100000            # paper capital
 max_positions: 10          # equal-weight denominator
 max_order_value_cap: 15000 # per-day total buy cap
+stop_loss_pct: 8.0         # broker-side GTC stop on every buy (0 disables)
 analyze_max_workers: 4     # parallel ticker analyses in the morning pass
 
 screener:

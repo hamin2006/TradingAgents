@@ -133,3 +133,41 @@ def test_live_mode_hard_rejected(monkeypatch):
     b = AlpacaBroker({"alpaca": {"paper": False}})
     with pytest.raises(ConnectionError):
         b.connect()
+
+
+def test_buy_bracket_includes_stop_leg(broker):
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-1"
+    submitted.status = "filled"
+    submitted.filled_qty = "10"
+    submitted.filled_avg_price = "101.5"
+    mock_client.submit_order.return_value = submitted
+    mock_client.get_order_by_id.return_value = submitted
+    with patch("alpaca_broker.time.sleep"):
+        b.place_market_orders(
+            [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
+                   protection_price=102.0, stop_price=92.0)])
+    req = mock_client.submit_order.call_args[0][0]
+    assert req.order_class.value == "oto"
+    assert req.stop_loss.stop_price == 92.0
+
+
+def test_sell_cancels_open_stops_for_symbol(broker):
+    b, mock_client, _ = broker
+    open_stop = MagicMock()
+    open_stop.symbol = "TSLA"
+    open_stop.type = "stop"
+    open_stop.id = "stop-1"
+    mock_client.get_orders.return_value = [open_stop]
+    submitted = MagicMock()
+    submitted.id = "order-2"
+    submitted.status = "filled"
+    submitted.filled_qty = "40"
+    submitted.filled_avg_price = "245.0"
+    mock_client.submit_order.return_value = submitted
+    mock_client.get_order_by_id.return_value = submitted
+    with patch("alpaca_broker.time.sleep"):
+        b.place_market_orders(
+            [Order(ticker="TSLA", action="SELL", shares=40, reason="rating exit")])
+    mock_client.cancel_order_by_id.assert_called_with("stop-1")

@@ -60,3 +60,22 @@ def test_missing_rating_or_price_skipped():
     orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0, "MSFT": 200.0},
                             capital=100_000, max_positions=10)
     assert all(o.ticker == "AAPL" for o in orders)
+
+
+def test_buy_includes_stop_loss():
+    orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0},
+                            capital=100_000, max_positions=10)
+    assert orders[0].stop_price == 92.0  # last_close * (1 - 8%)
+
+
+def test_stop_loss_pct_configurable():
+    orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0},
+                            capital=100_000, max_positions=10, stop_loss_pct=5.0)
+    assert orders[0].stop_price == 95.0
+
+
+def test_sell_has_no_stop():
+    orders = compute_orders({"TSLA": "Sell"}, {"TSLA": 40}, {"TSLA": 250.0},
+                            capital=100_000, max_positions=10)
+    assert orders[0].action == "SELL"
+    assert orders[0].stop_price is None

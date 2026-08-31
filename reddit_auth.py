@@ -15,7 +15,6 @@ byte-identical in structure — a drop-in swap from daily_run.
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -132,7 +131,6 @@ def _get_token() -> str:
             return _token_cache["token"]
         client_id = os.environ["REDDIT_CLIENT_ID"]
         secret = os.environ["REDDIT_SECRET"]
-        basic = base64.b64encode(f"{client_id}:{secret}".encode()).decode()
         resp = requests.post(
             _TOKEN_URL,
             data="grant_type=client_credentials",

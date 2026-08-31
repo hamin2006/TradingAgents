@@ -22,8 +22,13 @@ import os
 import time
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderClass, OrderSide, OrderType, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+    StopLossRequest,
+)
 
 from decisions import Order
 
@@ -91,7 +96,20 @@ class AlpacaBroker:
 
         for o in orders:
             side = OrderSide.BUY if o.action == "BUY" else OrderSide.SELL
-            if o.action == "BUY" and o.protection_price:
+            if o.action == "BUY" and o.protection_price and o.stop_price:
+                # OTO: protection-capped limit entry triggers a GTC stop-loss
+                # leg, so the position is protected 24/7 between daily runs.
+                # OCO semantics: a later rating-based market sell cancels any
+                # leftover stop for the symbol (see _cancel_open_stops).
+                request = LimitOrderRequest(
+                    symbol=o.ticker, qty=o.shares, side=side,
+                    type=OrderType.LIMIT, limit_price=o.protection_price,
+                    time_in_force=TimeInForce.DAY, extended_hours=False,
+                    order_class=OrderClass.OTO,
+                    stop_loss=StopLossRequest(stop_price=o.stop_price),
+                )
+            elif o.action == "BUY" and o.protection_price:
+                # No stop configured: plain protection-capped limit entry.
                 request = LimitOrderRequest(
                     symbol=o.ticker, qty=o.shares, side=side,
                     type=OrderType.LIMIT, limit_price=o.protection_price,
@@ -119,12 +137,25 @@ class AlpacaBroker:
                     self._client.cancel_order_by_id(submitted.id)
                     logger.warning("order for %s not filled in %ds; cancelled",
                                    o.ticker, FILL_TIMEOUT_S)
+                elif o.action == "SELL":
+                    self._cancel_open_stops(o.ticker)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
             reports.append({"ticker": o.ticker, "action": o.action,
                             "shares": o.shares, "filled": filled,
                             "avg_price": round(float(avg_price), 4)})
         return reports
+
+    def _cancel_open_stops(self, symbol: str) -> None:
+        """Cancel leftover stop orders for a symbol after a rating exit."""
+        try:
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            for order in self._client.get_orders(request):
+                if (order.symbol == symbol and order.type == "stop"):
+                    self._client.cancel_order_by_id(order.id)
+                    logger.info("cancelled leftover stop %s for %s", order.id, symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not cancel open stops for %s: %s", symbol, exc)
 
     def disconnect(self) -> None:
         pass  # stateless REST client; nothing to tear down

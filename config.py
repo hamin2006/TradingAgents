@@ -12,7 +12,7 @@ DEFAULT_WATCHLIST_PATH = Path("watchlist.yaml")
 _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
     ["seed_watchlist", "capital", "max_positions", "max_order_value_cap",
      "screener", "ibkr", "alpaca", "broker", "trading_enabled",
-     "analyze_max_workers"]
+     "analyze_max_workers", "stop_loss_pct"]
 )
 
 # App-level defaults for keys the framework does not know about. These live
@@ -23,6 +23,9 @@ APP_DEFAULTS = {
     "capital": 100_000,
     "max_positions": 10,
     "max_order_value_cap": None,
+    # Broker-side stop-loss attached to every buy (GTC, % below last close).
+    # Enforced 24/7 by the broker between daily runs. 0 disables.
+    "stop_loss_pct": 8.0,
     "trading_enabled": True,
     "broker": "alpaca",  # active backend: "alpaca" (default) or "ibkr"
     # Parallel ticker analyses in the 07:00 pass. The pipeline is IO-bound on
