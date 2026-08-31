@@ -1,6 +1,7 @@
 """tests/test_reddit_auth.py — OAuth Reddit fetcher tests (mocked HTTP)."""
 
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -134,3 +135,56 @@ def test_degrades_gracefully_on_failure(creds, monkeypatch):
     reddit_auth._token_cache["token"] = "stale"
     out = reddit_auth.fetch_reddit_posts("NVDA", subreddits=("stocks",))
     assert "<no Reddit posts found" in out  # placeholder, never raises
+
+
+def test_resilient_retries_on_placeholder():
+    """A placeholder (fetch failure) triggers backoff retries, not silence."""
+    calls = {"n": 0}
+
+    def impl(ticker, subreddits=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return "<no Reddit posts found mentioning NVDA across r/stocks in the past 7 days>"
+        return "r/stocks — 2 recent posts mentioning NVDA:"
+
+    with patch("reddit_auth.time.sleep"):
+        out = reddit_auth.make_resilient(impl)("NVDA")
+    assert calls["n"] == 3
+    assert out == "r/stocks — 2 recent posts mentioning NVDA:"
+
+
+def test_resilient_serves_cache_when_all_fail(tmp_path, monkeypatch):
+    """Total failure must still give the agent Reddit data: cached block."""
+    monkeypatch.setenv("REDDIT_CACHE_DIR", str(tmp_path))
+    reddit_auth._store_cache("NVDA", "old block", date="2026-08-29")
+
+    def impl(ticker, subreddits=None, **kwargs):
+        return "<no Reddit posts found mentioning NVDA across r/stocks in the past 7 days>"
+
+    with patch("reddit_auth.time.sleep"):
+        out = reddit_auth.make_resilient(impl)("NVDA")
+    assert "old block" in out
+    assert "cached from 2026-08-29" in out
+
+
+def test_resilient_placeholder_only_when_no_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_CACHE_DIR", str(tmp_path))
+
+    def impl(ticker, subreddits=None, **kwargs):
+        return "<no Reddit posts found mentioning NVDA across r/stocks in the past 7 days>"
+
+    with patch("reddit_auth.time.sleep"):
+        out = reddit_auth.make_resilient(impl)("NVDA")
+    assert out.startswith("<no Reddit posts found")
+
+
+def test_resilient_caches_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_CACHE_DIR", str(tmp_path))
+
+    def impl(ticker, subreddits=None, **kwargs):
+        return "r/stocks — 2 recent posts mentioning NVDA:"
+
+    with patch("reddit_auth.time.sleep"):
+        reddit_auth.make_resilient(impl)("NVDA")
+    assert (tmp_path / "nvda.json").exists()
+    assert reddit_auth._load_cache("NVDA")["block"].startswith("r/stocks")

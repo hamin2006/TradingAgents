@@ -180,6 +180,7 @@ _REDDIT_PATCHED = False
 _REDDIT_MIN_INTERVAL = 8.0  # seconds between Reddit requests (anonymous ~10/min)
 _REDDIT_LAST_TS = 0.0  # monotonic timestamp of the last request, guarded by _REDDIT_LOCK
 _REDDIT_OAUTH_PATCHED = False
+_REDDIT_OAUTH_ACTIVE = False
 
 
 def _ensure_reddit_pacing() -> None:
@@ -215,26 +216,38 @@ def _ensure_reddit_pacing() -> None:
 
 
 def _ensure_reddit_oauth() -> bool:
-    """Swap the sentiment analyst's Reddit fetch to the OAuth path when
-    REDDIT_CLIENT_ID / REDDIT_SECRET are set (100 QPM vs ~10 anonymous).
+    """Ensure the sentiment analyst always gets Reddit data.
 
-    Returns True when OAuth is active (or was already), False when the creds
-    are absent — the caller then keeps the paced anonymous RSS path.
+    Swaps the sentiment analyst's fetch_reddit_posts to a resilient wrapper
+    (retry-with-backoff + per-ticker cache) around either the OAuth fetcher
+    (when REDDIT_CLIENT_ID / REDDIT_SECRET are set) or the framework's RSS
+    path. Returns True when OAuth is active (100 QPM — the paced anonymous
+    wrapper becomes unnecessary); False on the RSS path (caller keeps
+    pacing to avoid 429 bursts).
     """
-    global _REDDIT_OAUTH_PATCHED
+    global _REDDIT_OAUTH_PATCHED, _REDDIT_OAUTH_ACTIVE
     if _REDDIT_OAUTH_PATCHED:
-        return True
+        return _REDDIT_OAUTH_ACTIVE
     import reddit_auth
-    if not reddit_auth.credentials_available():
-        return False
+
     # sentiment_analyst binds fetch_reddit_posts at import time; swap its
-    # module global so the analyst's calls use our OAuth fetcher. Signature
-    # and output block format are drop-in identical.
+    # module global so the analyst's calls use our resilient wrapper.
+    # Signature and output block format are drop-in identical.
     import tradingagents.agents.analysts.sentiment_analyst as sa
-    sa.fetch_reddit_posts = reddit_auth.fetch_reddit_posts
+
+    original = sa.fetch_reddit_posts
+    if reddit_auth.credentials_available():
+        impl = reddit_auth.fetch_reddit_posts
+        active = True
+        logger.info("Reddit: using OAuth fetcher (100 QPM) with retry+cache")
+    else:
+        impl = original
+        active = False
+        logger.info("Reddit: using paced RSS path with retry+cache")
+    sa.fetch_reddit_posts = reddit_auth.make_resilient(impl)
     _REDDIT_OAUTH_PATCHED = True
-    logger.info("Reddit: using OAuth fetcher (100 QPM)")
-    return True
+    _REDDIT_OAUTH_ACTIVE = active
+    return active
 
 
 def _analyze_one(ticker: str, today_str: str, cfg: dict):

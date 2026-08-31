@@ -486,16 +486,22 @@ def test_reddit_oauth_swapped_when_creds_present(monkeypatch):
     monkeypatch.setenv("REDDIT_SECRET", "s")
     original = sa.fetch_reddit_posts
     daily_run._REDDIT_OAUTH_PATCHED = False
+    daily_run._REDDIT_OAUTH_ACTIVE = False
     try:
-        swapped = daily_run._ensure_reddit_oauth()
-        assert swapped is True
-        assert sa.fetch_reddit_posts is reddit_auth.fetch_reddit_posts
+        active = daily_run._ensure_reddit_oauth()
+        assert active is True
+        # swapped to the resilient OAuth wrapper (not the raw impl, not the original)
+        assert sa.fetch_reddit_posts is not original
+        assert sa.fetch_reddit_posts is not reddit_auth.fetch_reddit_posts
     finally:
-        sa.fetch_reddit_posts = original
+        sa.fetch_reddit_posts = _unwrap_reddit_fetch(original)
         daily_run._REDDIT_OAUTH_PATCHED = False
+        daily_run._REDDIT_OAUTH_ACTIVE = False
 
 
-def test_reddit_oauth_not_swapped_without_creds(monkeypatch):
+def test_reddit_resilient_wrapper_applied_without_creds(monkeypatch):
+    """Even without OAuth creds, the RSS path gets the retry+cache wrapper —
+    the agents are never left without Reddit data."""
     import daily_run
     import tradingagents.agents.analysts.sentiment_analyst as sa
 
@@ -503,9 +509,12 @@ def test_reddit_oauth_not_swapped_without_creds(monkeypatch):
     monkeypatch.delenv("REDDIT_SECRET", raising=False)
     original = sa.fetch_reddit_posts
     daily_run._REDDIT_OAUTH_PATCHED = False
+    daily_run._REDDIT_OAUTH_ACTIVE = False
     try:
-        swapped = daily_run._ensure_reddit_oauth()
-        assert swapped is False
-        assert sa.fetch_reddit_posts is original
+        active = daily_run._ensure_reddit_oauth()
+        assert active is False  # RSS path -> caller keeps pacing
+        assert sa.fetch_reddit_posts is not original  # still wrapped
     finally:
+        sa.fetch_reddit_posts = _unwrap_reddit_fetch(original)
         daily_run._REDDIT_OAUTH_PATCHED = False
+        daily_run._REDDIT_OAUTH_ACTIVE = False

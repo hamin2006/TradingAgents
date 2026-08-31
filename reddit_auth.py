@@ -16,10 +16,13 @@ byte-identical in structure — a drop-in swap from daily_run.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
+import random
 import threading
 import time
+from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
@@ -32,8 +35,89 @@ _UA = "tradingagents/0.2 (daily-paper-trading; +https://github.com/hamin2006/Tra
 DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
 SEARCH_LIMIT = 5
 
+_MAX_RETRIES = 2       # retries after the initial attempt (exponential backoff)
+_BASE_DELAY_S = 4.0    # 4s -> 8s between retries, plus jitter
+
+_PLACEHOLDER_PREFIX = "<no Reddit posts found"
+
 _token_lock = threading.Lock()
 _token_cache = {"token": None, "expires_at": 0.0}
+
+
+def _cache_dir() -> Path:
+    return Path(os.environ.get("REDDIT_CACHE_DIR",
+                               Path.home() / ".tradingagents" / "logs" / "reddit_cache"))
+
+
+def _cache_path(ticker: str) -> Path:
+    safe = "".join(c for c in ticker.lower() if c.isalnum()) or "ticker"
+    return _cache_dir() / f"{safe}.json"
+
+
+def _store_cache(ticker: str, block: str, date: str | None = None) -> None:
+    try:
+        path = _cache_path(ticker)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "date": date or time.strftime("%Y-%m-%d"),
+            "block": block,
+        }), encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 - caching is best-effort
+        logger.warning("could not write Reddit cache for %s: %s", ticker, exc)
+
+
+def _load_cache(ticker: str) -> dict | None:
+    try:
+        path = _cache_path(ticker)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # noqa: BLE001
+        logger.warning("could not read Reddit cache for %s: %s", ticker, exc)
+        return None
+
+
+def _is_placeholder(block: str) -> bool:
+    return block.startswith(_PLACEHOLDER_PREFIX)
+
+
+def make_resilient(impl):
+    """Wrap any fetch_reddit_posts-style implementation with a guarantee:
+
+    1. A placeholder result (fetch failure) triggers up to ``_MAX_RETRIES``
+       retries with exponential backoff + jitter.
+    2. If every attempt fails, serve the most recent successful block for
+       that ticker from the cache (stale Reddit data beats no data).
+    3. On success, the block is cached for the next failure.
+    """
+    def resilient(ticker, subreddits=DEFAULT_SUBREDDITS, **kwargs):
+        block = impl(ticker, subreddits=subreddits, **kwargs)
+        attempt = 0
+        while _is_placeholder(block) and attempt < _MAX_RETRIES:
+            attempt += 1
+            delay = _BASE_DELAY_S * (2 ** (attempt - 1)) + random.uniform(0, 2.0)
+            logger.warning(
+                "Reddit fetch gave no posts for %s (attempt %d/%d); "
+                "backing off %.1fs then retrying",
+                ticker, attempt, _MAX_RETRIES, delay,
+            )
+            time.sleep(delay)
+            block = impl(ticker, subreddits=subreddits, **kwargs)
+
+        if _is_placeholder(block):
+            cached = _load_cache(ticker)
+            if cached is not None:
+                logger.warning("serving cached Reddit block for %s from %s",
+                               ticker, cached["date"])
+                return (f"{cached['block']}\n\n"
+                        f"(Reddit discussion cached from {cached['date']}; "
+                        f"live fetch failed today)")
+            return block
+        _store_cache(ticker, block)
+        return block
+
+    resilient._wrapped_original = impl  # tests unwrap to the underlying fetcher
+    return resilient
 
 
 def credentials_available() -> bool:
