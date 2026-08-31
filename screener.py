@@ -98,17 +98,27 @@ def compute_raw_metrics(hist: pd.DataFrame) -> dict | None:
     sma50 = close.rolling(50).mean().iloc[-1]
     high = close.max()
     avg_dollar_vol = float((hist["Close"] * hist["Volume"]).tail(20).mean())
+    daily_rets = close.pct_change().dropna()
+    realized_vol = float(daily_rets.std() * (252 ** 0.5))  # annualized
     return {
         "ret_1m": ret(21), "ret_3m": ret(63), "ret_6m": ret(126),
         "sma50_spread": last / sma50 - 1,
         "high_proximity": float(last / high),
         "avg_dollar_vol": avg_dollar_vol,
+        "realized_vol": realized_vol,
     }
 
 
 def _zscore(values: pd.Series) -> pd.Series:
     s = pd.Series(values)
     return (s - s.mean()) / s.std()
+
+
+# Vol-adjusted momentum (Barroso–Santa-Clara 2015): rank by return relative to
+# its own realized volatility, with a floor so low-vol names can't divide to
+# infinity. Demotes lottery-like parabolic movers — the names that mean-revert
+# hardest in momentum crashes.
+VOL_FLOOR = 0.10  # 10% annualized
 
 
 def score_universe(prices: dict[str, pd.DataFrame],
@@ -119,8 +129,12 @@ def score_universe(prices: dict[str, pd.DataFrame],
     if not rows:
         return []
     frame = pd.DataFrame(rows).T
-    score = sum(_zscore(frame[col]).fillna(0.0) for col in
-                ("ret_1m", "ret_3m", "ret_6m", "sma50_spread", "high_proximity"))
+    vol = frame["realized_vol"].clip(lower=VOL_FLOOR)
+    for ret_col in ("ret_1m", "ret_3m", "ret_6m"):
+        frame[f"{ret_col}_adj"] = frame[ret_col] / vol
+    score_cols = ("ret_1m_adj", "ret_3m_adj", "ret_6m_adj",
+                  "sma50_spread", "high_proximity")
+    score = sum(_zscore(frame[col]).fillna(0.0) for col in score_cols)
     ranked = score.sort_values(ascending=False)
     return [{"ticker": t, "score": round(float(s), 4)} for t, s in ranked.items()]
 

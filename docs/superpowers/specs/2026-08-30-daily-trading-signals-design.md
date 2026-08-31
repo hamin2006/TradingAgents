@@ -155,8 +155,31 @@ Component responsibilities:
 
 **Why momentum:** the Jegadeesh–Titman (1993) result — buying recent winners persists —
 is the canonical, well-documented basis for candidate generation; liquidity filtering
-first is the standard safeguard against ranking into untradeable names. v1 is purely
-deterministic and testable; an LLM news overlay can be added later without rework.
+first is the standard safeguard against ranking into untradeable names.
+
+**Screening robustness roadmap** (research report:
+`.superpowers/sdd/research-screening-methods.md`; evidence: Daniel–Moskowitz 2016
+"Momentum Crashes", Barroso–Santa-Clara 2015 volatility-managed momentum, Antonacci
+dual momentum, Bali et al. MAX effect). Momentum ranking is regime-fragile — in
+crashes the highest-momentum names mean-revert hardest. Upgrades, in rollout order
+(each validated against `analyze_results.py` outcomes before the next lands):
+
+1. ✅ **Volatility-adjusted momentum** (implemented): the three return z-scores are
+   computed on `return ÷ annualized realized vol` (126d, 10% floor) instead of raw
+   returns — Barroso–Santa-Clara's volatility-managed momentum ("~2× Sharpe,
+   virtually eliminates crashes"). Demotes lottery-like parabolic movers in every
+   regime; no on/off state, so candidate recall is preserved.
+2. ⏳ **Rank-based composite + winsorization**: percentile ranks replace z-scores
+   (bounds score blow-ups like the z≈+30 outlier observed in testing), optional
+   5-day rank-stability check.
+3. ⏳ **Index-level regime gate**: SPY vs 200-day SMA × VIX percentile →
+   CALM/WARN/STRESS; WARN drops the top-decile 1m-momentum tail, STRESS pauses buys.
+   Only after `analyze_results.py` shows real drawdown behavior — the gate pays a
+   whipsaw tax on ordinary days.
+4. ⏳ **Absolute (dual) momentum gate**: ticker must beat T-bills over 12m and be
+   positive over 6m (Antonacci); suppress buys if SPY fails its own trend test.
+5. ⏳ **Anti-lottery overlay**: penalize MAX (largest 1-day gain) or exclude the
+   blow-off signature `z(1m)>+3 & z(6m)<+1`.
 
 ## 5. Decision engine
 

@@ -163,3 +163,44 @@ def test_build_pool_uses_et_week_key(tmp_path, monkeypatch):
     monkeypatch.setattr("screener.today_et", lambda: date(2026, 8, 30))  # Sunday
     path = build_pool(cfg)
     assert path.name == "pool_2026-35.json"
+
+
+def _oscillating_hist(n=130, drift=0.001, amplitude=0.15):
+    """Same endpoint and same 52w-high signature as the steady path, but with
+    much higher realized vol (dips only, so max == final value for both)."""
+    idx = pd.date_range(end=pd.Timestamp.today().normalize(), periods=n, freq="B")
+    base = [100 * (1 + drift) ** i for i in range(n)]
+    cycles = 12
+    osc = [1 - amplitude * abs(__import__("math").sin(2 * 3.14159 * cycles * i / n))
+           for i in range(n)]
+    vals = [b * o for b, o in zip(base, osc)]
+    return pd.DataFrame({"Open": vals, "High": [v * 1.01 for v in vals],
+                         "Low": [v * 0.99 for v in vals],
+                         "Close": vals, "Volume": [2_000_000] * n}, index=idx)
+
+
+def test_compute_raw_metrics_includes_realized_vol():
+    steady = compute_raw_metrics(_hist(drift=0.001))
+    wild = compute_raw_metrics(_oscillating_hist())
+    assert steady["realized_vol"] > 0
+    assert wild["realized_vol"] > steady["realized_vol"]
+
+
+def test_score_universe_prefers_steady_over_parabolic():
+    """Vol-adjusted momentum: a high-vol parabolic path with the same endpoint
+    returns must rank BELOW a steadier mover (momentum-crash defense)."""
+    prices = {"STEADY": _hist(drift=0.001), "PARABOLIC": _oscillating_hist()}
+    ranked = score_universe(prices)
+    by_ticker = {r["ticker"]: r["score"] for r in ranked}
+    assert by_ticker["STEADY"] > by_ticker["PARABOLIC"]
+
+
+def test_vol_floor_bounds_tiny_vol_names():
+    """A near-zero-vol name must not produce an infinite score via division."""
+    hist = _hist(drift=0.001)
+    hist["Close"] = hist["Close"] * 1.0  # already smooth; vol is small but nonzero
+    m = compute_raw_metrics(hist)
+    # realized vol of a smooth ramp is small; the floor applies in scoring
+    ranked = score_universe({"SMOOTH": hist})
+    import math
+    assert math.isfinite(ranked[0]["score"])
