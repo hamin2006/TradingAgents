@@ -70,7 +70,7 @@ def test_fetch_subreddit_all_paginates_and_dedupes():
     page1 = [{"id": f"p{i:05d}", "created_utc": 1700000000 + i,
               "title": "t", "selftext": "", "score": 1, "num_comments": 0,
               "subreddit": "wallstreetbets"} for i in range(100)]
-    page2 = [{"id": f"q{i:05d}", "created_utc": 1600000000 + i,
+    page2 = [{"id": f"q{i:05d}", "created_utc": 1700000100 + i,
               "title": "t", "selftext": "", "score": 1, "num_comments": 0,
               "subreddit": "wallstreetbets"} for i in range(100)]
     calls = []
@@ -80,7 +80,7 @@ def test_fetch_subreddit_all_paginates_and_dedupes():
         if len(calls) == 1:
             return _resp(page1)
         if len(calls) == 2:
-            return _resp(page2)   # second page ignores before= -> loop ends
+            return _resp(page2)
         return _resp([])
 
     with patch("requests.get", side_effect=fake_get):
@@ -88,7 +88,8 @@ def test_fetch_subreddit_all_paginates_and_dedupes():
     assert len(posts) == 200
     assert len({p["id"] for p in posts}) == 200
     assert calls[0]["after"] == 1500000000.0
-    assert calls[1]["before"] == page1[-1]["created_utc"] - 1
+    assert calls[1]["after"] == 1700000099 + 1   # forward cursor
+    assert "before" not in calls[1]              # no before= in forward paging
 
 
 def _resp(posts):

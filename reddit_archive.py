@@ -81,12 +81,12 @@ def _fetch_page(subreddit: str, after_epoch: float,
                 before_epoch: float | None = None, limit: int = _PAGE_SIZE) -> list[dict]:
     params: dict = {
         "subreddit": subreddit,
-        "after": after_epoch,
+        "after": int(after_epoch),  # archive rejects float epochs (400)
         "limit": limit,
         "sort": "asc",
     }
     if before_epoch is not None:
-        params["before"] = before_epoch
+        params["before"] = int(before_epoch)
     resp = requests.get(_ARCHIVE_API, params=params, timeout=_REQUEST_TIMEOUT_S)
     resp.raise_for_status()
     posts = resp.json().get("data") or []
@@ -96,12 +96,17 @@ def _fetch_page(subreddit: str, after_epoch: float,
 
 
 def _fetch_subreddit_all(subreddit: str, after_epoch: float) -> list[dict]:
-    """Paginate r/{subreddit} back to ``after_epoch``; dedupe by post id."""
+    """Paginate r/{subreddit} forward from ``after_epoch``; dedupe by post id.
+
+    The archive pages forward: each response's newest ``created_utc`` (+1)
+    becomes the next ``after`` cursor. ``sort=asc`` returns oldest-first so a
+    stable cursor always advances.
+    """
     posts: list[dict] = []
     seen: set[str] = set()
-    before: float | None = None
+    cursor = int(after_epoch)
     for _ in range(_MAX_PAGES_PER_SUBREDDIT):
-        page = _fetch_page(subreddit, after_epoch, before_epoch=before)
+        page = _fetch_page(subreddit, cursor)
         fresh = []
         for p in page:
             pid = p.get("id")
@@ -111,8 +116,8 @@ def _fetch_subreddit_all(subreddit: str, after_epoch: float) -> list[dict]:
         posts.extend(fresh)
         if not page:
             break
-        before = page[-1]["created_utc"] - 1
-        if len(posts) >= _PAGE_SIZE * (_MAX_PAGES_PER_SUBREDDIT - 1):
+        cursor = int(page[-1]["created_utc"]) + 1
+        if not fresh:
             break
     return posts
 
