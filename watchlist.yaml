@@ -28,7 +28,7 @@ screener:
   candidate_slots: 8       # candidates drawn daily from the ranked queue
   min_watchlist_size: 5    # production gate (test: 1)
   exclusion_days: 3        # churn guard; keep candidates as fresh as possible
-  entry_protection_pct: 2.0
+  entry_protection_pct: 5.0
   regime_gate: true        # SPY/SMA200 x VIX: WARN drops 1m tail, STRESS pauses buys
 
 # Active broker backend. "alpaca" = Alpaca paper API (instant, no daemon —
