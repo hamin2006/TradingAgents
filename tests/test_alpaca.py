@@ -135,22 +135,61 @@ def test_live_mode_hard_rejected(monkeypatch):
         b.connect()
 
 
-def test_buy_bracket_includes_stop_leg(broker):
+def test_buy_bracket_attaches_stop_after_fill(broker):
+    """Two-step entry: plain protection-capped limit first; only after the
+    fill does the GTC stop-loss get submitted. (OTO-at-open inverts the pair
+    in Alpaca's paper engine and never fills — verified live 2026-09-01.)"""
     b, mock_client, _ = broker
-    submitted = MagicMock()
-    submitted.id = "order-1"
-    submitted.status = "filled"
-    submitted.filled_qty = "10"
-    submitted.filled_avg_price = "101.5"
-    mock_client.submit_order.return_value = submitted
-    mock_client.get_order_by_id.return_value = submitted
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "filled"
+    entry.filled_qty = "10"
+    entry.filled_avg_price = "101.5"
+    stop = MagicMock()
+    stop.id = "stop-1"
+    stop.status = "new"
+    mock_client.submit_order.side_effect = [entry, stop]
+    mock_client.get_order_by_id.return_value = entry
     with patch("alpaca_broker.time.sleep"):
-        b.place_market_orders(
+        reports = b.place_market_orders(
             [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
                    protection_price=102.0, stop_price=92.0)])
-    req = mock_client.submit_order.call_args[0][0]
-    assert req.order_class.value == "oto"
-    assert req.stop_loss.stop_price == 92.0
+    calls = mock_client.submit_order.call_args_list
+    assert len(calls) == 2
+    entry_req = calls[0][0][0]
+    assert entry_req.symbol == "AAPL"
+    assert entry_req.limit_price == 102.0
+    assert getattr(entry_req, "order_class", None) is None       # plain entry
+    assert getattr(entry_req, "stop_loss", None) is None         # no OTO leg
+    stop_req = calls[1][0][0]
+    assert stop_req.symbol == "AAPL"
+    assert stop_req.side.value == "sell"
+    assert stop_req.type.value == "stop"
+    assert stop_req.stop_price == 92.0
+    assert stop_req.time_in_force.value == "gtc"                 # 24/7 protection
+    assert reports[0] == {"ticker": "AAPL", "action": "BUY", "shares": 10,
+                          "filled": 10, "avg_price": 101.5}
+
+
+def test_unfilled_entry_does_not_attach_stop(broker):
+    """If the entry never fills (gap beyond the cap / timeout), no stop-loss
+    must be submitted — a stop for a position that does not exist would be
+    rejected and logged as noise."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "new"
+    mock_client.submit_order.return_value = entry
+    mock_client.get_order_by_id.return_value = entry
+    ticks = iter([100.0, 100.0, 100.0, 161.0])  # last tick exceeds deadline
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
+                   protection_price=102.0, stop_price=92.0)])
+    assert mock_client.submit_order.call_count == 1  # entry only, no stop
+    mock_client.cancel_order_by_id.assert_called_once_with("order-1")
+    assert reports[0]["filled"] == 0
 
 
 def test_sell_cancels_open_stops_for_symbol(broker):

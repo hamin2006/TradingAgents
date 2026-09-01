@@ -11,6 +11,12 @@ Execution semantics:
 - BUY orders carry a protection cap (limit order at protection_price): if
   the open gaps beyond the cap the order stays unfilled and is cancelled
   after the fill timeout — never overpaid, mirroring IBKR's MKT+auxPrice.
+- Stop-losses attach TWO-STEP, not as an OTO bracket: Alpaca's paper engine
+  inverts the OTO leg creation at the open (stop leg lands before the limit,
+  no parent linkage) so the entry never activates — verified live 2026-09-01
+  (IT and CRWD both unfilled). Submitting the plain capped entry first and
+  the GTC stop only after the fill avoids the broken path entirely; the
+  unprotected window is the poll interval (<=5s).
 - SELL orders are plain market orders (clean exit, no cap).
 
 Credentials: ALPACA_API_KEY / ALPACA_SECRET_KEY env vars (secrets never live
@@ -22,12 +28,12 @@ import os
 import time
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, OrderType, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
-    StopLossRequest,
+    StopOrderRequest,
 )
 
 from decisions import Order
@@ -96,20 +102,9 @@ class AlpacaBroker:
 
         for o in orders:
             side = OrderSide.BUY if o.action == "BUY" else OrderSide.SELL
-            if o.action == "BUY" and o.protection_price and o.stop_price:
-                # OTO: protection-capped limit entry triggers a GTC stop-loss
-                # leg, so the position is protected 24/7 between daily runs.
-                # OCO semantics: a later rating-based market sell cancels any
-                # leftover stop for the symbol (see _cancel_open_stops).
-                request = LimitOrderRequest(
-                    symbol=o.ticker, qty=o.shares, side=side,
-                    type=OrderType.LIMIT, limit_price=o.protection_price,
-                    time_in_force=TimeInForce.DAY, extended_hours=False,
-                    order_class=OrderClass.OTO,
-                    stop_loss=StopLossRequest(stop_price=o.stop_price),
-                )
-            elif o.action == "BUY" and o.protection_price:
-                # No stop configured: plain protection-capped limit entry.
+            if o.action == "BUY" and o.protection_price:
+                # Plain protection-capped limit entry — NO OTO bracket (the
+                # paper engine inverts the pair at the open; see module doc).
                 request = LimitOrderRequest(
                     symbol=o.ticker, qty=o.shares, side=side,
                     type=OrderType.LIMIT, limit_price=o.protection_price,
@@ -137,6 +132,16 @@ class AlpacaBroker:
                     self._client.cancel_order_by_id(submitted.id)
                     logger.warning("order for %s not filled in %ds; cancelled",
                                    o.ticker, FILL_TIMEOUT_S)
+                elif o.action == "BUY" and o.stop_price:
+                    # Two-step: attach the GTC stop-loss only once the entry
+                    # filled, so the position is protected 24/7 between runs.
+                    stop_request = StopOrderRequest(
+                        symbol=o.ticker, qty=o.shares, side=OrderSide.SELL,
+                        type=OrderType.STOP, stop_price=o.stop_price,
+                        time_in_force=TimeInForce.GTC, extended_hours=False,
+                    )
+                    self._client.submit_order(stop_request)
+                    logger.info("attached GTC stop %s for %s", o.stop_price, o.ticker)
                 elif o.action == "SELL":
                     self._cancel_open_stops(o.ticker)
             except Exception as exc:  # noqa: BLE001
