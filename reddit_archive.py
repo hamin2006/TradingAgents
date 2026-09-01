@@ -115,3 +115,66 @@ def _fetch_subreddit_all(subreddit: str, after_epoch: float) -> list[dict]:
         if len(posts) >= _PAGE_SIZE * (_MAX_PAGES_PER_SUBREDDIT - 1):
             break
     return posts
+
+
+_ENGAGEMENT_FINALIZE_S = 36 * 3600  # archive scores settle ~36h after posting
+
+
+def _mentions_ticker(post: dict, ticker: str) -> bool:
+    pattern = re.compile(rf"\b{re.escape(ticker)}\b", re.IGNORECASE)
+    haystack = f"{post.get('title') or ''}\n{post.get('selftext') or ''}"
+    return bool(pattern.search(haystack))
+
+
+def _filter_posts(posts: list[dict], ticker: str) -> list[dict]:
+    return sorted(
+        (p for p in posts if _mentions_ticker(p, ticker)),
+        key=lambda p: p.get("created_utc") or 0,
+        reverse=True,
+    )
+
+
+def _format_block(ticker: str, posts: list[dict],
+                  end_date: str | None = None) -> str:
+    """Format filtered archive posts like the framework's fetch_reddit_posts."""
+    blocks: list[str] = []
+    by_sub: dict[str, list[dict]] = {}
+    end_cutoff = None
+    if end_date:
+        end_cutoff = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc).timestamp() + 86400  # end of end_date UTC
+    for p in posts:
+        if end_cutoff and (p.get("created_utc") or 0) > end_cutoff:
+            continue  # look-ahead safety (#1220): no future posts for backtests
+        by_sub.setdefault(p.get("subreddit") or "reddit", []).append(p)
+    newest = max((p.get("created_utc") or 0 for p in posts), default=0)
+    note = ""
+    if newest and newest > time.time() - _ENGAGEMENT_FINALIZE_S:
+        note = ("\n(Note: engagement counts finalize ~36h after posting; "
+                "the freshest posts show score=1, 0 comments)")
+    for sub, sub_posts in by_sub.items():
+        lines = [f"r/{sub} — {len(sub_posts)} recent posts mentioning {ticker.upper()} (via Arctic Shift archive):"]
+        for p in sub_posts:
+            created = p.get("created_utc")
+            created_str = (
+                time.strftime("%Y-%m-%d", time.gmtime(created)) if created else "?"
+            )
+            meta = created_str
+            if p.get("score") is not None and p.get("num_comments") is not None:
+                meta += f" · {p['score']:>4}↑ · {p['num_comments']:>3}c"
+            selftext = (p.get("selftext") or "").replace("\n", " ").strip()
+            if len(selftext) > 240:
+                selftext = selftext[:240] + "…"
+            lines.append(
+                f"  [{meta}] {p.get('title') or ''}"
+                + (f"\n    body excerpt: {selftext}" if selftext else "")
+            )
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + note
+
+
+def _empty_placeholder(ticker: str, subreddits: tuple[str, ...]) -> str:
+    return (
+        f"<no Reddit posts found mentioning {ticker.upper()} across "
+        f"{', '.join(f'r/{s}' for s in subreddits)} in the past 7 days>"
+    )

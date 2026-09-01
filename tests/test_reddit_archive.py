@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -112,3 +113,71 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
 def test_cache_missing_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv("REDDIT_ARCHIVE_CACHE_DIR", str(tmp_path))
     assert reddit_archive._load_sub_cache("nope") is None
+
+
+def test_mentions_ticker_word_boundary():
+    assert reddit_archive._mentions_ticker(
+        {"title": "NVDA earnings tomorrow", "selftext": ""}, "NVDA")
+    assert reddit_archive._mentions_ticker(
+        {"title": "$NVDA to the moon", "selftext": ""}, "NVDA")
+    assert reddit_archive._mentions_ticker(
+        {"title": "no", "selftext": "bought some nvda calls"}, "NVDA")
+    assert not reddit_archive._mentions_ticker(
+        {"title": "NVDAX is different", "selftext": ""}, "NVDA")
+    assert not reddit_archive._mentions_ticker(
+        {"title": "unrelated", "selftext": "market musings"}, "NVDA")
+    assert reddit_archive._mentions_ticker(
+        {"title": "BRK-B analysis", "selftext": ""}, "BRK-B")
+
+
+def test_filter_posts_keeps_mentioners_newest_first():
+    old = {"id": "a", "title": "NVDA long term", "selftext": "", "created_utc": 1}
+    mid = {"id": "b", "title": "other", "selftext": "", "created_utc": 2}
+    new = {"id": "c", "title": "nvda gamma squeeze", "selftext": "", "created_utc": 3}
+    out = reddit_archive._filter_posts([old, mid, new], "NVDA")
+    assert [p["id"] for p in out] == ["c", "a"]
+
+
+def test_format_block_matches_framework_shape():
+    posts = [
+        {"id": "abc12", "title": "NVDA earnings tomorrow",
+         "selftext": "long text " * 60, "score": 12, "num_comments": 3,
+         "created_utc": 1700000000, "subreddit": "wallstreetbets"},
+    ]
+    block = reddit_archive._format_block("NVDA", posts)
+    assert "r/wallstreetbets" in block
+    assert "NVDA" in block
+    assert "12" in block and "3c" in block
+    assert "2023" in block  # 1700000000 == 2023-11-14
+    assert "…" in block      # body excerpt truncated
+
+
+def test_format_block_notes_prefinalization_engagement():
+    now = time.time()
+    fresh = {"id": "f1", "title": "NVDA just now", "selftext": "",
+             "score": 1, "num_comments": 0, "created_utc": now - 60,
+             "subreddit": "wallstreetbets"}
+    block = reddit_archive._format_block("NVDA", [fresh])
+    assert "finalize" in block.lower()
+
+
+def test_format_block_omits_note_when_old_enough():
+    block = reddit_archive._format_block("NVDA", [
+        {"id": "o1", "title": "NVDA then", "selftext": "",
+         "score": 40, "num_comments": 7, "created_utc": time.time() - 2 * 86400,
+         "subreddit": "wallstreetbets"}])
+    assert "finalize" not in block.lower()
+
+
+def test_format_block_trims_posts_newer_than_end_date():
+    now = time.time()
+    future = {"id": "f1", "title": "NVDA leak tomorrow", "selftext": "",
+              "score": 1, "num_comments": 0, "created_utc": now + 86400,
+              "subreddit": "wallstreetbets"}
+    past = {"id": "p1", "title": "NVDA back then", "selftext": "",
+            "score": 9, "num_comments": 2, "created_utc": now - 3 * 86400,
+            "subreddit": "wallstreetbets"}
+    end = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
+    block = reddit_archive._format_block("NVDA", [future, past], end_date=end)
+    assert "leak tomorrow" not in block     # future post dropped (#1220)
+    assert "back then" in block
