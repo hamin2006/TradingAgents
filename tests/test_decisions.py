@@ -30,6 +30,22 @@ def test_hold_and_held_buy_produce_no_orders():
     assert orders == []
 
 
+def test_review_rating_is_noop():
+    """Upstream v0.4.0 emits REVIEW when a model's output has no recognizable
+    rating. It must never trade: not a buy, not a sell — a flag for re-run."""
+    orders = compute_orders(
+        {"AMZN": "REVIEW"}, {}, {"AMZN": 100.0}, 100_000, 10,
+        entry_protection_pct=5.0)
+    assert orders == []
+
+
+def test_review_rating_on_held_position_keeps_position():
+    """A REVIEW on a held position must not liquidate it (no fabricated Sell)."""
+    orders = compute_orders(
+        {"AMZN": "REVIEW"}, {"AMZN": 10}, {"AMZN": 100.0}, 100_000, 10)
+    assert orders == []
+
+
 def test_underweight_held_is_sell():
     ratings = {"NVDA": "Underweight"}
     holdings = {"NVDA": 10}
