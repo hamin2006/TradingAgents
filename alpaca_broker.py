@@ -132,6 +132,27 @@ class AlpacaBroker:
                     self._client.cancel_order_by_id(submitted.id)
                     logger.warning("order for %s not filled in %ds; cancelled",
                                    o.ticker, FILL_TIMEOUT_S)
+                elif o.action == "BUY" and o.stop_price and avg_price <= o.stop_price:
+                    # Gap-down guard: the fill at/below the stop level (last
+                    # close x 0.92) means the stock gapped through the stop at
+                    # the open — the position would be dead on arrival (stop
+                    # fires immediately at a guaranteed loss). Undo the entry
+                    # with an immediate market sell; never attach the stop.
+                    logger.warning(
+                        "gap-down entry for %s: filled %.2f at/below stop %.2f; "
+                        "undoing the position", o.ticker, avg_price, o.stop_price)
+                    try:
+                        undo = MarketOrderRequest(
+                            symbol=o.ticker, qty=o.shares, side=OrderSide.SELL,
+                            type=OrderType.MARKET,
+                            time_in_force=TimeInForce.DAY, extended_hours=False,
+                        )
+                        self._client.submit_order(undo)
+                        filled = 0
+                    except Exception as exc:  # noqa: BLE001 - position left naked; log loudly
+                        logger.error("gap-down undo SELL failed for %s: %s "
+                                     "(position left without a stop!)", o.ticker, exc)
+                        filled = 0
                 elif o.action == "BUY" and o.stop_price:
                     # Two-step: attach the GTC stop-loss only once the entry
                     # filled, so the position is protected 24/7 between runs.

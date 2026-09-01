@@ -192,6 +192,53 @@ def test_unfilled_entry_does_not_attach_stop(broker):
     assert reports[0]["filled"] == 0
 
 
+def test_gap_down_fill_below_stop_is_undone(broker):
+    """A fill at or below the stop level (last close x 0.92) means the stock
+    gapped through the stop at the open. The position would be dead on
+    arrival (stop fires immediately at a loss), so the entry is undone with
+    an immediate market sell and no stop is attached."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "filled"
+    entry.filled_qty = "10"
+    entry.filled_avg_price = "90.0"   # below stop 92.0: gapped through
+    mock_client.submit_order.return_value = entry
+    mock_client.get_order_by_id.return_value = entry
+    with patch("alpaca_broker.time.sleep"):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
+                   protection_price=102.0, stop_price=92.0)])
+    calls = mock_client.submit_order.call_args_list
+    assert len(calls) == 2            # entry + undo sell; NO stop order
+    undo = calls[1][0][0]
+    assert isinstance(undo, MarketOrderRequest)
+    assert undo.side.value == "sell"
+    assert undo.qty == 10
+    assert not any("stop" in str(c[0][0].type.value) for c in calls)
+    assert reports[0]["filled"] == 0  # position undone, nothing held
+
+
+def test_gap_down_undo_failure_still_attaches_no_stop(broker):
+    """If the undo sell itself fails, no stop is attached either — the
+    position is left naked and logged loudly rather than being sold at the
+    stop with a guaranteed loss."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "filled"
+    entry.filled_qty = "10"
+    entry.filled_avg_price = "90.0"
+    mock_client.submit_order.side_effect = [entry, Exception("sell failed")]
+    mock_client.get_order_by_id.return_value = entry
+    with patch("alpaca_broker.time.sleep"):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
+                   protection_price=102.0, stop_price=92.0)])
+    assert mock_client.submit_order.call_count == 2  # no stop attempted
+    assert reports[0]["filled"] == 0
+
+
 def test_sell_cancels_open_stops_for_symbol(broker):
     b, mock_client, _ = broker
     open_stop = MagicMock()
