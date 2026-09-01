@@ -7,7 +7,7 @@ behavior we added for the Trader, Research Manager, and Sentiment Analyst
 so they share the same deterministic output shape.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -393,6 +393,18 @@ def _structured_sentiment_llm(captured: dict, report: SentimentReport | None = N
 
 @pytest.mark.unit
 class TestSentimentAnalystAgent:
+    @pytest.fixture(autouse=True)
+    def _no_live_reddit(self):
+        """The Sentiment Analyst fetches Reddit synchronously; stub it so these
+        tests stay hermetic and fast (Reddit's RSS path is rate-limited and
+        429s carry 5s retry sleeps, which trip pytest-timeout on rate-limited
+        IPs)."""
+        with patch(
+            "tradingagents.agents.analysts.sentiment_analyst.fetch_reddit_posts",
+            return_value="r/wallstreetbets: <no posts found mentioning NVDA in the past 7 days>",
+        ):
+            yield
+
     def test_structured_path_produces_rendered_markdown(self):
         captured = {}
         report = SentimentReport(
