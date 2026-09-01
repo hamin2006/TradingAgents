@@ -5,6 +5,7 @@ llm_provider: openrouter
 quick_think_llm: deepseek/deepseek-v4-flash-0731   # dated snapshot, cheaper prompt pricing
 deep_think_llm: deepseek/deepseek-v4-pro
 output_language: English
+max_tokens: null            # unused; tracks upstream config surface so merges stay clean
 
 # Pin OpenRouter routing per model slug (multiple hosts serve the same model;
 # pin to the first-party provider). Unknown models route unpinned.

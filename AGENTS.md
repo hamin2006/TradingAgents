@@ -6,6 +6,8 @@ Guidance for agent sessions working in this repository.
 
 A fork of **TauricResearch/TradingAgents** (multi-agent LLM trading framework, LangGraph) extended with a daily paper-trading automation layer:
 
+> **Framework base:** upstream **v0.4.0** (merged `2026-08-31`, commit `0e9de89`). Notable upstream surface we consume: memory log entries may carry a trailing `resolved:YYYY-MM-DD` tag (our analytics tolerate it), unparseable ratings surface as `REVIEW` (a safe no-op in `compute_orders`), and a cross-provider `max_tokens` config key exists (tracked as `null` in `watchlist.yaml` for merge cleanliness).
+
 1. A deterministic **S&P 500 momentum screener** generates buy candidates every trading morning (raw-momentum composite + liquidity filter + **regime gate**: SPY-vs-200d-SMA × VIX → CALM/WARN/STRESS — WARN drops the 1m-momentum tail, STRESS pauses new buys; measured via a 5y crash-in-sample backtest, see spec §5bis).
 2. A **parallel multi-agent analysis pass** (4 analysts → bull/bear debate → trader → 3-way risk debate → portfolio manager) rates each watchlist ticker Buy/Overweight/Hold/Underweight/Sell.
 3. Ratings execute **automatically on an Alpaca paper account** at the 09:30 ET market open, with broker-side entry protection caps and stop-losses.

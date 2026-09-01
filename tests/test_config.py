@@ -83,5 +83,6 @@ def test_shipped_watchlist_yaml_loads():
     assert cfg["llm_provider"] == "openrouter"
     assert cfg["quick_think_llm"].startswith("deepseek/")
     assert cfg["deep_think_llm"].startswith("deepseek/")
+    assert cfg["max_tokens"] is None  # tracked for upstream-merge cleanliness
     assert cfg["screener"]["min_watchlist_size"] == 5
     assert cfg["screener"]["pool_size"] == 50
