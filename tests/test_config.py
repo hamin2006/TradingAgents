@@ -62,6 +62,21 @@ def test_unknown_yaml_key_rejected(tmp_path):
         load_watchlist_config(yaml_path)
 
 
+def test_duplicate_yaml_key_rejected(tmp_path):
+    """PyYAML silently keeps the LAST duplicate key (last-wins), which bit us
+    in openrouter_provider_pins: a stale DeepSeek line shadowed StreamLake and
+    the effective pin was a provider that cannot serve the model. Duplicate
+    keys must be a loud error, not a silent override."""
+    yaml_path = tmp_path / "watchlist.yaml"
+    yaml_path.write_text(
+        "openrouter_provider_pins:\n"
+        "  deepseek/deepseek-v4-pro: StreamLake\n"
+        "  deepseek/deepseek-v4-pro: DeepSeek\n"
+    )
+    with pytest.raises(ValueError, match="[Dd]uplicate"):
+        load_watchlist_config(yaml_path)
+
+
 def test_shipped_watchlist_yaml_loads():
     from config import DEFAULT_WATCHLIST_PATH, load_watchlist_config
     cfg = load_watchlist_config(DEFAULT_WATCHLIST_PATH)

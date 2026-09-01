@@ -70,13 +70,34 @@ def merge_over_default(base: dict, overrides: dict) -> dict:
     return merged
 
 
+def _reject_duplicate_keys(node, path=""):
+    """Recursively reject YAML mapping nodes with duplicate keys.
+
+    PyYAML silently keeps the last duplicate (last-wins), which once shadowed
+    a working OpenRouter provider pin with a broken one. Loud failure beats a
+    silent override of a safety-relevant setting.
+    """
+    if not isinstance(node, yaml.MappingNode):
+        return
+    seen = set()
+    for key_node, value_node in node.value:
+        key = key_node.value
+        full = f"{path}.{key}" if path else key
+        if key in seen:
+            raise ValueError(f"Duplicate key in watchlist.yaml: {full!r}")
+        seen.add(key)
+        _reject_duplicate_keys(value_node, full)
+
+
 def load_watchlist_config(path: str | Path | None = None) -> dict:
     path = Path(path) if path else DEFAULT_WATCHLIST_PATH
     base = merge_over_default(DEFAULT_CONFIG, APP_DEFAULTS)
     if not path.exists():
         return base
     with open(path, encoding="utf-8") as f:
-        overrides = yaml.safe_load(f) or {}
+        text = f.read()
+    _reject_duplicate_keys(yaml.compose(text))
+    overrides = yaml.safe_load(text) or {}
     unknown = set(overrides) - _KNOWN_KEYS
     if unknown:
         raise ValueError(f"Unknown watchlist.yaml keys: {sorted(unknown)}")
