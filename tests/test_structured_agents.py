@@ -394,14 +394,18 @@ def _structured_sentiment_llm(captured: dict, report: SentimentReport | None = N
 @pytest.mark.unit
 class TestSentimentAnalystAgent:
     @pytest.fixture(autouse=True)
-    def _no_live_reddit(self):
-        """The Sentiment Analyst fetches Reddit synchronously; stub it so these
-        tests stay hermetic and fast (Reddit's RSS path is rate-limited and
-        429s carry 5s retry sleeps, which trip pytest-timeout on rate-limited
-        IPs)."""
+    def _no_live_social(self):
+        """The Sentiment Analyst fetches Reddit + StockTwits synchronously; stub
+        both so these tests stay hermetic and fast (Reddit 429s and StockTwits
+        burst-403s carry multi-second retry sleeps through the resilient
+        wrappers installed by the daily_run tests)."""
         with patch(
             "tradingagents.agents.analysts.sentiment_analyst.fetch_reddit_posts",
             return_value="r/wallstreetbets: <no posts found mentioning NVDA in the past 7 days>",
+        ), patch(
+            "tradingagents.agents.analysts.sentiment_analyst.fetch_stocktwits_messages",
+            return_value="<no StockTwits messages for $NVDA within 2026-01-08..2026-01-15 "
+                         "(public stream serves only recent messages)>",
         ):
             yield
 

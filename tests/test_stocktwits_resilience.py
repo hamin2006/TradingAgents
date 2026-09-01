@@ -3,6 +3,9 @@ mapping (#1113).
 
 StockTwits lists crypto under ``<BASE>.X`` (Yahoo's ``BTC-USD`` 404s), and any
 transport error must degrade to a placeholder rather than raise.
+
+The second section covers the retry-with-backoff + per-ticker cache wrapper
+(burst-403 defense under parallel analyze workers).
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from urllib.error import HTTPError
 
 import pytest
 
+import stocktwits_resilience
 from tradingagents.dataflows import stocktwits
 
 
@@ -75,3 +79,74 @@ class TestStockTwitsCryptoSymbols:
         with patch.object(stocktwits, "urlopen", side_effect=fake_urlopen):
             stocktwits.fetch_stocktwits_messages("BTC-USD")
         assert "/symbol/BTC.X.json" in seen["url"]
+
+
+def test_resilient_retries_on_failure():
+    """A failure placeholder triggers backoff retries, not silence."""
+    calls = {"n": 0}
+
+    def impl(ticker, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return "<stocktwits unavailable: HTTPError>"
+        return "Bullish: 1 (100%) · Bearish: 0 (0%) · Unlabeled: 0 · Total: 1"
+
+    with patch("stocktwits_resilience.time.sleep"):
+        out = stocktwits_resilience.make_resilient(impl)("AAPL")
+    assert calls["n"] == 3
+    assert out.startswith("Bullish:")
+
+
+def test_resilient_serves_cache_when_all_fail(tmp_path, monkeypatch):
+    """Total failure must still give the analyst StockTwits data: cached block."""
+    monkeypatch.setenv("STOCKTWITS_CACHE_DIR", str(tmp_path))
+    stocktwits_resilience._store_cache("AAPL", "old block", date="2026-08-29")
+
+    def impl(ticker, **kwargs):
+        return "<stocktwits unavailable: HTTPError>"
+
+    with patch("stocktwits_resilience.time.sleep"):
+        out = stocktwits_resilience.make_resilient(impl)("AAPL")
+    assert "old block" in out
+    assert "cached from 2026-08-29" in out
+
+
+def test_resilient_placeholder_only_when_no_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("STOCKTWITS_CACHE_DIR", str(tmp_path))
+
+    def impl(ticker, **kwargs):
+        return "<stocktwits unavailable: HTTPError>"
+
+    with patch("stocktwits_resilience.time.sleep"):
+        out = stocktwits_resilience.make_resilient(impl)("AAPL")
+    assert out.startswith("<stocktwits unavailable")
+
+
+def test_resilient_caches_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("STOCKTWITS_CACHE_DIR", str(tmp_path))
+
+    def impl(ticker, **kwargs):
+        return "Bullish: 1 (100%) · Bearish: 0 (0%) · Unlabeled: 0 · Total: 1"
+
+    with patch("stocktwits_resilience.time.sleep"):
+        stocktwits_resilience.make_resilient(impl)("AAPL")
+    assert (tmp_path / "aapl.json").exists()
+    assert stocktwits_resilience._load_cache("AAPL")["block"].startswith("Bullish:")
+
+
+def test_resilient_does_not_retry_or_cache_empty_window(tmp_path, monkeypatch):
+    """A genuinely empty window is not a failure: no retries, no cache write."""
+    monkeypatch.setenv("STOCKTWITS_CACHE_DIR", str(tmp_path))
+    calls = {"n": 0}
+
+    def impl(ticker, **kwargs):
+        calls["n"] += 1
+        return ("<no StockTwits messages for $AAPL within 2026-08-24..2026-08-31 "
+                "(public stream serves only recent messages)>")
+
+    with patch("stocktwits_resilience.time.sleep"):
+        out = stocktwits_resilience.make_resilient(impl)(
+            "AAPL", start_date="2026-08-24", end_date="2026-08-31")
+    assert calls["n"] == 1
+    assert out.startswith("<no StockTwits messages")
+    assert not (tmp_path / "aapl.json").exists()

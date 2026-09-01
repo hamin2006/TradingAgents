@@ -520,6 +520,22 @@ def test_reddit_resilient_wrapper_applied_without_creds(monkeypatch):
         daily_run._REDDIT_OAUTH_ACTIVE = False
 
 
+def test_stocktwits_resilient_wrapper_applied():
+    """The sentiment analyst's StockTwits fetch is wrapped (retry+cache)."""
+    import daily_run
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    original = sa.fetch_stocktwits_messages
+    daily_run._STOCKTWITS_PATCHED = False
+    try:
+        daily_run._ensure_stocktwits_resilience()
+        assert sa.fetch_stocktwits_messages is not original  # wrapped
+        assert sa.fetch_stocktwits_messages._wrapped_original is original
+    finally:
+        sa.fetch_stocktwits_messages = original
+        daily_run._STOCKTWITS_PATCHED = False
+
+
 def test_run_execute_stress_pauses_buys_but_exits(cfg, caplog):
     """Regime STRESS suppresses new BUY orders; rating exits still execute."""
     _ratings_file(cfg, {"AAPL": "Buy", "TSLA": "Sell"})

@@ -181,6 +181,26 @@ _REDDIT_MIN_INTERVAL = 8.0  # seconds between Reddit requests (anonymous ~10/min
 _REDDIT_LAST_TS = 0.0  # monotonic timestamp of the last request, guarded by _REDDIT_LOCK
 _REDDIT_OAUTH_PATCHED = False
 _REDDIT_OAUTH_ACTIVE = False
+_STOCKTWITS_PATCHED = False
+
+
+def _ensure_stocktwits_resilience() -> None:
+    """Wrap the sentiment analyst's StockTwits fetch with retry + per-ticker cache.
+
+    The public StockTwits endpoint intermittently 403s under parallel analyze
+    workers (burst throttling) — the same failure class Reddit's RSS path has.
+    A retry-with-backoff + cache wrapper guarantees the analyst always gets
+    StockTwits data. Framework untouched: the swap is lazy from this module.
+    """
+    global _STOCKTWITS_PATCHED
+    if _STOCKTWITS_PATCHED:
+        return
+    import stocktwits_resilience
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    original = sa.fetch_stocktwits_messages
+    sa.fetch_stocktwits_messages = stocktwits_resilience.make_resilient(original)
+    _STOCKTWITS_PATCHED = True
 
 
 def _ensure_reddit_pacing() -> None:
@@ -334,6 +354,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_openrouter_pins(cfg.get("openrouter_provider_pins"))
     if not _ensure_reddit_oauth():
         _ensure_reddit_pacing()
+    _ensure_stocktwits_resilience()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):
