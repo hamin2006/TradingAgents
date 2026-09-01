@@ -13,7 +13,7 @@ openrouter_provider_pins:
   deepseek/deepseek-v4-flash-0731: Relace
   deepseek/deepseek-v4-pro: StreamLake
 
-capital: 100000            # paper capital
+capital: 10000            # paper capital (matches real paper-account cash)
 max_positions: 10          # position-count cap AND equal-weight denominator
 max_order_value_cap: 15000 # per-day total buy cap
 stop_loss_pct: 8.0         # broker-side GTC stop on every buy (0 disables)
