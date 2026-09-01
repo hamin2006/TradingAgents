@@ -296,9 +296,10 @@ def _ensure_openrouter_pins(pins: dict[str, str] | None = None) -> None:
     """Pin OpenRouter routing per model slug (Relace, DeepSeek, ...).
 
     OpenRouter serves many slugs from multiple hosting providers and rotates
-    between them by default; a pin forces the request to the named provider
-    (``allow_fallbacks=false``) by injecting OpenRouter's ``provider`` routing
-    body through the OpenAI-compatible request. Framework untouched: the
+    between them by default; a pin orders the request to the named provider
+    first (``allow_fallbacks=true`` — the pin is a preference, not a hard
+    lock) by injecting OpenRouter's ``provider`` routing body through the
+    OpenAI-compatible request. Framework untouched: the
     ``OpenAIClient.get_llm`` method is wrapped lazily from this module.
     """
     global _OPENROUTER_PINS, _OPENROUTER_PINS_APPLIED
@@ -315,8 +316,9 @@ def _ensure_openrouter_pins(pins: dict[str, str] | None = None) -> None:
         if provider and getattr(self, "provider", "") == "openrouter":
             llm.extra_body = {**(getattr(llm, "extra_body", None) or {}),
                               "provider": {"order": [provider],
-                                           "allow_fallbacks": False}}
-            logger.info("OpenRouter pin: %s -> %s", llm.model_name, provider)
+                                           "allow_fallbacks": True}}
+            logger.info("OpenRouter pin: %s -> %s (fallbacks allowed)",
+                        llm.model_name, provider)
         return llm
 
     pinned_get_llm._wrapped_original = original

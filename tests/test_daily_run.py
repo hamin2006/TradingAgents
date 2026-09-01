@@ -676,20 +676,20 @@ def test_openrouter_pin_injects_provider_body():
 
     original_attr = oc.OpenAIClient.get_llm
     daily_run._OPENROUTER_PINS_APPLIED = False
-    daily_run._OPENROUTER_PINS = {"deepseek/deepseek-v4-flash-0731": "Fireworks",
-                                  "deepseek/deepseek-v4-pro": "Fireworks"}
+    daily_run._OPENROUTER_PINS = {"deepseek/deepseek-v4-flash-0731": "Relace",
+                                  "deepseek/deepseek-v4-pro": "StreamLake"}
     try:
         daily_run._ensure_openrouter_pins(daily_run._OPENROUTER_PINS)
 
         pinned = OpenAIClient(model="deepseek/deepseek-v4-flash-0731",
                               provider="openrouter").get_llm()
-        assert pinned.extra_body == {"provider": {"order": ["Fireworks"],
-                                                  "allow_fallbacks": False}}
+        assert pinned.extra_body == {"provider": {"order": ["Relace"],
+                                                  "allow_fallbacks": True}}
 
         pinned_pro = OpenAIClient(model="deepseek/deepseek-v4-pro",
                                   provider="openrouter").get_llm()
-        assert pinned_pro.extra_body == {"provider": {"order": ["Fireworks"],
-                                                      "allow_fallbacks": False}}
+        assert pinned_pro.extra_body == {"provider": {"order": ["StreamLake"],
+                                                      "allow_fallbacks": True}}
 
         native = OpenAIClient(model="deepseek/deepseek-v4-flash-0731",
                               provider="deepseek").get_llm()  # non-OpenRouter
