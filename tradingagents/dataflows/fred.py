@@ -175,7 +175,19 @@ def get_macro_data(
     except ValueError as e:
         return f"FRED: {e}"
 
-    meta = _request("series", {"series_id": series_id, **realtime}).get("seriess") or []
+    try:
+        meta = _request("series", {"series_id": series_id, **realtime}).get("seriess") or []
+    except ValueError as e:
+        # _request raises on FRED 400s (unknown series IDs, series IDs over the
+        # 25-char limit, malformed params). Same graceful guidance: a bad
+        # argument shouldn't surface as a raw FRED error in the analyst's report.
+        if "series_id" in str(e) or "series ID" in str(e):
+            return (
+                f"FRED: '{indicator}' is not a known macro alias or a valid FRED "
+                f"series ID. Use an alias (e.g. 'cpi', 'unemployment', "
+                f"'10y_treasury') or a raw FRED series ID (e.g. 'CPIAUCSL')."
+            )
+        raise
     if not meta:
         return (
             f"FRED series '{series_id}' not found. Pass a known alias "
