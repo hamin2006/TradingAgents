@@ -178,3 +178,69 @@ def _empty_placeholder(ticker: str, subreddits: tuple[str, ...]) -> str:
         f"<no Reddit posts found mentioning {ticker.upper()} across "
         f"{', '.join(f'r/{s}' for s in subreddits)} in the past 7 days>"
     )
+
+
+def _window_epoch(start_date: str | None, end_date: str | None) -> float:
+    if start_date:
+        return datetime.strptime(start_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc).timestamp()
+    return time.time() - 7 * 86400
+
+
+def _cache_fresh_for_all(subreddits) -> bool:
+    for sub in subreddits:
+        cached = _load_sub_cache(sub)
+        if cached is None or time.time() - cached.get("fetched_at", 0) > _CACHE_TTL_S:
+            return False
+    return True
+
+
+def _pull_archive(subreddits, start_date: str | None) -> bool:
+    """Fill/refresh per-subreddit caches once per run. True when usable."""
+    global _ARCHIVE_LOADED
+    with _ARCHIVE_LOCK:
+        if _ARCHIVE_LOADED:
+            return True
+        after = _window_epoch(start_date, None)
+        try:
+            for sub in subreddits:
+                if not _cache_fresh_for_all([sub]):
+                    _store_sub_cache(sub, _fetch_subreddit_all(sub, after))
+            _ARCHIVE_LOADED = True
+            return True
+        except Exception as exc:  # noqa: BLE001 - degrade, never raise
+            logger.warning("Reddit archive pull failed (%s); serving stale cache or RSS", exc)
+            stale = all(_load_sub_cache(sub) is not None for sub in subreddits)
+            if stale:
+                _ARCHIVE_LOADED = True
+                return True
+            return False
+
+
+def make_archive_aware(impl):
+    """Wrap a fetch_reddit_posts-style implementation: archive-first, RSS fallback.
+
+    ``impl`` takes ``(ticker, subreddits=..., limit_per_sub=..., timeout=...,
+    inter_request_delay=..., start_date=..., end_date=...)`` and returns a
+    plaintext block. Drop-in signature- and format-compatible with the
+    framework's fetcher and the reddit_auth resilient wrapper.
+    """
+    def archive_aware(ticker, subreddits=DEFAULT_SUBREDDITS, limit_per_sub=5,
+                      timeout=10.0, inter_request_delay=1.0,
+                      start_date=None, end_date=None):
+        subs = tuple(subreddits)
+        if _pull_archive(subs, start_date):
+            matches: list[dict] = []
+            for sub in subs:
+                cached = _load_sub_cache(sub)
+                if cached:
+                    matches.extend(_filter_posts(cached.get("posts") or [], ticker))
+            if matches:
+                return _format_block(ticker, matches, end_date)
+            return _empty_placeholder(ticker, subs)
+        return impl(ticker, subreddits=subreddits, limit_per_sub=limit_per_sub,
+                    timeout=timeout, inter_request_delay=inter_request_delay,
+                    start_date=start_date, end_date=end_date)
+
+    archive_aware._wrapped_original = impl  # tests unwrap to the underlying fetcher
+    return archive_aware

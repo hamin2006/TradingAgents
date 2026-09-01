@@ -181,3 +181,134 @@ def test_format_block_trims_posts_newer_than_end_date():
     block = reddit_archive._format_block("NVDA", [future, past], end_date=end)
     assert "leak tomorrow" not in block     # future post dropped (#1220)
     assert "back then" in block
+
+
+@pytest.fixture
+def clean_archive(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_ARCHIVE_CACHE_DIR", str(tmp_path))
+    reddit_archive._ARCHIVE_LOADED = False
+    yield
+    reddit_archive._ARCHIVE_LOADED = False
+
+
+def test_wrapper_serves_fresh_cache_without_network(clean_archive):
+    reddit_archive._store_sub_cache("wallstreetbets", PAGE)
+    reddit_archive._store_sub_cache("stocks", [])
+    reddit_archive._store_sub_cache("investing", [])
+    called = {"n": 0}
+
+    def impl(*args, **kwargs):
+        called["n"] += 1
+        return "<no Reddit posts found mentioning NVDA across r/wallstreetbets, r/stocks, r/investing in the past 7 days>"
+
+    wrapped = reddit_archive.make_archive_aware(impl)
+    block = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+    assert called["n"] == 0          # archive served, RSS never invoked
+    assert "NVDA earnings tomorrow" in block
+
+
+def test_wrapper_empty_archive_returns_placeholder_not_failure(clean_archive):
+    reddit_archive._store_sub_cache("wallstreetbets", [])
+    reddit_archive._store_sub_cache("stocks", [])
+    reddit_archive._store_sub_cache("investing", [])
+    called = {"n": 0}
+
+    def impl(*args, **kwargs):
+        called["n"] += 1
+        return "RSS DATA"
+
+    wrapped = reddit_archive.make_archive_aware(impl)
+    block = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+    assert called["n"] == 0
+    assert block.startswith("<no Reddit posts found mentioning NVDA")
+
+
+def test_wrapper_pulls_once_on_miss_then_reuses(clean_archive):
+    fetched = []
+
+    def fake_get(url, params=None, timeout=None):
+        fetched.append(dict(params or {}))
+        sub = (params or {}).get("subreddit")
+        posts = [dict(p, subreddit=sub) for p in PAGE] if sub == "wallstreetbets" else []
+        return _resp(posts)
+
+    def impl(*args, **kwargs):
+        return "RSS DATA"
+
+    wrapped = reddit_archive.make_archive_aware(impl)
+    with patch("requests.get", side_effect=fake_get):
+        b1 = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+        n_first = len(fetched)
+        b2 = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+    assert b1 == b2
+    assert "NVDA earnings tomorrow" in b1
+    assert n_first >= 3          # one page per subreddit
+    assert len(fetched) == n_first  # second call reused cache, no network
+
+
+def test_wrapper_serves_stale_cache_when_pull_fails(clean_archive):
+    for sub in reddit_archive.DEFAULT_SUBREDDITS:
+        posts = [dict(p, subreddit=sub) for p in PAGE] if sub == "wallstreetbets" else []
+        path = reddit_archive._cache_path(sub)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "fetched_at": time.time() - 2 * reddit_archive._CACHE_TTL_S,  # stale
+            "posts": posts,
+        }), encoding="utf-8")
+
+    def bad_get(url, params=None, timeout=None):
+        raise RuntimeError("archive down")
+
+    def impl(*args, **kwargs):
+        return "RSS DATA"
+
+    wrapped = reddit_archive.make_archive_aware(impl)
+    with patch("requests.get", side_effect=bad_get):
+        block = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+    assert "NVDA earnings tomorrow" in block
+
+
+def test_wrapper_falls_back_to_impl_without_any_cache(clean_archive):
+    def impl(*args, **kwargs):
+        return "RSS DATA"
+
+    def bad_get(url, params=None, timeout=None):
+        raise RuntimeError("archive down")
+
+    wrapped = reddit_archive.make_archive_aware(impl)
+    with patch("requests.get", side_effect=bad_get):
+        block = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+    assert block == "RSS DATA"
+    assert wrapped._wrapped_original is impl
+
+
+def test_wrapper_single_fill_under_concurrency(clean_archive):
+    import threading
+
+    fetched = []
+
+    def fake_get(url, params=None, timeout=None):
+        fetched.append(dict(params or {}))
+        sub = (params or {}).get("subreddit")
+        posts = [dict(p, subreddit=sub) for p in PAGE] if sub == "wallstreetbets" else []
+        return _resp(posts)
+
+    wrapped = reddit_archive.make_archive_aware(lambda *a, **k: "RSS")
+    results = []
+    barrier = threading.Barrier(4)
+
+    def worker():
+        barrier.wait()
+        with patch("requests.get", side_effect=fake_get):
+            results.append(wrapped("NVDA", start_date="2026-08-25",
+                                   end_date="2026-09-01"))
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(results) == 4
+    assert all("NVDA earnings tomorrow" in r for r in results)
+    subreddits_fetched = {f["subreddit"] for f in fetched}
+    assert subreddits_fetched == set(reddit_archive.DEFAULT_SUBREDDITS)
