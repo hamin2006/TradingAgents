@@ -182,6 +182,7 @@ _REDDIT_LAST_TS = 0.0  # monotonic timestamp of the last request, guarded by _RE
 _REDDIT_OAUTH_PATCHED = False
 _REDDIT_OAUTH_ACTIVE = False
 _STOCKTWITS_PATCHED = False
+_REDDIT_ARCHIVE_PATCHED = False
 
 
 def _ensure_stocktwits_resilience() -> None:
@@ -201,6 +202,26 @@ def _ensure_stocktwits_resilience() -> None:
     original = sa.fetch_stocktwits_messages
     sa.fetch_stocktwits_messages = stocktwits_resilience.make_resilient(original)
     _STOCKTWITS_PATCHED = True
+
+
+def _ensure_reddit_archive() -> None:
+    """Wrap the sentiment analyst's Reddit fetch archive-first (Arctic Shift).
+
+    The anonymous RSS path loses subreddits to 429s under parallel workers;
+    the keyless Arctic Shift archive gives complete 7-day coverage, cached
+    per subreddit and filtered locally per ticker. Falls back to the existing
+    resilient RSS path when the archive is unreachable. Framework untouched:
+    the swap is lazy from this module.
+    """
+    global _REDDIT_ARCHIVE_PATCHED
+    if _REDDIT_ARCHIVE_PATCHED:
+        return
+    import reddit_archive
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    original = sa.fetch_reddit_posts
+    sa.fetch_reddit_posts = reddit_archive.make_archive_aware(original)
+    _REDDIT_ARCHIVE_PATCHED = True
 
 
 def _ensure_reddit_pacing() -> None:
@@ -354,6 +375,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_openrouter_pins(cfg.get("openrouter_provider_pins"))
     if not _ensure_reddit_oauth():
         _ensure_reddit_pacing()
+    _ensure_reddit_archive()
     _ensure_stocktwits_resilience()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 

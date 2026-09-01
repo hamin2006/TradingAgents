@@ -34,6 +34,7 @@ The user observes the paper portfolio and can pause trading via a kill switch. N
 | `ibkr.py` / `alpaca_broker.py` / `broker.py` | Broker backends, same interface (connect, positions+cash, orders, disconnect). **Alpaca is active** (paper-only, hard-guarded); IBKR kept for a later flip |
 | `daily_run.py` | CLI orchestrator: `--analyze` (parallel per-ticker pipeline runs with retry + memory log), `--execute` (kill switch → ratings → holdings → orders → two-phase executed log), `--healthcheck`. Also watchlist assembly (holdings ∪ screened candidates, exclusion window, min-size gate) and runtime patches (memory-log locking, reddit pacing/oauth) |
 | `reddit_auth.py` | OAuth Reddit fetcher — inactive until `REDDIT_CLIENT_ID`/`REDDIT_SECRET` are set; falls back to the paced anonymous RSS path. Resilience wrapper (retry + per-ticker cache) applies on both paths |
+| `reddit_archive.py` | Keyless Arctic Shift archive pull (complete subreddit coverage, per-sub cache, local ticker filter); archive-first wrapper with RSS fallback |
 | `analyze_results.py` | Outcome analytics over the decision memory log (hit rates by rating tier, per-ticker alpha, streaks) |
 | `watchlist.yaml` | User-facing config: seed watchlist, models, capital, sizing, screener + broker settings, kill switch |
 | `SETUP.md` | Full production setup: keys, broker, cron, smoke tests |

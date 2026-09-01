@@ -536,6 +536,22 @@ def test_stocktwits_resilient_wrapper_applied():
         daily_run._STOCKTWITS_PATCHED = False
 
 
+def test_reddit_archive_wrapper_applied():
+    """The sentiment analyst's Reddit fetch is wrapped (archive-first)."""
+    import daily_run
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    original = sa.fetch_reddit_posts
+    daily_run._REDDIT_ARCHIVE_PATCHED = False
+    try:
+        daily_run._ensure_reddit_archive()
+        assert sa.fetch_reddit_posts is not original  # wrapped
+        assert sa.fetch_reddit_posts._wrapped_original is original
+    finally:
+        sa.fetch_reddit_posts = _unwrap_reddit_fetch(original)
+        daily_run._REDDIT_ARCHIVE_PATCHED = False
+
+
 def test_run_execute_stress_pauses_buys_but_exits(cfg, caplog):
     """Regime STRESS suppresses new BUY orders; rating exits still execute."""
     _ratings_file(cfg, {"AAPL": "Buy", "TSLA": "Sell"})
