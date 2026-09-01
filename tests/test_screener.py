@@ -175,7 +175,7 @@ def _oscillating_hist(n=130, drift=0.001, amplitude=0.15):
     cycles = 12
     osc = [1 - amplitude * abs(__import__("math").sin(2 * 3.14159 * cycles * i / n))
            for i in range(n)]
-    vals = [b * o for b, o in zip(base, osc)]
+    vals = [b * o for b, o in zip(base, osc, strict=True)]
     return pd.DataFrame({"Open": vals, "High": [v * 1.01 for v in vals],
                          "Low": [v * 0.99 for v in vals],
                          "Close": vals, "Volume": [2_000_000] * n}, index=idx)
@@ -201,7 +201,6 @@ def test_vol_floor_bounds_tiny_vol_names():
     """A near-zero-vol name must not produce an infinite score via division."""
     hist = _hist(drift=0.001)
     hist["Close"] = hist["Close"] * 1.0  # already smooth; vol is small but nonzero
-    m = compute_raw_metrics(hist)
     # realized vol of a smooth ramp is small; the floor applies in scoring
     ranked = score_universe({"SMOOTH": hist})
     import math
