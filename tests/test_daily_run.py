@@ -188,6 +188,100 @@ def test_run_analyze_parallelizes(cfg):
     assert payload["failures"] == []
 
 
+def _buy_quota_graph(ratings_by_ticker):
+    """Fake graph returning a preset rating per ticker (default Hold)."""
+    class FakeTradingAgentsGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            rating = ratings_by_ticker.get(ticker, "Hold")
+            return None, f"**Rating**: {rating}"
+
+    return FakeTradingAgentsGraph
+
+
+def _pool(n):
+    return [{"ticker": chr(ord("A") + i), "score": 1.0 - i / 100} for i in range(n)]
+
+
+def test_run_analyze_expands_until_buy_quota(cfg):
+    """With min_buy_quota unmet after the base batch, more pool candidates are
+    analyzed (in rank order, skipping already-analyzed) until the quota is hit."""
+    cfg["screener"] = {"candidate_slots": 2, "min_watchlist_size": 1,
+                       "exclusion_days": 7, "min_buy_quota": 2, "max_analyze": 6}
+    ratings_by_ticker = {"A": "Hold", "B": "Hold", "C": "Buy", "D": "Buy"}
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    pool = _pool(8)
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.TradingAgentsGraph", _buy_quota_graph(ratings_by_ticker)), \
+         patch("daily_run.TradingMemoryLog") as mock_log, \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run.load_pool", return_value=pool), \
+         patch("daily_run.load_regime", return_value="CALM"):
+        mock_log.return_value.load_entries.return_value = []
+        payload = run_analyze(cfg)
+    assert set(payload["ratings"]) == {"A", "B", "C", "D"}  # expanded 2 -> 4
+    assert sum(1 for r in payload["ratings"].values() if r in {"Buy", "Overweight"}) == 2
+
+
+def test_run_analyze_expansion_stops_at_max_analyze(cfg):
+    """A quota that can never be met must stop at max_analyze, not run away."""
+    cfg["screener"] = {"candidate_slots": 2, "min_watchlist_size": 1,
+                       "exclusion_days": 7, "min_buy_quota": 5, "max_analyze": 4}
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    pool = _pool(8)
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.TradingAgentsGraph", _buy_quota_graph({})), \
+         patch("daily_run.TradingMemoryLog") as mock_log, \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run.load_pool", return_value=pool), \
+         patch("daily_run.load_regime", return_value="CALM"):
+        mock_log.return_value.load_entries.return_value = []
+        payload = run_analyze(cfg)
+    assert len(payload["ratings"]) == 4  # capped at max_analyze
+    assert sum(1 for r in payload["ratings"].values() if r in {"Buy", "Overweight"}) == 0
+
+
+def test_run_analyze_no_expansion_when_quota_met_in_base(cfg):
+    """Quota met by the base watchlist -> no extra tickers analyzed."""
+    cfg["screener"] = {"candidate_slots": 2, "min_watchlist_size": 1,
+                       "exclusion_days": 7, "min_buy_quota": 1, "max_analyze": 6}
+    ratings_by_ticker = {"A": "Buy"}
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    pool = _pool(8)
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.TradingAgentsGraph", _buy_quota_graph(ratings_by_ticker)), \
+         patch("daily_run.TradingMemoryLog") as mock_log, \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run.load_pool", return_value=pool), \
+         patch("daily_run.load_regime", return_value="CALM"):
+        mock_log.return_value.load_entries.return_value = []
+        payload = run_analyze(cfg)
+    assert set(payload["ratings"]) == {"A", "B"}  # base only, no expansion
+
+
+def test_run_analyze_no_expansion_on_stress_regime(cfg):
+    """STRESS pauses new buys -> the expansion loop must not burn LLM calls."""
+    cfg["screener"] = {"candidate_slots": 2, "min_watchlist_size": 1,
+                       "exclusion_days": 7, "min_buy_quota": 2, "max_analyze": 6}
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    pool = _pool(8)
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.TradingAgentsGraph", _buy_quota_graph({})), \
+         patch("daily_run.TradingMemoryLog") as mock_log, \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run.load_pool", return_value=pool), \
+         patch("daily_run.load_regime", return_value="STRESS"):
+        mock_log.return_value.load_entries.return_value = []
+        payload = run_analyze(cfg)
+    assert set(payload["ratings"]) == {"A", "B"}  # base only under STRESS
+
+
 def test_seconds_until_open():
     from datetime import datetime
     from zoneinfo import ZoneInfo

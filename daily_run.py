@@ -15,7 +15,7 @@ import yfinance as yf
 
 from broker import create_broker
 from config import load_watchlist_config
-from decisions import compute_orders
+from decisions import BUY_RATINGS, compute_orders
 from screener import load_pool, load_regime
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.utils.rating import parse_rating
@@ -109,6 +109,36 @@ def assemble_watchlist(holdings, pool, memory_entries, cfg, today):
             f"(pool exhausted, seed insufficient)")
 
     return watchlist
+
+
+def _next_candidates(pool, holdings, memory_entries, cfg, today, skip, limit):
+    """Next eligible pool candidates (rank order) not yet analyzed today.
+
+    Mirrors assemble_watchlist's draw but for the buy-quota expansion loop:
+    walks deeper into the ranked pool, skipping tickers already analyzed
+    (``skip``), held, or inside the exclusion window.
+    """
+    cfg = cfg or {}
+    exclusion_days = int(cfg.get("screener", {}).get("exclusion_days", 7))
+    by_ticker = {e["ticker"]: e for e in memory_entries if e.get("ticker")}
+    out = []
+    for item in pool:
+        if len(out) >= limit:
+            break
+        ticker = item["ticker"]
+        if ticker in skip or ticker in holdings:
+            continue
+        entry = by_ticker.get(ticker)
+        if entry is not None and _recently_touched(entry, today, exclusion_days):
+            continue
+        if ticker in out:
+            continue
+        out.append(ticker)
+    return out
+
+
+def _buy_count(ratings: dict[str, str]) -> int:
+    return sum(1 for r in ratings.values() if r in BUY_RATINGS)
 
 
 # --- orchestrator ---
@@ -387,17 +417,46 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
         else:
             failures.append(ticker)
 
-    if max_workers <= 1 or len(watchlist) <= 1:
-        for ticker in watchlist:
-            record(_analyze_one(ticker, _today_str(), cfg))
-    else:
-        logger.info("analyzing %d tickers with %d workers", len(watchlist), max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers,
-                                thread_name_prefix="analyze") as pool:
-            futures = [pool.submit(_analyze_one, t, _today_str(), cfg)
-                       for t in watchlist]
-            for future in as_completed(futures):
-                record(future.result())
+    def analyze_batch(tickers_batch):
+        if max_workers <= 1 or len(tickers_batch) <= 1:
+            for ticker in tickers_batch:
+                record(_analyze_one(ticker, _today_str(), cfg))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers,
+                                    thread_name_prefix="analyze") as pool:
+                futures = [pool.submit(_analyze_one, t, _today_str(), cfg)
+                           for t in tickers_batch]
+                for future in as_completed(futures):
+                    record(future.result())
+
+    analyze_batch(watchlist)
+
+    # Buy-quota expansion: if the base watchlist produced fewer agent-approved
+    # buys than min_buy_quota (and the regime is not STRESS, which pauses new
+    # buys anyway), keep analyzing deeper pool candidates — in rank order,
+    # skipping held/excluded/already-analyzed — until the quota is met or
+    # max_analyze tickers have been analyzed this run. Only the auto-watchlist
+    # mode (explicit --tickers lists are fixed, e.g. smoke tests) expands.
+    if tickers is None:
+        scfg = cfg.get("screener", {}) or {}
+        min_buy_quota = int(scfg.get("min_buy_quota", 0))
+        max_analyze = int(scfg.get("max_analyze", 0)) or len(watchlist)
+        candidate_slots = int(scfg.get("candidate_slots", 3))
+        if min_buy_quota > 0 and load_regime(cfg) != "STRESS":
+            while (_buy_count(ratings) < min_buy_quota
+                   and len(ratings) + len(failures) < max_analyze):
+                analyzed = set(ratings) | set(failures)
+                more = _next_candidates(pool, holdings,
+                                        memory_log.load_entries(), cfg,
+                                        TODAY_ET(), analyzed, candidate_slots)
+                if not more:
+                    logger.info("buy quota %d unmet; pool exhausted "
+                                "(have %d buys from %d tickers)",
+                                min_buy_quota, _buy_count(ratings), len(ratings))
+                    break
+                logger.info("buy quota %d unmet (have %d); analyzing %d more: %s",
+                            min_buy_quota, _buy_count(ratings), len(more), more)
+                analyze_batch(more)
 
     payload = {"date": _today_str(),
                "ratings": dict(sorted(ratings.items())),

@@ -30,6 +30,9 @@ screener:
   exclusion_days: 3        # churn guard; keep candidates as fresh as possible
   entry_protection_pct: 5.0
   regime_gate: true        # SPY/SMA200 x VIX: WARN drops 1m tail, STRESS pauses buys
+  min_buy_quota: 5         # keep analyzing deeper pool candidates until this many
+                           # agent-approved buys (Buy/Overweight) are found
+  max_analyze: 24          # hard cap on tickers analyzed per morning (cost guard)
 
 # Active broker backend. "alpaca" = Alpaca paper API (instant, no daemon —
 # keys from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars). Flip to "ibkr"

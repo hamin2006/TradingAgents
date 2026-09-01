@@ -50,6 +50,13 @@ APP_DEFAULTS = {
         # Regime gate (5y backtest: the only defense that survived the 2022
         # crash in-sample). STRESS pauses new buys; WARN drops the 1m tail.
         "regime_gate": True,
+        # Buy-quota expansion: if the base watchlist yields fewer agent-approved
+        # buys (Buy/Overweight) than min_buy_quota, keep analyzing deeper pool
+        # candidates until the quota is met or max_analyze tickers were analyzed
+        # this run. 0 disables expansion (max_analyze 0 = no cap beyond the base
+        # watchlist). Skipped entirely under STRESS (buys paused anyway).
+        "min_buy_quota": 0,
+        "max_analyze": 0,
     },
     # Alpaca: secrets come from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars,
     # never from yaml. paper=True is the safe default; flip only with intent.
