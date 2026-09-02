@@ -76,12 +76,31 @@ class TestLLMEvents:
         assert ev["response"].startswith("OK")
         assert ev["latency_s"] >= 0
 
-    def test_prompt_truncated_to_limit(self, logger_fx):
+    def test_prompt_not_truncated_full_context(self, logger_fx):
+        """Debugging needs the exact context the model saw: no truncation."""
         logger_fx.on_chat_model_start({}, [[_fake_prompt("x" * 5000)]], run_id=_rid())
         ev = logger_fx._read_all()[-1]
         assert ev["type"] == "llm_start"
-        assert len(ev["prompt"]) == structured_log.TRUNCATE_CHARS
-        assert ev["prompt"].endswith("…")
+        assert "x" * 5000 in ev["prompt"]
+        assert "[P]" in ev["prompt"]  # message role labelled
+
+    def test_llm_end_captures_reasoning(self, logger_fx):
+        logger_fx.on_llm_end(_fake_llm_result(reasoning="deep thinking trace"),
+                             run_id=_rid())
+        ev = logger_fx._read_all()[-1]
+        assert ev["reasoning"] == "deep thinking trace"
+
+    def test_response_full_not_truncated(self, logger_fx):
+        long_text = "R" * 30000
+        logger_fx.on_llm_end(_fake_llm_result(text=long_text), run_id=_rid())
+        ev = logger_fx._read_all()[-1]
+        assert ev["response"] == long_text
+
+    def test_tool_args_full_not_truncated(self, logger_fx):
+        args = {"ticker": "COP", "start_date": "x" * 3000}
+        logger_fx.on_tool_start({"name": "get_news"}, args, run_id=uuid.UUID(_rid()))
+        ev = logger_fx._read_all()[-1]
+        assert ev["tool_args"] == str(args)
 
     def test_llm_error_recorded(self, logger_fx):
         logger_fx.on_llm_error(RuntimeError("boom"), run_id=_rid())
@@ -222,7 +241,7 @@ _ANALYST_BY_TOOL_NODE = {
 }
 
 
-def _fake_llm_result(usage=None):
+def _fake_llm_result(usage=None, reasoning=None, text="OK"):
     from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
 
@@ -236,12 +255,16 @@ def _fake_llm_result(usage=None):
         "input_token_details": {"cache_read": (usage.get("input_token_details") or {}).get("cache_read", 0)},
         "output_token_details": {"reasoning": 0},
     }
+    kwargs = {}
+    if reasoning:
+        kwargs["additional_kwargs"] = {"reasoning_content": reasoning}
     msg = AIMessage(
-        content="OK",
+        content=text,
         usage_metadata=complete,
         response_metadata={
             "model_provider": "Relace",
             "model_name": "deepseek/deepseek-v4-flash-0731",
         },
+        **kwargs,
     )
     return ChatResult(generations=[ChatGeneration(message=msg)])

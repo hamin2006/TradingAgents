@@ -37,8 +37,6 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 logger = logging.getLogger(__name__)
 
-TRUNCATE_CHARS = 2000
-
 _CACHE_DIR_ENV = "STRUCTURED_LOG_DIR"
 
 # LangGraph names the per-analyst ToolNodes tools_<analyst>; attribute their
@@ -75,10 +73,65 @@ def _git_sha() -> str | None:
         return None
 
 
-def _truncate(text: str, limit: int = TRUNCATE_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"
+def _message_text(content) -> str:
+    """Render an LLM message payload to text: plain strings pass through,
+    content-block lists (text / reasoning / tool blocks) are joined."""
+    if content is None:
+        return ""
+    if not isinstance(content, list):
+        return str(content)
+    bits = []
+    for block in content:
+        if isinstance(block, dict):
+            bits.append(str(block.get("text", "") or block))
+        else:
+            bits.append(str(block))
+    return "\n".join(b for b in bits if b)
+
+
+def _dump_messages(messages) -> str:
+    """Full human-readable dump of the message list sent to the model.
+
+    Debugging requires the exact context a call saw, so nothing is truncated:
+    every message role and its full content (plus any tool calls) is included.
+    """
+    if not messages:
+        return ""
+    msgs = messages[0] if isinstance(messages[0], list) else messages
+    parts = []
+    for msg in msgs:
+        label = getattr(msg, "type", None) or type(msg).__name__
+        line = f"[{label}] {_message_text(getattr(msg, 'content', None))}"
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            line += f"\n  tool_calls: {json.dumps(tool_calls, default=str)}"
+        parts.append(line)
+    return "\n".join(parts)
+
+
+def _reasoning_of(msg) -> str:
+    """Extract model thinking from whatever channel the provider used.
+
+    DeepSeek-style models send reasoning in ``reasoning_content`` (an
+    extra OpenAI-compatible field surfaced in additional_kwargs); some
+    providers inline ``reasoning``/``thinking`` blocks in content instead.
+    """
+    content = getattr(msg, "content", None)
+    if isinstance(content, list):
+        bits = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in ("reasoning", "thinking"):
+                bits.append(_message_text(block))
+        if bits:
+            return "\n".join(bits)
+    ak = getattr(msg, "additional_kwargs", None) or {}
+    rm = getattr(msg, "response_metadata", None) or {}
+    for key in ("reasoning_content", "reasoning"):
+        if ak.get(key):
+            return _message_text(ak.get(key))
+        if rm.get(key):
+            return _message_text(rm.get(key))
+    return ""
 
 
 def set_active_logger(run_log: StructuredRunLogger | None) -> None:
@@ -186,12 +239,11 @@ class StructuredRunLogger(BaseCallbackHandler):
             "t0": time.monotonic(),
             "agent": self._agent_for(parent_run_id, metadata),
         }
-        prompt = messages[0][0].content if messages and messages[0] else ""
         self._emit({"type": "llm_start",
-                    "agent": self._agent_for(parent_run_id, metadata),
-                    "run_id": str(run_id),
-                    "parent_run_id": str(parent_run_id) if parent_run_id else None,
-                    "prompt": _truncate(str(prompt))})
+                "agent": self._agent_for(parent_run_id, metadata),
+                "run_id": str(run_id),
+                "parent_run_id": str(parent_run_id) if parent_run_id else None,
+                "prompt": _dump_messages(messages)})
 
     def on_llm_end(self, response, *, run_id, parent_run_id=None, **kwargs) -> None:
         started_info = self._llm_starts.pop(str(run_id), None)
@@ -211,7 +263,7 @@ class StructuredRunLogger(BaseCallbackHandler):
         if gen is not None:
             msg = getattr(gen, "message", None)
             if msg is not None:
-                text = str(msg.content or "")
+                text = _message_text(msg.content)
                 um = getattr(msg, "usage_metadata", None) or {}
                 usage = {
                     "input": um.get("input_tokens", 0),
@@ -225,13 +277,15 @@ class StructuredRunLogger(BaseCallbackHandler):
                 text = str(gen.text or "")
         self._llm_calls += 1
         self._total_tokens += usage.get("input", 0) + usage.get("output", 0)
+        reasoning = _reasoning_of(msg) if gen is not None and getattr(gen, "message", None) is not None else ""
         self._emit({"type": "llm_end", "agent": agent,
                     "run_id": str(run_id),
                     "parent_run_id": str(parent_run_id) if parent_run_id else None,
                     "model": model, "provider_used": provider,
                     "token_usage": usage,
                     "latency_s": round(time.monotonic() - started, 2),
-                    "response": _truncate(text)})
+                    "reasoning": reasoning,
+                    "response": text})
 
     def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs) -> None:
         started_info = self._llm_starts.pop(str(run_id), None)
@@ -241,7 +295,7 @@ class StructuredRunLogger(BaseCallbackHandler):
                     "run_id": str(run_id),
                     "parent_run_id": str(parent_run_id) if parent_run_id else None,
                     "latency_s": round(time.monotonic() - started, 2),
-                    "error": str(error)[:500]})
+                    "error": str(error)})
 
     # -- tool calls (LangGraph ToolNodes: fred / stock data / news / ...) ----
 
@@ -256,7 +310,7 @@ class StructuredRunLogger(BaseCallbackHandler):
         }
         self._emit({"type": "tool_start", "agent": agent,
                     "run_id": str(run_id), "tool": name,
-                    "tool_args": _truncate(str(input_str), 1000)})
+                    "tool_args": str(input_str)})
 
     def on_tool_end(self, output, *, run_id, parent_run_id=None, metadata=None,
                     **kwargs) -> None:
