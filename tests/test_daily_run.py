@@ -39,13 +39,50 @@ def test_run_analyze_extracts_ratings_and_writes_json(cfg):
 
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
          patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
-         patch("daily_run.TradingMemoryLog") as mock_log:
+         patch("daily_run.TradingMemoryLog") as mock_log, \
+         patch("structured_log.StructuredRunLogger") as mock_logger:
         mock_log.return_value.load_entries.return_value = []
         payload = run_analyze(cfg, tickers=["AAPL", "MSFT"])
     assert payload["ratings"] == {"AAPL": "Buy", "MSFT": "Buy"}
     files = list(__import__("pathlib").Path(cfg["results_dir"]).glob("ratings_*.json"))
     assert len(files) == 1
     assert json.loads(files[0].read_text())["ratings"]["AAPL"] == "Buy"
+    # structured logging: per-ticker logger created and finished with the rating
+    assert mock_logger.call_count == 2
+    mock_logger.return_value.finish.assert_any_call(rating="Buy")
+
+
+def test_analyze_one_passes_callback_and_records_rating(cfg, tmp_path, monkeypatch):
+    """The structured-log callback is threaded into TradingAgentsGraph and the
+    final rating lands in the run_end event."""
+    from unittest.mock import patch as _patch
+
+    import daily_run
+    import structured_log
+
+    monkeypatch.setenv("STRUCTURED_LOG_DIR", str(tmp_path / "structured"))
+    captured = {}
+
+    class FakeGraph:
+        def __init__(self, config=None, callbacks=None, **kwargs):
+            captured["callbacks"] = callbacks
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return None, "**Rating**: Hold"
+
+    with _patch("daily_run.TradingAgentsGraph", FakeGraph):
+        ticker, rating, error = daily_run._analyze_one("AAPL", "2026-09-02", cfg)
+    assert (ticker, rating, error) == ("AAPL", "Hold", None)
+    assert captured["callbacks"], "structured logger must be passed as callback"
+    logger = captured["callbacks"][0]
+    assert isinstance(logger, structured_log.StructuredRunLogger)
+    assert logger.ticker == "AAPL"
+    # the run_end event with the rating was written
+    log_path = tmp_path / "structured" / "2026-09-02" / "AAPL.jsonl"
+    assert log_path.exists()
+    events = [json.loads(line) for line in log_path.read_text().strip().splitlines()]
+    assert events[-1]["type"] == "run_end"
+    assert events[-1]["rating"] == "Hold"
 
 
 def test_run_analyze_includes_holdings(cfg):

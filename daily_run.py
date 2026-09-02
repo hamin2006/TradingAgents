@@ -367,16 +367,26 @@ def _analyze_one(ticker: str, today_str: str, cfg: dict):
     Returns (ticker, rating, error). Runs inside a worker thread, so it must
     never raise: all failures are reported through the error slot.
     """
+    import structured_log
+    run_log = structured_log.StructuredRunLogger(ticker=ticker, today=today_str)
     try:
-        _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, today_str)
-        return ticker, extract_rating(signal), None
+        _, signal = TradingAgentsGraph(config=cfg,
+                                       callbacks=[run_log]).propagate(ticker, today_str)
+        rating = extract_rating(signal)
+        run_log.finish(rating=rating)
+        return ticker, rating, None
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis failed for %s: %s", ticker, exc)
         try:
-            _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, today_str)
-            return ticker, extract_rating(signal), None
+            run_log.finish(rating=None)
+            _, signal = TradingAgentsGraph(config=cfg,
+                                           callbacks=[run_log]).propagate(ticker, today_str)
+            rating = extract_rating(signal)
+            run_log.finish(rating=rating)
+            return ticker, rating, None
         except Exception as exc2:  # noqa: BLE001
             logger.error("retry also failed for %s: %s", ticker, exc2)
+            run_log.finish(rating=None)
             return ticker, None, exc2
 
 
