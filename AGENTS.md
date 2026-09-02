@@ -32,23 +32,26 @@ The user observes the paper portfolio and can pause trading via a kill switch. N
 | `decisions.py` | Pure decision engine: ratings + holdings → orders. Protection-capped buys, broker-side stop-loss, conviction-scaled sizing (Buy 1.5×, Overweight 1.0×), order-value caps |
 | `screener.py` | S&P 500 momentum screen: Wikipedia universe (User-Agent header required), batched yfinance, liquidity filter, vol-adjusted z-score composite, ranked pool |
 | `ibkr.py` / `alpaca_broker.py` / `broker.py` | Broker backends, same interface (connect, positions+cash, orders, disconnect). **Alpaca is active** (paper-only, hard-guarded); IBKR kept for a later flip |
-| `daily_run.py` | CLI orchestrator: `--analyze` (parallel per-ticker pipeline runs with retry + memory log), `--execute` (kill switch → ratings → holdings → orders → two-phase executed log), `--healthcheck`. Also watchlist assembly (holdings ∪ screened candidates, exclusion window, min-size gate) and runtime patches (memory-log locking, reddit pacing/oauth) |
+| `daily_run.py` | CLI orchestrator: `--analyze` (parallel per-ticker pipeline runs with retry + memory log + per-ticker structured logging), `--execute` (kill switch → ratings → holdings → orders → two-phase executed log), `--healthcheck`. Also watchlist assembly (holdings ∪ screened candidates, exclusion window, min-size gate), buy-quota expansion (`min_buy_quota`/`max_analyze`), and runtime patches (memory-log locking, reddit pacing/oauth, structured-log callbacks) |
 | `reddit_auth.py` | OAuth Reddit fetcher — inactive until `REDDIT_CLIENT_ID`/`REDDIT_SECRET` are set; falls back to the paced anonymous RSS path. Resilience wrapper (retry + per-ticker cache) applies on both paths |
 | `reddit_archive.py` | Keyless Arctic Shift archive pull (complete subreddit coverage, per-sub cache, local ticker filter); archive-first wrapper with RSS fallback |
+| `structured_log.py` | Per-ticker structured JSONL logging of the analyze run: every LLM turn (agent via `langgraph_node` metadata, model, provider, token usage, latency), chain boundaries, errors; `run_end` event + per-day `summary.json` |
+| `power_schedule.py` | Self-managed RTC power: `--arm` (set next-weekday 05:45 ET alarm, stay on), `--shutdown` (arm + power off via `rtcwake -m off` via passwordless sudo); `@reboot` cron re-arms because this BIOS clears alarms on any boot |
 | `analyze_results.py` | Outcome analytics over the decision memory log (hit rates by rating tier, per-ticker alpha, streaks) |
-| `watchlist.yaml` | User-facing config: seed watchlist, models, capital, sizing, screener + broker settings, kill switch |
-| `SETUP.md` | Full production setup: keys, broker, cron, smoke tests |
+| `watchlist.yaml` | User-facing config: seed watchlist, models, provider pins, capital (10k), sizing, screener + buy-quota + broker settings, kill switch |
+| `SETUP.md` | Full production setup: keys, broker, cron + power schedule, smoke tests |
 
 Daily pipeline data flow: `screener` (06:00) → `daily_run --analyze` (07:00, parallel threads, ratings JSON) → `daily_run --execute` (09:00, waits for the 09:30 open, places orders) → artifacts + memory log. Full details in the spec (`docs/superpowers/specs/`) and `SETUP.md`.
 
 ## Operational facts
 
 - **Production host:** the user's Ubuntu 24.04 PC (`pc` SSH alias over Tailscale; run commands via `expect ~/.config/opencode/skills/pc-dev/scripts/pc_ssh.exp '<cmd>'`, password auth via `PC_PASSWORD`; power via `ensure_power.py --device "PC Plug"`). Repo lives at `/home/harsh-amin/workplace/TradingAgents`.
-- **PC timezone is America/Edmonton** — cron uses `CRON_TZ=America/New_York`; every cron job `cd`s into the repo first (the framework loads `.env` from the working directory).
-- **Cron schedule (Mon–Fri):** 06:00 screen → 06:50 healthcheck → 07:00 analyze → 09:00 execute.
-- **Artifacts:** `~/.tradingagents/logs/` (ratings/executed/pool JSONs, analysis_report.md), `~/.tradingagents/memory/trading_memory.md` (decision log).
+- **PC timezone is America/Edmonton** — cron runs in host-local time (Ubuntu ignores `CRON_TZ`; ET = local + 2h year-round); every cron job `cd`s into the repo first (the framework loads `.env` from the working directory).
+- **Cron schedule (Mon–Fri, local):** 03:50 power arm → 04:00 screen → 04:50 healthcheck → 05:00 analyze → 07:00 execute → 08:00 power off; `@reboot` re-arms. RTC alarm wakes the machine at 05:45 ET.
+- **Power:** self-managed via `power_schedule.py` + RTC alarm; the PC shuts itself down at 10:00 ET and wakes at 05:45 ET. Manual wake anytime via the Kasa plug (`ensure_power.py --device "PC Plug"`).
+- **Artifacts:** `~/.tradingagents/logs/` (ratings/executed/pool JSONs, analysis_report.md, structured/{date}/{ticker}.jsonl + summary.json), `~/.tradingagents/memory/trading_memory.md` (decision log).
 - **Kill switch:** a `DISABLE_TRADING` file at the repo root forces analysis-only mode.
-- **Safety chain on execute:** kill switch → ratings-file check → once-per-day idempotency (mark-before-submit log) → capital capped by real account cash → per-day order-value cap → entry protection cap (+2%, cancel if gapped) → GTC stop-loss (−8%) → fill timeout + cancel.
+- **Safety chain on execute:** kill switch → ratings-file check → once-per-day idempotency (mark-before-submit log) → capital capped by real account cash → per-day order-value cap → entry protection cap (+5%, cancel if gapped up) → two-step GTC stop-loss (−8%) → gap-down undo (fill at/below stop = sell back) → fill timeout + cancel.
 - **Keys in `.env`:** `OPENROUTER_API_KEY`, `FRED_API_KEY`, `ALPACA_API_KEY`/`ALPACA_SECRET` (required/active); `REDDIT_CLIENT_ID`/`SECRET` optional (activates OAuth Reddit).
 
 ## Known gotchas
@@ -56,7 +59,11 @@ Daily pipeline data flow: `screener` (06:00) → `daily_run --analyze` (07:00, p
 - Reddit's anonymous RSS path is rate-limited (~10 req/min): fetches are paced + retried + cached. Reddit's own 429 retry **re-invokes the module attribute**, so wrappers around it must use `RLock` (plain `Lock` deadlocks).
 - Wikipedia 403s requests without a `User-Agent` header; `pd.read_html` needs `io.StringIO` for HTML strings.
 - Module names must not collide with pip packages (`alpaca.py` would shadow `alpaca-py` — hence `alpaca_broker.py`).
-- Alpaca quirks: `BRACKET` order class requires both legs (use `OTO` for stop-only); entry orders before 09:30 with `extended_hours=False` queue for the open.
+- Alpaca quirks: `BRACKET` order class requires both legs (use `OTO` for stop-only); entry orders before 09:30 with `extended_hours=False` queue for the open. **Do NOT use OTO for buys**: the paper engine inverts the leg creation at the open and entries never fill (verified live 2/2 — IT 8/31, CRWD 9/1). Buys are two-step: plain capped limit entry → poll fill → attach GTC stop. If the fill is at/below the stop level (gapped through the stop), the entry is sold back immediately (gap-down guard).
+- **This Gigabyte B550 BIOS clears the armed RTC alarm on ANY boot** (plug cut or graceful reboot) — the `@reboot` cron re-arms (`power_schedule.py --arm`); without it a plug-flip between runs kills the next morning's wake.
+- **Hard plug cuts corrupt recent filesystem writes** (ext4 loses dirty pages — seen live: `.git` object store destroyed, a freshly cloned file truncated to 0 bytes). Only flip the plug when the machine is fully off; never trust a repo state across a cut without `sync` + `git fsck`.
+- **Ubuntu cron ignores `CRON_TZ`** (verified twice) — all crontab times are host-local America/Edmonton (ET + 2h year-round, both zones share DST dates). The crontab header comment carries the mapping; keep power entries in local time too.
+- `daily_run.py` had **no logging config** — INFO was silently dropped; only WARNING+ surfaced via Python's last-resort handler. Per-ticker structured logs now exist at `~/.tradingagents/logs/structured/{date}/{ticker}.jsonl` (agent attribution via LangGraph's `metadata['langgraph_node']`, NOT chain events — `on_chain_start` never fires in this graph). Tool-style events don't fire for pre-fetched data (reddit/stocktwits are plain function calls, not LangChain tools).
 - ib_async's `StopOrder` stores the stop price in `auxPrice`; `GetOrdersRequest`+`QueryOrderStatus` for open-order queries.
 - The PC's smart plug is controlled via a `tplinkcloud` shim (user site-packages) backed by python-kasa local LAN discovery — TP-Link deprecated the cloud login. Works on the home network only.
 - Mac framework Python has broken SSL certs: prefix scripts with `SSL_CERT_FILE=$(python -c "import certifi; print(certifi.where())")`. The Ubuntu PC is unaffected.
@@ -67,3 +74,4 @@ Daily pipeline data flow: `screener` (06:00) → `daily_run --analyze` (07:00, p
 - Reddit OAuth credentials: app creation is captcha-blocked (network flag); retry later — the code path activates automatically once creds land in `.env`.
 - Drawdown circuit breaker: deferred until ~2 weeks of resolved decisions exist in the memory log (threshold from evidence, not guesswork).
 - Screening robustness roadmap (spec §5bis): the 5y crash-in-sample backtest settled the defaults — production = **raw_momentum + regime gate** (vol_adjusted/rank_based remain selectable registry strategies); dual momentum and anti-lottery overlay are deferred pending outcome data.
+- Structured log shows `provider_used: "openai"` (OpenRouter's platform name in `model_provider`), not the actual host (Relace vs fallback) — needs OpenRouter response-header parsing; and pre-fetched data sources (reddit/stocktwits/news) aren't logged as distinct events (plain function calls, not LangChain tools) — could emit structured events from the resilience wrappers directly.
