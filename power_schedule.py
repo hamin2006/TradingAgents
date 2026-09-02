@@ -1,10 +1,10 @@
 """power_schedule.py — self-managed power on/off for the trading PC.
 
-The trading cron runs 06:00-10:00 ET on weekdays; the machine is otherwise
+The trading cron runs 04:10-10:00 ET on weekdays; the machine is otherwise
 unused. This module shuts it down after the run and wakes it before the next
 one, using the RTC alarm (rtcwake), so it is not always on:
 
-- ``--arm`` (05:50 ET cron): set the RTC alarm for the next weekday 05:45 ET
+- ``--arm`` (04:05 ET cron): set the RTC alarm for the next weekday 04:00 ET
   using ``rtcwake -m no`` (set the alarm only, do NOT power off). Arming
   early in the day means any manual shutdown later is safe — the alarm is
   already sitting in the RTC chip.
@@ -13,8 +13,9 @@ one, using the RTC alarm (rtcwake), so it is not always on:
   by then; can power back on manually from the Kasa app or the plug).
 
 Wake math is done in America/New_York explicitly (the box runs
-America/Edmonton; the cron already uses CRON_TZ=America/New_York), but
-rtcwake takes seconds-from-now so the actual command is timezone-immune.
+America/Edmonton); rtcwake takes seconds-from-now so the actual command
+is timezone-immune. Ubuntu cron ignores CRON_TZ, so cron times are
+host-local (America/Edmonton) - see the crontab header comment.
 
 One-time setup (see SETUP.md):
 - BIOS: enable "Wake on RTC Alarm" / "Resume by Alarm".
@@ -31,15 +32,15 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 
-WAKE_HOUR = 5
-WAKE_MINUTE = 45
+WAKE_HOUR = 4
+WAKE_MINUTE = 0
 # rtcwake needs root (writes /sys/class/rtc/rtc0/wakealarm); the sudoers rule
 # (user ALL=(ALL) NOPASSWD: /usr/sbin/rtcwake) makes this passwordless.
 _RTCWAKE = ["sudo", "-n", "/usr/sbin/rtcwake"]
 
 
 def _next_wake(now: datetime) -> datetime:
-    """Next weekday (Mon-Fri) 05:45 ET at or after ``now``."""
+    """Next weekday (Mon-Fri) 04:00 ET at or after ``now``."""
     wake = datetime(now.year, now.month, now.day, WAKE_HOUR, WAKE_MINUTE,
                     tzinfo=ET)
     if now >= wake:

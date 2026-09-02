@@ -36,19 +36,19 @@ The user observes the paper portfolio and can pause trading via a kill switch. N
 | `reddit_auth.py` | OAuth Reddit fetcher — inactive until `REDDIT_CLIENT_ID`/`REDDIT_SECRET` are set; falls back to the paced anonymous RSS path. Resilience wrapper (retry + per-ticker cache) applies on both paths |
 | `reddit_archive.py` | Keyless Arctic Shift archive pull (complete subreddit coverage, per-sub cache, local ticker filter); archive-first wrapper with RSS fallback |
 | `structured_log.py` | Per-ticker structured JSONL logging of the analyze run: every LLM turn (agent via `langgraph_node` metadata, model, provider, token usage, latency), chain boundaries, errors; `run_end` event + per-day `summary.json` |
-| `power_schedule.py` | Self-managed RTC power: `--arm` (set next-weekday 05:45 ET alarm, stay on), `--shutdown` (arm + power off via `rtcwake -m off` via passwordless sudo); `@reboot` cron re-arms because this BIOS clears alarms on any boot |
+| `power_schedule.py` | Self-managed RTC power: `--arm` (set next-weekday 04:00 ET alarm, stay on), `--shutdown` (arm + power off via `rtcwake -m off` via passwordless sudo); `@reboot` cron re-arms because this BIOS clears alarms on any boot |
 | `analyze_results.py` | Outcome analytics over the decision memory log (hit rates by rating tier, per-ticker alpha, streaks) |
 | `watchlist.yaml` | User-facing config: seed watchlist, models, provider pins, capital (10k), sizing, screener + buy-quota + broker settings, kill switch |
 | `SETUP.md` | Full production setup: keys, broker, cron + power schedule, smoke tests |
 
-Daily pipeline data flow: `screener` (06:00) → `daily_run --analyze` (07:00, parallel threads, ratings JSON) → `daily_run --execute` (09:00, waits for the 09:30 open, places orders) → artifacts + memory log. Full details in the spec (`docs/superpowers/specs/`) and `SETUP.md`.
+Daily pipeline data flow: `screener` (04:10 ET) → `daily_run --analyze` (04:30 ET, parallel threads, ratings JSON) → `daily_run --execute` (09:00 ET, waits for the 09:30 open, places orders) → artifacts + memory log. Full details in the spec (`docs/superpowers/specs/`) and `SETUP.md`.
 
 ## Operational facts
 
 - **Production host:** the user's Ubuntu 24.04 PC (`pc` SSH alias over Tailscale; run commands via `expect ~/.config/opencode/skills/pc-dev/scripts/pc_ssh.exp '<cmd>'`, password auth via `PC_PASSWORD`; power via `ensure_power.py --device "PC Plug"`). Repo lives at `/home/harsh-amin/workplace/TradingAgents`.
 - **PC timezone is America/Edmonton** — cron runs in host-local time (Ubuntu ignores `CRON_TZ`; ET = local + 2h year-round); every cron job `cd`s into the repo first (the framework loads `.env` from the working directory).
-- **Cron schedule (Mon–Fri, local):** 03:50 power arm → 04:00 screen → 04:50 healthcheck → 05:00 analyze → 07:00 execute → 08:00 power off; `@reboot` re-arms. RTC alarm wakes the machine at 05:45 ET.
-- **Power:** self-managed via `power_schedule.py` + RTC alarm; the PC shuts itself down at 10:00 ET and wakes at 05:45 ET. Manual wake anytime via the Kasa plug (`ensure_power.py --device "PC Plug"`).
+- **Cron schedule (Mon–Fri, local):** 02:05 power arm → 02:10 screen → 02:25 healthcheck → 02:30 analyze → 07:00 execute → 08:00 power off; `@reboot` re-arms. RTC alarm wakes the machine at 04:00 ET (= 02:00 local). The morning chain is early so a full `max_analyze` batch (~3h, 4 workers) lands before the 09:00 ET execute checkpoint.
+- **Power:** self-managed via `power_schedule.py` + RTC alarm; the PC shuts itself down at 10:00 ET and wakes at 04:00 ET. Manual wake anytime via the Kasa plug (`ensure_power.py --device "PC Plug"`).
 - **Artifacts:** `~/.tradingagents/logs/` (ratings/executed/pool JSONs, analysis_report.md, structured/{date}/{ticker}.jsonl + summary.json), `~/.tradingagents/memory/trading_memory.md` (decision log).
 - **Kill switch:** a `DISABLE_TRADING` file at the repo root forces analysis-only mode.
 - **Safety chain on execute:** kill switch → ratings-file check → once-per-day idempotency (mark-before-submit log) → capital capped by real account cash → per-day order-value cap → entry protection cap (+5%, cancel if gapped up) → two-step GTC stop-loss (−8%) → gap-down undo (fill at/below stop = sell back) → fill timeout + cancel.

@@ -132,14 +132,14 @@ hours year-round: the ET schedule is expressed as local times minus 2h. Cron job
 `cd` into the repo first (the framework loads `.env` from the working directory).
 
 ```cron
-# Local (MDT/MST) mapping: 04:00=06:00ET screen | 04:50=06:50ET healthcheck
-#                           05:00=07:00ET analyze | 07:00=09:00ET execute
-#                           03:50=05:50ET power arm | 08:00=10:00ET power off
-50 4 * * 1-5  cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --healthcheck >> logs/health.log 2>&1
-0 4 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python screener.py --screen >> logs/screener.log 2>&1
-0 5 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --analyze >> logs/cron.log 2>&1
+# Local (MDT/MST) mapping: 02:05=04:05ET power arm | 02:10=04:10ET screen
+#                           02:25=04:25ET healthcheck | 02:30=04:30ET analyze
+#                           07:00=09:00ET execute | 08:00=10:00ET power off
+25 2 * * 1-5  cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --healthcheck >> logs/health.log 2>&1
+10 2 * * 1-5  cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python screener.py --screen >> logs/screener.log 2>&1
+30 2 * * 1-5  cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --analyze >> logs/cron.log 2>&1
 0 7 * * 1-5   cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python daily_run.py --execute >> logs/orders.log 2>&1
-50 3 * * 1-5 cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python power_schedule.py --arm >> logs/power.log 2>&1
+5 2 * * 1-5 cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python power_schedule.py --arm >> logs/power.log 2>&1
 0 8 * * 1-5 cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python power_schedule.py --shutdown >> logs/power.log 2>&1
 @reboot cd /home/harsh-amin/workplace/TradingAgents && .venv/bin/python power_schedule.py --arm >> logs/power.log 2>&1
 ```
@@ -149,8 +149,14 @@ the API keys would never load. Do NOT add `CRON_TZ=America/New_York`: Ubuntu
 cron silently ignores it and everything would run 2h late (verified twice —
 2026-08-31 and 2026-09-01 when the power entries were first added in ET).
 
-The 06:00 screen refreshes the momentum ranking **every trading day** before the
-07:00 analysis (the scores are deterministic but prices move daily, so a weekly
+The chain runs early (screen 04:10 ET, analyze 04:30 ET) so the full
+`max_analyze` batch — ~3h across 4 workers at ~40 min/ticker — lands well
+before the 09:00 ET execute checkpoint. On 2026-09-02 the batch was still
+running at 10:00 ET when the old schedule's power-off fired and the day was
+lost; the current times leave the whole batch + retries a ~1.5h buffer.
+
+The 04:10 screen refreshes the momentum ranking **every trading day** before the
+04:30 analysis (the scores are deterministic but prices move daily, so a weekly
 snapshot goes stale). It's free (yfinance only, no LLM cost), takes ~10 min, and
 if it fails the analysis falls back to the last cached pool — never blocks the
 run.
@@ -161,7 +167,7 @@ otherwise cancel pre-open orders. Dry-runs (`--dry-run`) never wait.
 ### Self-managed power (RTC wake/shutdown) — one-time setup
 
 The machine powers itself off after the run (10:00 ET) and wakes itself before
-the next one (05:45 ET) via the RTC alarm, so it is not always on.
+the next one (04:00 ET) via the RTC alarm, so it is not always on.
 
 1. **BIOS — enable RTC wake (one-time, manual):** on this Gigabyte B550
    (AORUS ELITE AX V2) both relevant settings are already active, but if you
@@ -175,14 +181,14 @@ the next one (05:45 ET) via the RTC alarm, so it is not always on.
    echo "harsh-amin ALL=(ALL) NOPASSWD: /usr/sbin/rtcwake" | sudo tee /etc/sudoers.d/rtcwake
    sudo chmod 440 /etc/sudoers.d/rtcwake
    ```
-3. Install the three power cron lines above (`--arm` at 05:50 ET, `--shutdown`
+3. Install the three power cron lines above (`--arm` at 04:05 ET, `--shutdown`
    at 10:00 ET, `@reboot --arm`).
 
 **How it works** (all times ET; the alarm is stored as an absolute epoch in the
 RTC chip, which runs UTC — immune to the Edmonton/ET confusion):
 
-- 05:45 — RTC alarm wakes the machine (alarm armed the previous day).
-- 05:50 — `--arm` (cron 03:50 local) re-arms the alarm for the next weekday.
+- 04:00 — RTC alarm wakes the machine (alarm armed the previous day).
+- 04:05 — `--arm` (cron 02:05 local) re-arms the alarm for the next weekday.
 - 10:00 — `--shutdown` (cron 08:00 local) powers off via `rtcwake -m off`;
   the same command arms the next day's alarm first.
 - Any boot — `@reboot --arm` re-arms. **This is load-bearing:** this BIOS
@@ -194,7 +200,7 @@ RTC chip, which runs UTC — immune to the Edmonton/ET confusion):
 - RTC wake from a graceful shutdown: works (powered off, booted itself on the
   alarm, no plug involved).
 - Alarm firing while the machine is already ON: harmless no-op — it fires and
-  clears; the 05:50 arm re-arms afterwards either way.
+  clears; the 04:05 arm re-arms afterwards either way.
 - Plug power-cut while the machine is OFF: safe (nothing running).
 - Plug power-cut while the machine is RUNNING: **risky** — this filesystem
   loses recent writes on hard cuts (ext4 delayed allocation). Seen live: a

@@ -32,7 +32,9 @@ screener:
   regime_gate: true        # SPY/SMA200 x VIX: WARN drops 1m tail, STRESS pauses buys
   min_buy_quota: 5         # keep analyzing deeper pool candidates until this many
                            # agent-approved buys (Buy/Overweight) are found
-  max_analyze: 24          # hard cap on tickers analyzed per morning (cost guard)
+  max_analyze: 16          # hard cap on tickers analyzed per morning: batch must
+                           # finish before the 09:00 ET execute checkpoint
+                           # (~3h with 4 workers from a 04:30 ET start)
 
 # Active broker backend. "alpaca" = Alpaca paper API (instant, no daemon —
 # keys from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars). Flip to "ibkr"

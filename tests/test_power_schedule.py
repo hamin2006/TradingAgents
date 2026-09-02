@@ -18,26 +18,26 @@ def _dt(y, m, d, hh, mm, tz=ET):
 
 
 def test_next_wake_is_next_weekday_morning():
-    # Monday 12:00 ET -> Tuesday 05:45 ET
+    # Monday 12:00 ET -> Tuesday 04:00 ET
     wake = power_schedule._next_wake(_dt(2026, 9, 7, 12, 0))
-    assert wake == _dt(2026, 9, 8, 5, 45)
+    assert wake == _dt(2026, 9, 8, 4, 0)
 
 
 def test_next_wake_same_day_when_before_wake_time():
-    # Monday 03:00 ET -> Monday 05:45 ET (already past midnight, same day)
+    # Monday 03:00 ET -> Monday 04:00 ET (already past midnight, same day)
     wake = power_schedule._next_wake(_dt(2026, 9, 7, 3, 0))
-    assert wake == _dt(2026, 9, 7, 5, 45)
+    assert wake == _dt(2026, 9, 7, 4, 0)
 
 
 def test_next_wake_friday_rolls_to_monday():
     wake = power_schedule._next_wake(_dt(2026, 9, 4, 12, 0))  # Friday
-    assert wake == _dt(2026, 9, 7, 5, 45)  # Monday
+    assert wake == _dt(2026, 9, 7, 4, 0)  # Monday
     assert wake.weekday() == 0
 
 
 def test_next_wake_weekend_rolls_to_monday():
     wake = power_schedule._next_wake(_dt(2026, 9, 5, 12, 0))  # Saturday
-    assert wake == _dt(2026, 9, 7, 5, 45)
+    assert wake == _dt(2026, 9, 7, 4, 0)
 
 
 def test_seconds_until_wake_is_timezone_immune():
