@@ -33,7 +33,9 @@ ET = ZoneInfo("America/New_York")
 
 WAKE_HOUR = 5
 WAKE_MINUTE = 45
-_RTCWAKE = "/usr/sbin/rtcwake"
+# rtcwake needs root (writes /sys/class/rtc/rtc0/wakealarm); the sudoers rule
+# (user ALL=(ALL) NOPASSWD: /usr/sbin/rtcwake) makes this passwordless.
+_RTCWAKE = ["sudo", "-n", "/usr/sbin/rtcwake"]
 
 
 def _next_wake(now: datetime) -> datetime:
@@ -61,8 +63,8 @@ def _run(cmd: list[str]) -> None:
 def arm(now: datetime | None = None, dry_run: bool = False) -> int:
     """Arm the RTC alarm for the next wake; leave the machine running."""
     seconds = _seconds_until_wake(now or datetime.now(ET))
-    cmd = [_RTCWAKE, "-m", "no", "-s", str(seconds)]
-    print(f"arm: rtcwake -m no -s {seconds} "
+    cmd = [*_RTCWAKE, "-m", "no", "-s", str(seconds)]
+    print(f"arm: {' '.join(cmd)} "
           f"(wake {_next_wake(now or datetime.now(ET))})")
     if not dry_run:
         _run(cmd)
@@ -72,8 +74,8 @@ def arm(now: datetime | None = None, dry_run: bool = False) -> int:
 def shutdown(now: datetime | None = None, dry_run: bool = False) -> int:
     """Arm the RTC alarm and power off."""
     seconds = _seconds_until_wake(now or datetime.now(ET))
-    cmd = [_RTCWAKE, "-m", "off", "-s", str(seconds)]
-    print(f"shutdown: rtcwake -m off -s {seconds} "
+    cmd = [*_RTCWAKE, "-m", "off", "-s", str(seconds)]
+    print(f"shutdown: {' '.join(cmd)} "
           f"(wake {_next_wake(now or datetime.now(ET))})")
     if not dry_run:
         _run(cmd)

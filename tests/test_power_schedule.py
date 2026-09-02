@@ -52,24 +52,24 @@ def test_seconds_until_wake_is_timezone_immune():
 
 
 def test_rtcwake_off_command():
-    # shutdown path: -m off with the computed seconds
+    # shutdown path: -m off with the computed seconds, via passwordless sudo
     with patch("power_schedule._run") as run:
         power_schedule.shutdown(now=_dt(2026, 9, 7, 12, 0))
     cmd = run.call_args[0][0]
-    assert cmd[0].endswith("rtcwake")
-    assert cmd[1] == "-m"
-    assert cmd[2] == "off"
-    assert cmd[3] == "-s"
-    secs = int(cmd[4])
+    assert cmd[:3] == ["sudo", "-n", "/usr/sbin/rtcwake"]
+    assert cmd[3:5] == ["-m", "off"]
+    assert cmd[5] == "-s"
+    secs = int(cmd[6])
     assert secs > 0
 
 
 def test_rtcwake_arm_command_uses_no_mode():
-    # arm path: -m no (set the alarm, do NOT power off)
+    # arm path: -m no (set the alarm, do NOT power off), via passwordless sudo
     with patch("power_schedule._run") as run:
         power_schedule.arm(now=_dt(2026, 9, 7, 12, 0))
     cmd = run.call_args[0][0]
-    assert cmd[1:3] == ["-m", "no"]
+    assert cmd[:3] == ["sudo", "-n", "/usr/sbin/rtcwake"]
+    assert cmd[3:5] == ["-m", "no"]
 
 
 def test_dry_run_does_not_execute():
