@@ -17,6 +17,13 @@ def cfg(tmp_path):
     return c
 
 
+@pytest.fixture(autouse=True)
+def _isolate_structured_logs(tmp_path, monkeypatch):
+    """_analyze_one writes a per-ticker structured log to the home dir; keep
+    the suite hermetic by pointing it at the tmp dir."""
+    monkeypatch.setenv("STRUCTURED_LOG_DIR", str(tmp_path / "structured"))
+
+
 def _ratings_file(cfg, ratings, failures=None, day="2026-08-31"):
     import daily_run
     payload = {"date": day, "ratings": ratings, "failures": failures or []}

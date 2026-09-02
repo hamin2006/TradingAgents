@@ -47,6 +47,18 @@ class TestAttribution:
         logger_fx.on_llm_end(_fake_llm_result(), run_id=_rid(), parent_run_id=None)
         assert logger_fx._read_all()[-1]["agent"] == "unknown"
 
+    def test_langgraph_node_metadata_names_the_agent(self, logger_fx):
+        """LangGraph tags every LLM start with metadata['langgraph_node'];
+        that must win over the parent-run-id mapping."""
+        rid = _rid()
+        logger_fx.on_chat_model_start(
+            {}, [[_fake_prompt("hello")]], run_id=uuid.UUID(rid),
+            metadata={"langgraph_node": "Sentiment Analyst"})
+        logger_fx.on_llm_end(_fake_llm_result(), run_id=uuid.UUID(rid))
+        events = logger_fx._read_all()
+        assert events[-2]["agent"] == "Sentiment Analyst"  # llm_start
+        assert events[-1]["agent"] == "Sentiment Analyst"  # llm_end (stashed)
+
 
 class TestLLMEvents:
     def test_llm_end_records_usage_and_provider(self, logger_fx):

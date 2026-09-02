@@ -90,7 +90,13 @@ class StructuredRunLogger(BaseCallbackHandler):
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=str) + "\n")
 
-    def _agent_for(self, parent_run_id: UUID | None) -> str:
+    def _agent_for(self, parent_run_id: UUID | None,
+                   metadata: dict | None = None) -> str:
+        # LangGraph tags every LLM start with the node name in metadata;
+        # parent-run-id -> chain-name mapping is the fallback for non-graph
+        # (e.g. test/direct) invocations.
+        if metadata and metadata.get("langgraph_node"):
+            return metadata["langgraph_node"]
         if parent_run_id is None:
             return "unknown"
         return self._chain_names.get(str(parent_run_id), "unknown")
@@ -118,16 +124,23 @@ class StructuredRunLogger(BaseCallbackHandler):
     # -- LLM turns -----------------------------------------------------------
 
     def on_chat_model_start(self, serialized, messages, *, run_id,
-                            parent_run_id=None, **kwargs) -> None:
-        self._llm_starts[str(run_id)] = time.monotonic()
+                            parent_run_id=None, tags=None, metadata=None,
+                            **kwargs) -> None:
+        self._llm_starts[str(run_id)] = {
+            "t0": time.monotonic(),
+            "agent": self._agent_for(parent_run_id, metadata),
+        }
         prompt = messages[0][0].content if messages and messages[0] else ""
-        self._emit({"type": "llm_start", "agent": self._agent_for(parent_run_id),
+        self._emit({"type": "llm_start",
+                    "agent": self._agent_for(parent_run_id, metadata),
                     "run_id": str(run_id),
                     "parent_run_id": str(parent_run_id) if parent_run_id else None,
                     "prompt": _truncate(str(prompt))})
 
     def on_llm_end(self, response, *, run_id, parent_run_id=None, **kwargs) -> None:
-        started = self._llm_starts.pop(str(run_id), time.monotonic())
+        started_info = self._llm_starts.pop(str(run_id), None)
+        started = started_info["t0"] if started_info else time.monotonic()
+        agent = started_info["agent"] if started_info else self._agent_for(parent_run_id)
         usage = {}
         provider = None
         model = None
@@ -156,7 +169,7 @@ class StructuredRunLogger(BaseCallbackHandler):
                 text = str(gen.text or "")
         self._llm_calls += 1
         self._total_tokens += usage.get("input", 0) + usage.get("output", 0)
-        self._emit({"type": "llm_end", "agent": self._agent_for(parent_run_id),
+        self._emit({"type": "llm_end", "agent": agent,
                     "run_id": str(run_id),
                     "parent_run_id": str(parent_run_id) if parent_run_id else None,
                     "model": model, "provider_used": provider,
@@ -165,8 +178,10 @@ class StructuredRunLogger(BaseCallbackHandler):
                     "response": _truncate(text)})
 
     def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs) -> None:
-        started = self._llm_starts.pop(str(run_id), time.monotonic())
-        self._emit({"type": "error", "agent": self._agent_for(parent_run_id),
+        started_info = self._llm_starts.pop(str(run_id), None)
+        started = started_info["t0"] if started_info else time.monotonic()
+        agent = started_info["agent"] if started_info else self._agent_for(parent_run_id)
+        self._emit({"type": "error", "agent": agent,
                     "run_id": str(run_id),
                     "parent_run_id": str(parent_run_id) if parent_run_id else None,
                     "latency_s": round(time.monotonic() - started, 2),
