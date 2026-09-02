@@ -97,6 +97,48 @@ def test_resilient_retries_on_failure():
     assert out.startswith("Bullish:")
 
 
+def test_emits_fetch_event_with_mode(tmp_path, monkeypatch):
+    """With an active structured logger, the wrapper reports the fetch outcome."""
+    import json
+
+    import structured_log
+    monkeypatch.setenv("STOCKTWITS_CACHE_DIR", str(tmp_path / "cache"))
+    logger = structured_log.StructuredRunLogger(ticker="AAPL", out_dir=str(tmp_path))
+    structured_log.set_active_logger(logger)
+    try:
+        with patch("stocktwits_resilience.time.sleep"):
+            stocktwits_resilience.make_resilient(
+                lambda ticker, **kw: "<stocktwits unavailable: boom>")(  # noqa: E731
+                "AAPL", start_date="2026-08-25", end_date="2026-09-01")
+    finally:
+        structured_log.clear_active_logger()
+    events = [json.loads(line) for line in logger.path.read_text().strip().splitlines()]
+    fetch = [e for e in events if e["type"] == "fetch_end"]
+    assert fetch, "fetch_end event must be emitted on failure"
+    assert fetch[-1]["source"] == "stocktwits"
+    assert fetch[-1]["mode"] == "placeholder"
+    assert fetch[-1]["retries"] >= 0
+
+
+def test_emits_live_mode_on_success(tmp_path, monkeypatch):
+    import json
+
+    import structured_log
+    monkeypatch.setenv("STOCKTWITS_CACHE_DIR", str(tmp_path / "cache"))
+    logger = structured_log.StructuredRunLogger(ticker="AAPL", out_dir=str(tmp_path))
+    structured_log.set_active_logger(logger)
+    try:
+        stocktwits_resilience.make_resilient(
+            lambda ticker, **kw: "Bullish: 1 (100%) · Total: 1")(  # noqa: E731
+            "AAPL", start_date="2026-08-25", end_date="2026-09-01")
+    finally:
+        structured_log.clear_active_logger()
+    events = [json.loads(line) for line in logger.path.read_text().strip().splitlines()]
+    fetch = [e for e in events if e["type"] == "fetch_end"]
+    assert fetch[-1]["mode"] == "live"
+    assert fetch[-1]["source"] == "stocktwits"
+
+
 def test_resilient_serves_cache_when_all_fail(tmp_path, monkeypatch):
     """Total failure must still give the analyst StockTwits data: cached block."""
     monkeypatch.setenv("STOCKTWITS_CACHE_DIR", str(tmp_path))

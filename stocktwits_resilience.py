@@ -78,6 +78,7 @@ def make_resilient(impl):
     format are drop-in identical to the framework's fetcher.
     """
     def resilient(ticker, **kwargs):
+        t0 = time.monotonic()
         block = impl(ticker, **kwargs)
         attempt = 0
         while _is_failure(block) and attempt < _MAX_RETRIES:
@@ -96,13 +97,29 @@ def make_resilient(impl):
             if cached is not None:
                 logger.warning("serving cached StockTwits block for %s from %s",
                                ticker, cached["date"])
+                _emit(ticker, mode="cache", retries=attempt, t0=t0)
                 return (f"{cached['block']}\n\n"
                         f"(StockTwits messages cached from {cached['date']}; "
                         f"live fetch failed today)")
+            _emit(ticker, mode="placeholder", retries=attempt, t0=t0)
             return block
         if not block.startswith(_EMPTY_PREFIX):
             _store_cache(ticker, block)
+        _emit(ticker, mode="live", retries=attempt, t0=t0)
         return block
 
     resilient._wrapped_original = impl  # tests unwrap to the underlying fetcher
     return resilient
+
+
+def _emit(ticker: str, *, mode: str, retries: int, t0: float) -> None:
+    """Report the fetch outcome into the active structured log (no-op outside
+    an analyze run)."""
+    try:
+        import structured_log
+        structured_log.emit_fetch(
+            source="stocktwits", agent="Sentiment Analyst", mode=mode,
+            retries=retries, latency_s=round(time.monotonic() - t0, 2),
+        )
+    except Exception:  # noqa: BLE001 - logging must never break a fetch
+        logger.debug("could not emit StockTwits fetch event for %s", ticker)

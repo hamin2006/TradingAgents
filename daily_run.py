@@ -254,6 +254,82 @@ def _ensure_reddit_archive() -> None:
     _REDDIT_ARCHIVE_PATCHED = True
 
 
+_GRAPH_TOOL_CALLBACKS_PATCHED = False
+
+
+def _ensure_graph_tool_callbacks() -> None:
+    """Inject the thread-local structured logger into graph-invoke callbacks.
+
+    The framework's Propagator.get_graph_args accepts ``callbacks`` for tool
+    execution tracking (propagation.py) but _run_graph never passes any —
+    so ToolNode executions (FRED, stock data, news tools) emit nothing with
+    constructor-bound callbacks alone (verified live). This patch makes every
+    graph invocation pick up the current thread's structured logger, giving
+    tool_start/tool_end events with per-analyst attribution.
+    """
+    global _GRAPH_TOOL_CALLBACKS_PATCHED
+    if _GRAPH_TOOL_CALLBACKS_PATCHED:
+        return
+    import structured_log
+    import tradingagents.graph.propagation as prop_mod
+
+    original = prop_mod.Propagator.get_graph_args
+
+    def with_structured_log(self, callbacks=None):
+        args = original(self, callbacks=callbacks)
+        active = structured_log.get_active_logger()
+        if active is not None:
+            config = args.setdefault("config", {})
+            config["callbacks"] = list(config.get("callbacks") or []) + [active]
+        return args
+
+    with_structured_log._wrapped_original = original
+    prop_mod.Propagator.get_graph_args = with_structured_log
+    _GRAPH_TOOL_CALLBACKS_PATCHED = True
+
+
+_NEWS_LOGGING_PATCHED = False
+
+
+def _ensure_news_logging() -> None:
+    """Wrap the sentiment analyst's direct get_news call for structured logs.
+
+    The sentiment analyst pre-fetches news by calling ``get_news.func``
+    directly (not through a LangGraph ToolNode), so it is invisible to the
+    invoke-level callbacks. Wrap the tool's func to emit a fetch event into
+    the thread-local structured log.
+    """
+    global _NEWS_LOGGING_PATCHED
+    if _NEWS_LOGGING_PATCHED:
+        return
+    import structured_log
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    tool = sa.get_news
+    original_func = tool.func
+
+    def logged_news_func(*args, **kwargs):
+        t0 = time.monotonic()
+        try:
+            out = original_func(*args, **kwargs)
+            structured_log.emit_fetch(
+                source="yahoo_news", agent="Sentiment Analyst", mode="live",
+                latency_s=round(time.monotonic() - t0, 2),
+                bytes=len(str(out or "")),
+            )
+            return out
+        except Exception as exc:  # noqa: BLE001
+            structured_log.emit_fetch(
+                source="yahoo_news", agent="Sentiment Analyst", mode="placeholder",
+                latency_s=round(time.monotonic() - t0, 2), error=str(exc)[:200],
+            )
+            raise
+
+    logged_news_func._wrapped_original = original_func
+    tool.func = logged_news_func
+    _NEWS_LOGGING_PATCHED = True
+
+
 def _ensure_reddit_pacing() -> None:
     """Rate-limit Reddit fetches across parallel analyze workers.
 
@@ -370,24 +446,39 @@ def _analyze_one(ticker: str, today_str: str, cfg: dict):
     import structured_log
     run_log = structured_log.StructuredRunLogger(ticker=ticker, today=today_str)
     try:
-        _, signal = TradingAgentsGraph(config=cfg,
-                                       callbacks=[run_log]).propagate(ticker, today_str)
-        rating = extract_rating(signal)
+        rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
         run_log.finish(rating=rating)
         return ticker, rating, None
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis failed for %s: %s", ticker, exc)
         try:
             run_log.finish(rating=None)
-            _, signal = TradingAgentsGraph(config=cfg,
-                                           callbacks=[run_log]).propagate(ticker, today_str)
-            rating = extract_rating(signal)
+            rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
             run_log.finish(rating=rating)
             return ticker, rating, None
         except Exception as exc2:  # noqa: BLE001
             logger.error("retry also failed for %s: %s", ticker, exc2)
             run_log.finish(rating=None)
             return ticker, None, exc2
+
+
+def _propagate_with_structured_log(ticker: str, today_str: str, cfg: dict,
+                                   run_log) -> str:
+    """Run the graph with ``run_log`` bound to this thread.
+
+    The logger reaches the graph through the patched Propagator.get_graph_args
+    (see _ensure_graph_tool_callbacks), which injects the thread-local logger
+    into the invoke config — that is what makes ToolNode executions (FRED,
+    stock data, news tools) emit events. Constructor callbacks alone never
+    reach tools. Cleared in finally so parallel workers don't cross-talk.
+    """
+    import structured_log
+    structured_log.set_active_logger(run_log)
+    try:
+        _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, today_str)
+        return extract_rating(signal)
+    finally:
+        structured_log.clear_active_logger()
 
 
 def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
@@ -419,6 +510,8 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
         _ensure_reddit_pacing()
     _ensure_reddit_archive()
     _ensure_stocktwits_resilience()
+    _ensure_graph_tool_callbacks()
+    _ensure_news_logging()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):

@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,20 @@ logger = logging.getLogger(__name__)
 TRUNCATE_CHARS = 2000
 
 _CACHE_DIR_ENV = "STRUCTURED_LOG_DIR"
+
+# LangGraph names the per-analyst ToolNodes tools_<analyst>; attribute their
+# executions to the analyst (verified live: tools_market/tools_news/...).
+_ANALYST_BY_TOOLS_NODE = {
+    "tools_market": "Market Analyst",
+    "tools_social": "Sentiment Analyst",
+    "tools_news": "News Analyst",
+    "tools_fundamentals": "Fundamentals Analyst",
+}
+
+# Thread-local "active logger": _analyze_one sets this in each worker thread so
+# module-level wrappers (reddit/stocktwits/news fetches) can emit fetch events
+# into the right ticker's JSONL without being passed the logger explicitly.
+_thread_local = threading.local()
 
 
 def _out_dir(base: str | None, today: str | None = None) -> Path:
@@ -66,6 +81,37 @@ def _truncate(text: str, limit: int = TRUNCATE_CHARS) -> str:
     return text[: limit - 1] + "…"
 
 
+def set_active_logger(run_log: StructuredRunLogger | None) -> None:
+    """Bind a logger to the current thread (see _analyze_one)."""
+    _thread_local.run_log = run_log
+
+
+def get_active_logger() -> StructuredRunLogger | None:
+    return getattr(_thread_local, "run_log", None)
+
+
+def clear_active_logger() -> None:
+    _thread_local.run_log = None
+
+
+def emit_fetch(*, source: str, agent: str, mode: str,
+               retries: int = 0, latency_s: float = 0.0, bytes: int = 0,
+               error: str | None = None) -> None:
+    """Emit a fetch_end event into the current thread's structured log.
+
+    Called from the module-level resilience wrappers (stocktwits_resilience,
+    reddit_archive, reddit_auth, the news wrapper) which have no reference to
+    the per-ticker logger. No-op outside an analyze run (hermetic tests, bare
+    calls).
+    """
+    run_log = get_active_logger()
+    if run_log is None:
+        return
+    run_log.emit_fetch(source=source, agent=agent, mode=mode,
+                       retries=retries, latency_s=latency_s,
+                       bytes=bytes, error=error)
+
+
 class StructuredRunLogger(BaseCallbackHandler):
     """LangChain callback handler writing one JSONL event per pipeline action."""
 
@@ -77,7 +123,7 @@ class StructuredRunLogger(BaseCallbackHandler):
         self.git_sha = git_sha or _git_sha()
         self._chain_names: dict[str, str] = {}
         self._tool_starts: dict[str, dict] = {}
-        self._llm_starts: dict[str, float] = {}
+        self._llm_starts: dict[str, dict] = {}
         self._started_at = time.monotonic()
         self._llm_calls = 0
         self._total_tokens = 0
@@ -90,13 +136,23 @@ class StructuredRunLogger(BaseCallbackHandler):
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=str) + "\n")
 
+    def emit_fetch(self, *, source: str, agent: str, mode: str,
+                   retries: int = 0, latency_s: float = 0.0, bytes: int = 0,
+                   error: str | None = None) -> None:
+        self._emit({"type": "fetch_end", "agent": agent, "source": source,
+                    "mode": mode, "retries": retries, "latency_s": latency_s,
+                    "bytes": bytes, "error": error})
+
     def _agent_for(self, parent_run_id: UUID | None,
                    metadata: dict | None = None) -> str:
-        # LangGraph tags every LLM start with the node name in metadata;
-        # parent-run-id -> chain-name mapping is the fallback for non-graph
-        # (e.g. test/direct) invocations.
-        if metadata and metadata.get("langgraph_node"):
-            return metadata["langgraph_node"]
+        # LangGraph tags LLM starts with the node name in metadata; tool runs
+        # carry the ToolNode name (tools_market etc.) which we map to analysts.
+        if metadata:
+            node = metadata.get("langgraph_node")
+            if node in _ANALYST_BY_TOOLS_NODE:
+                return _ANALYST_BY_TOOLS_NODE[node]
+            if node:
+                return node
         if parent_run_id is None:
             return "unknown"
         return self._chain_names.get(str(parent_run_id), "unknown")
@@ -187,32 +243,38 @@ class StructuredRunLogger(BaseCallbackHandler):
                     "latency_s": round(time.monotonic() - started, 2),
                     "error": str(error)[:500]})
 
-    # -- tool calls (reddit / stocktwits / news fetches) ----------------------
+    # -- tool calls (LangGraph ToolNodes: fred / stock data / news / ...) ----
 
     def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None,
-                      **kwargs) -> None:
+                      metadata=None, **kwargs) -> None:
         name = serialized.get("name") if isinstance(serialized, dict) else "tool"
+        agent = self._agent_for(parent_run_id, metadata)
         self._tool_starts[str(run_id)] = {
             "tool": name,
-            "input": _truncate(str(input_str), 1000),
+            "agent": agent,
+            "t0": time.monotonic(),
         }
-        self._emit({"type": "tool_start", "agent": self._agent_for(parent_run_id),
+        self._emit({"type": "tool_start", "agent": agent,
                     "run_id": str(run_id), "tool": name,
                     "tool_args": _truncate(str(input_str), 1000)})
 
-    def on_tool_end(self, output, *, run_id, parent_run_id=None, **kwargs) -> None:
+    def on_tool_end(self, output, *, run_id, parent_run_id=None, metadata=None,
+                    **kwargs) -> None:
         start = self._tool_starts.pop(str(run_id), {})
-        metadata = kwargs.get("metadata") or {}
-        self._emit({"type": "tool_end", "agent": self._agent_for(parent_run_id),
+        agent = start.get("agent") or self._agent_for(parent_run_id, metadata)
+        self._emit({"type": "tool_end", "agent": agent,
                     "run_id": str(run_id),
                     "tool": start.get("tool", "tool"),
-                    "cache_hit": metadata.get("cache_hit"),
-                    "retries": metadata.get("retries"),
+                    "latency_s": round(time.monotonic() - start.get("t0", time.monotonic()), 2),
                     "output_len": len(str(output))})
 
-    def on_tool_error(self, error, *, run_id, parent_run_id=None, **kwargs) -> None:
-        self._emit({"type": "error", "agent": self._agent_for(parent_run_id),
-                    "run_id": str(run_id), "error": str(error)[:500]})
+    def on_tool_error(self, error, *, run_id, parent_run_id=None, metadata=None,
+                      **kwargs) -> None:
+        start = self._tool_starts.pop(str(run_id), {})
+        agent = start.get("agent") or self._agent_for(parent_run_id, metadata)
+        self._emit({"type": "error", "agent": agent,
+                    "run_id": str(run_id), "tool": start.get("tool", "tool"),
+                    "error": str(error)[:500]})
 
     # -- run summary ----------------------------------------------------------
 

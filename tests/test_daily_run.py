@@ -59,9 +59,9 @@ def test_run_analyze_extracts_ratings_and_writes_json(cfg):
     mock_logger.return_value.finish.assert_any_call(rating="Buy")
 
 
-def test_analyze_one_passes_callback_and_records_rating(cfg, tmp_path, monkeypatch):
-    """The structured-log callback is threaded into TradingAgentsGraph and the
-    final rating lands in the run_end event."""
+def test_analyze_one_sets_active_logger_and_records_rating(cfg, tmp_path, monkeypatch):
+    """_analyze_one binds the structured logger to the worker thread (so the
+    get_graph_args patch and the wrappers can emit) and writes the rating."""
     from unittest.mock import patch as _patch
 
     import daily_run
@@ -71,25 +71,81 @@ def test_analyze_one_passes_callback_and_records_rating(cfg, tmp_path, monkeypat
     captured = {}
 
     class FakeGraph:
-        def __init__(self, config=None, callbacks=None, **kwargs):
-            captured["callbacks"] = callbacks
+        def __init__(self, config=None, **kwargs):
+            pass
 
         def propagate(self, ticker, date, asset_type="stock"):
+            captured["active"] = structured_log.get_active_logger()
             return None, "**Rating**: Hold"
 
     with _patch("daily_run.TradingAgentsGraph", FakeGraph):
         ticker, rating, error = daily_run._analyze_one("AAPL", "2026-09-02", cfg)
     assert (ticker, rating, error) == ("AAPL", "Hold", None)
-    assert captured["callbacks"], "structured logger must be passed as callback"
-    logger = captured["callbacks"][0]
-    assert isinstance(logger, structured_log.StructuredRunLogger)
-    assert logger.ticker == "AAPL"
+    assert isinstance(captured["active"], structured_log.StructuredRunLogger)
+    assert captured["active"].ticker == "AAPL"
+    assert structured_log.get_active_logger() is None  # cleared after run
     # the run_end event with the rating was written
     log_path = tmp_path / "structured" / "2026-09-02" / "AAPL.jsonl"
     assert log_path.exists()
     events = [json.loads(line) for line in log_path.read_text().strip().splitlines()]
     assert events[-1]["type"] == "run_end"
     assert events[-1]["rating"] == "Hold"
+
+
+def test_ensure_graph_tool_callbacks_injects_active_logger(cfg, tmp_path, monkeypatch):
+    """The get_graph_args patch must inject the thread-local logger into the
+    graph-invoke config so ToolNode executions (fred/stock/news tools) emit."""
+    import daily_run
+    import structured_log
+    import tradingagents.graph.propagation as prop_mod
+
+    monkeypatch.setenv("STRUCTURED_LOG_DIR", str(tmp_path / "structured"))
+    daily_run._GRAPH_TOOL_CALLBACKS_PATCHED = False
+    run_log = structured_log.StructuredRunLogger(ticker="AAPL",
+                                                 today="2026-09-02",
+                                                 out_dir=str(tmp_path / "structured"))
+    structured_log.set_active_logger(run_log)
+    try:
+        daily_run._ensure_graph_tool_callbacks()
+        fake_propagator = object.__new__(prop_mod.Propagator)
+        fake_propagator.max_recur_limit = 25
+        args = prop_mod.Propagator.get_graph_args(fake_propagator)
+    finally:
+        structured_log.clear_active_logger()
+    assert run_log in args["config"]["callbacks"]
+
+
+def test_ensure_news_logging_wraps_sentiment_get_news(tmp_path, monkeypatch):
+    """The sentiment analyst's direct get_news.func call (invisible to
+    LangGraph) is wrapped to emit a fetch event."""
+    import json
+
+    import daily_run
+    import structured_log
+    import tradingagents.agents.analysts.sentiment_analyst as sa
+
+    monkeypatch.setenv("STRUCTURED_LOG_DIR", str(tmp_path / "structured"))
+    daily_run._NEWS_LOGGING_PATCHED = False
+    original = sa.get_news.func
+    sa.get_news.func = lambda ticker, s, e: "mock news block"  # noqa: E731
+    try:
+        daily_run._ensure_news_logging()
+        assert sa.get_news.func is not original  # wrapped
+        logger = structured_log.StructuredRunLogger(
+            ticker="AAPL", today="2026-09-02", out_dir=str(tmp_path / "structured"))
+        structured_log.set_active_logger(logger)
+        try:
+            out = sa.get_news.func("AAPL", "2026-08-25", "2026-09-01")
+            assert out == "mock news block"
+        finally:
+            structured_log.clear_active_logger()
+    finally:
+        sa.get_news.func = original
+        daily_run._NEWS_LOGGING_PATCHED = False
+    events = [json.loads(line) for line in logger.path.read_text().strip().splitlines()]
+    fetch = [e for e in events if e["type"] == "fetch_end"]
+    assert fetch[-1]["source"] == "yahoo_news"
+    assert fetch[-1]["agent"] == "Sentiment Analyst"
 
 
 def test_run_analyze_includes_holdings(cfg):

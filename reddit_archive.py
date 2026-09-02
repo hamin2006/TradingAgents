@@ -234,6 +234,7 @@ def make_archive_aware(impl):
                       timeout=10.0, inter_request_delay=1.0,
                       start_date=None, end_date=None):
         subs = tuple(subreddits)
+        t0 = time.monotonic()
         if _pull_archive(subs, start_date):
             matches: list[dict] = []
             for sub in subs:
@@ -241,11 +242,27 @@ def make_archive_aware(impl):
                 if cached:
                     matches.extend(_filter_posts(cached.get("posts") or [], ticker))
             if matches:
+                _emit_fetch(ticker, mode="archive", t0=t0)
                 return _format_block(ticker, matches, end_date)
+            _emit_fetch(ticker, mode="archive", t0=t0)
             return _empty_placeholder(ticker, subs)
+        _emit_fetch(ticker, mode="fallback", t0=t0)
         return impl(ticker, subreddits=subreddits, limit_per_sub=limit_per_sub,
                     timeout=timeout, inter_request_delay=inter_request_delay,
                     start_date=start_date, end_date=end_date)
 
     archive_aware._wrapped_original = impl  # tests unwrap to the underlying fetcher
     return archive_aware
+
+
+def _emit_fetch(ticker: str, *, mode: str, t0: float) -> None:
+    """Report the fetch outcome into the active structured log (no-op outside
+    an analyze run)."""
+    try:
+        import structured_log
+        structured_log.emit_fetch(
+            source="reddit_archive", agent="Sentiment Analyst", mode=mode,
+            latency_s=round(time.monotonic() - t0, 2),
+        )
+    except Exception:  # noqa: BLE001 - logging must never break a fetch
+        logger.debug("could not emit Reddit archive fetch event for %s", ticker)

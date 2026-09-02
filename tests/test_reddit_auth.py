@@ -153,6 +153,26 @@ def test_resilient_retries_on_placeholder():
     assert out == "r/stocks — 2 recent posts mentioning NVDA:"
 
 
+def test_emits_fetch_event(tmp_path, monkeypatch):
+    """The RSS/OAuth resilient wrapper reports its outcome to the structured log."""
+    import json
+
+    import structured_log
+    monkeypatch.setenv("REDDIT_CACHE_DIR", str(tmp_path / "cache"))
+    logger = structured_log.StructuredRunLogger(ticker="NVDA", out_dir=str(tmp_path))
+    structured_log.set_active_logger(logger)
+    try:
+        reddit_auth.make_resilient(
+            lambda ticker, subreddits=None, **kw:  # noqa: E731
+            "r/stocks — 2 recent posts mentioning NVDA:" )("NVDA")
+    finally:
+        structured_log.clear_active_logger()
+    events = [json.loads(line) for line in logger.path.read_text().strip().splitlines()]
+    fetch = [e for e in events if e["type"] == "fetch_end"]
+    assert fetch[-1]["source"] == "reddit_rss"
+    assert fetch[-1]["mode"] == "live"
+
+
 def test_resilient_serves_cache_when_all_fail(tmp_path, monkeypatch):
     """Total failure must still give the agent Reddit data: cached block."""
     monkeypatch.setenv("REDDIT_CACHE_DIR", str(tmp_path))

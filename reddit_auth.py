@@ -90,6 +90,7 @@ def make_resilient(impl):
     3. On success, the block is cached for the next failure.
     """
     def resilient(ticker, subreddits=DEFAULT_SUBREDDITS, **kwargs):
+        t0 = time.monotonic()
         block = impl(ticker, subreddits=subreddits, **kwargs)
         attempt = 0
         while _is_placeholder(block) and attempt < _MAX_RETRIES:
@@ -108,15 +109,31 @@ def make_resilient(impl):
             if cached is not None:
                 logger.warning("serving cached Reddit block for %s from %s",
                                ticker, cached["date"])
+                _emit_fetch(ticker, mode="cache", retries=attempt, t0=t0)
                 return (f"{cached['block']}\n\n"
                         f"(Reddit discussion cached from {cached['date']}; "
                         f"live fetch failed today)")
+            _emit_fetch(ticker, mode="placeholder", retries=attempt, t0=t0)
             return block
         _store_cache(ticker, block)
+        _emit_fetch(ticker, mode="live", retries=attempt, t0=t0)
         return block
 
     resilient._wrapped_original = impl  # tests unwrap to the underlying fetcher
     return resilient
+
+
+def _emit_fetch(ticker: str, *, mode: str, retries: int, t0: float) -> None:
+    """Report the fetch outcome into the active structured log (no-op outside
+    an analyze run)."""
+    try:
+        import structured_log
+        structured_log.emit_fetch(
+            source="reddit_rss", agent="Sentiment Analyst", mode=mode,
+            retries=retries, latency_s=round(time.monotonic() - t0, 2),
+        )
+    except Exception:  # noqa: BLE001 - logging must never break a fetch
+        logger.debug("could not emit Reddit fetch event for %s", ticker)
 
 
 def credentials_available() -> bool:

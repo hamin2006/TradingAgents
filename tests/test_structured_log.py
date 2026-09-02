@@ -91,17 +91,18 @@ class TestLLMEvents:
 
 
 class TestToolEvents:
-    def test_tool_start_end_with_cache_hit_and_retries(self, logger_fx):
-        logger_fx.on_tool_start({"name": "fetch_reddit_posts"}, {"ticker": "AAPL"},
-                                run_id=_rid())
-        logger_fx.on_tool_end("block text", run_id=_rid(),
-                              metadata={"cache_hit": True, "retries": 2})
+    def test_tool_start_end_records_tool_and_latency(self, logger_fx):
+        rid = _rid()
+        logger_fx.on_tool_start({"name": "get_macro_indicators"}, {"ticker": "AAPL"},
+                                run_id=uuid.UUID(rid))
+        logger_fx.on_tool_end("block text", run_id=uuid.UUID(rid))
         events = logger_fx._read_all()
         assert events[-2]["type"] == "tool_start"
-        assert events[-2]["tool"] == "fetch_reddit_posts"
+        assert events[-2]["tool"] == "get_macro_indicators"
         assert events[-1]["type"] == "tool_end"
-        assert events[-1]["cache_hit"] is True
-        assert events[-1]["retries"] == 2
+        assert events[-1]["tool"] == "get_macro_indicators"
+        assert events[-1]["latency_s"] >= 0
+        assert events[-1]["output_len"] == len("block text")
 
 
 class TestRunSummary:
@@ -142,6 +143,83 @@ def _fake_prompt(text="hi"):
             return {"content": self.content}
 
     return P(text)
+
+
+class TestActiveLogger:
+    def test_set_active_logger_routes_emit_fetch(self, logger_fx):
+        structured_log.set_active_logger(logger_fx)
+        try:
+            structured_log.emit_fetch(source="stocktwits", agent="Sentiment Analyst",
+                                      mode="live", retries=1, latency_s=0.2, bytes=108)
+        finally:
+            structured_log.clear_active_logger()
+        ev = logger_fx._read_all()[-1]
+        assert ev["type"] == "fetch_end"
+        assert ev["source"] == "stocktwits"
+        assert ev["agent"] == "Sentiment Analyst"
+        assert ev["mode"] == "live"
+        assert ev["retries"] == 1
+        assert ev["bytes"] == 108
+
+    def test_emit_fetch_noop_without_active_logger(self, tmp_path):
+        structured_log.clear_active_logger()
+        structured_log.emit_fetch(source="stocktwits", agent="x", mode="live")
+        assert not (tmp_path / "AAPL.jsonl").exists()
+
+    def test_emit_fetch_thread_local_isolation(self, tmp_path):
+        """Parallel workers must not cross-talk: the active logger is per-thread."""
+        import threading
+
+        lg_a = structured_log.StructuredRunLogger(ticker="A", out_dir=str(tmp_path))
+        lg_b = structured_log.StructuredRunLogger(ticker="B", out_dir=str(tmp_path))
+        seen = {}
+
+        def worker(name, lg):
+            structured_log.set_active_logger(lg)
+            try:
+                structured_log.emit_fetch(source="reddit", agent="Sentiment Analyst",
+                                          mode="cache")
+                seen[name] = lg._read_all()[-1]["ticker"]
+            finally:
+                structured_log.clear_active_logger()
+
+        ta = threading.Thread(target=worker, args=("a", lg_a))
+        tb = threading.Thread(target=worker, args=("b", lg_b))
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+        assert seen == {"a": "A", "b": "B"}
+
+
+class TestToolAttribution:
+    def test_tools_node_maps_to_analyst(self, logger_fx):
+        rid = _rid()
+        logger_fx.on_tool_start({"name": "get_macro_indicators"}, "cpi",
+                                run_id=uuid.UUID(rid),
+                                metadata={"langgraph_node": "tools_news"})
+        logger_fx.on_tool_end("data", run_id=uuid.UUID(rid),
+                              metadata={"langgraph_node": "tools_news"})
+        events = logger_fx._read_all()
+        assert events[-2]["agent"] == "News Analyst"   # tool_start
+        assert events[-2]["tool"] == "get_macro_indicators"
+        assert events[-1]["agent"] == "News Analyst"   # tool_end
+
+    def test_unknown_tools_node_agent(self, logger_fx):
+        rid = _rid()
+        logger_fx.on_tool_start({"name": "some_tool"}, "x", run_id=uuid.UUID(rid),
+                                metadata={"langgraph_node": "tools_unknown"})
+        ev = logger_fx._read_all()[-1]
+        assert ev["agent"] == "tools_unknown"  # unmapped node kept raw
+
+
+# tool node -> analyst mapping used for attribution
+_ANALYST_BY_TOOL_NODE = {
+    "tools_market": "Market Analyst",
+    "tools_social": "Sentiment Analyst",
+    "tools_news": "News Analyst",
+    "tools_fundamentals": "Fundamentals Analyst",
+}
 
 
 def _fake_llm_result(usage=None):

@@ -313,3 +313,49 @@ def test_wrapper_single_fill_under_concurrency(clean_archive):
     assert all("NVDA earnings tomorrow" in r for r in results)
     subreddits_fetched = {f["subreddit"] for f in fetched}
     assert subreddits_fetched == set(reddit_archive.DEFAULT_SUBREDDITS)
+
+
+def test_emits_archive_mode_when_served(tmp_path, monkeypatch, clean_archive):
+    """Archive-served data reports mode=archive to the structured log."""
+    import json
+
+    import structured_log
+    monkeypatch.setenv("REDDIT_ARCHIVE_CACHE_DIR", str(tmp_path / "cache"))
+    logger = structured_log.StructuredRunLogger(ticker="NVDA", out_dir=str(tmp_path))
+    structured_log.set_active_logger(logger)
+    try:
+        reddit_archive._store_sub_cache("wallstreetbets", PAGE)
+        reddit_archive._store_sub_cache("stocks", [])
+        reddit_archive._store_sub_cache("investing", [])
+        wrapped = reddit_archive.make_archive_aware(lambda *a, **k: "RSS")
+        out = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+        assert "NVDA earnings tomorrow" in out
+    finally:
+        structured_log.clear_active_logger()
+    events = [json.loads(line) for line in logger.path.read_text().strip().splitlines()]
+    fetch = [e for e in events if e["type"] == "fetch_end"]
+    assert fetch[-1]["source"] == "reddit_archive"
+    assert fetch[-1]["mode"] == "archive"
+
+
+def test_emits_fallback_mode_when_delegating(tmp_path, monkeypatch, clean_archive):
+    """No archive available -> delegation to impl reports mode=fallback."""
+    import json
+
+    import structured_log
+    monkeypatch.setenv("REDDIT_ARCHIVE_CACHE_DIR", str(tmp_path / "cache"))
+    logger = structured_log.StructuredRunLogger(ticker="NVDA", out_dir=str(tmp_path))
+    structured_log.set_active_logger(logger)
+    try:
+        def bad_get(url, params=None, timeout=None):
+            raise RuntimeError("archive down")
+        wrapped = reddit_archive.make_archive_aware(lambda *a, **k: "RSS DATA")
+        with patch("requests.get", side_effect=bad_get):
+            out = wrapped("NVDA", start_date="2026-08-25", end_date="2026-09-01")
+        assert out == "RSS DATA"
+    finally:
+        structured_log.clear_active_logger()
+    events = [json.loads(line) for line in logger.path.read_text().strip().splitlines()]
+    fetch = [e for e in events if e["type"] == "fetch_end"]
+    assert fetch[-1]["source"] == "reddit_archive"
+    assert fetch[-1]["mode"] == "fallback"
