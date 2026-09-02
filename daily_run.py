@@ -353,8 +353,8 @@ def _ensure_fred_aliases() -> None:
     import tradingagents.agents.utils.macro_data_tools as mdt
     import tradingagents.dataflows.fred as fred_mod
 
-    for alias in ("crude_oil_wti", "wti", "crude_oil", "crude", "oil"):
-        fred_mod.MACRO_SERIES.setdefault(alias, "DCOILWTICO")
+    for alias, series_id in _FRED_ALIAS_EXTENSIONS.items():
+        fred_mod.MACRO_SERIES.setdefault(alias, series_id)
 
     tool = mdt.get_macro_indicators
     base = getattr(tool, "_wrapped_original_description", tool.description)
@@ -367,6 +367,33 @@ def _ensure_fred_aliases() -> None:
         "aliases."
     )
     _FRED_PATCHED = True
+
+
+# Aliases added on top of the framework's curated map. Every series ID was
+# verified live against FRED's series endpoint (2026-09-02) — several plausible
+# guesses were dead IDs (gold London fixing, ISM NAPM, JOLTS are all gone from
+# FRED; the 3-month CMT is DGS3MO, not DGS3M), so nothing unverified lands here.
+_FRED_ALIAS_EXTENSIONS = {
+    # Energy (news analyst asked for oil on 2026-09-02; no alias existed)
+    "crude_oil_wti": "DCOILWTICO",
+    "wti": "DCOILWTICO",
+    "crude_oil": "DCOILWTICO",
+    "crude": "DCOILWTICO",
+    "oil": "DCOILWTICO",
+    "crude_oil_brent": "DCOILBRENTEU",
+    "brent": "DCOILBRENTEU",
+    "natural_gas": "DHHNGSP",
+    "henry_hub": "DHHNGSP",
+    # Treasury curve depth (map has 2y/10y/30y only)
+    "3m_treasury": "DGS3MO",
+    "5y_treasury": "DGS5",
+    "10y_3m_spread": "T10Y3M",
+    # Labor & housing follow-ups
+    "hourly_earnings": "CES0500000003",
+    "wage_growth": "CES0500000003",
+    "case_shiller": "CSUSHPISA",
+    "home_prices": "CSUSHPISA",
+}
 
 
 def _ensure_reddit_pacing() -> None:

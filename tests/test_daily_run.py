@@ -159,12 +159,18 @@ def test_ensure_fred_aliases_adds_oil_mappings():
         assert fred_mod._resolve_series_id("crude_oil_wti") == "DCOILWTICO"
         assert fred_mod._resolve_series_id("wti") == "DCOILWTICO"
         assert fred_mod._resolve_series_id("oil") == "DCOILWTICO"
+        assert fred_mod._resolve_series_id("brent") == "DCOILBRENTEU"
+        assert fred_mod._resolve_series_id("natural_gas") == "DHHNGSP"
+        assert fred_mod._resolve_series_id("3m_treasury") == "DGS3MO"
+        assert fred_mod._resolve_series_id("5y_treasury") == "DGS5"
+        assert fred_mod._resolve_series_id("10y_3m_spread") == "T10Y3M"
+        assert fred_mod._resolve_series_id("hourly_earnings") == "CES0500000003"
         assert fred_mod._resolve_series_id("cpi") == "CPIAUCSL"  # existing intact
         keys_before = set(fred_mod.MACRO_SERIES)
         daily_run._ensure_fred_aliases()  # idempotent
         assert set(fred_mod.MACRO_SERIES) == keys_before
     finally:
-        for alias in ("crude_oil_wti", "wti", "crude_oil", "crude", "oil"):
+        for alias in daily_run._FRED_ALIAS_EXTENSIONS:
             fred_mod.MACRO_SERIES.pop(alias, None)
         daily_run._FRED_PATCHED = False
 
