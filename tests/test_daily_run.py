@@ -148,6 +148,53 @@ def test_ensure_news_logging_wraps_sentiment_get_news(tmp_path, monkeypatch):
     assert fetch[-1]["agent"] == "Sentiment Analyst"
 
 
+def test_ensure_fred_aliases_adds_oil_mappings():
+    """The observed 'crude_oil_wti' alias gap must resolve to DCOILWTICO."""
+    import daily_run
+    import tradingagents.dataflows.fred as fred_mod
+
+    daily_run._FRED_PATCHED = False
+    try:
+        daily_run._ensure_fred_aliases()
+        assert fred_mod._resolve_series_id("crude_oil_wti") == "DCOILWTICO"
+        assert fred_mod._resolve_series_id("wti") == "DCOILWTICO"
+        assert fred_mod._resolve_series_id("oil") == "DCOILWTICO"
+        assert fred_mod._resolve_series_id("cpi") == "CPIAUCSL"  # existing intact
+        keys_before = set(fred_mod.MACRO_SERIES)
+        daily_run._ensure_fred_aliases()  # idempotent
+        assert set(fred_mod.MACRO_SERIES) == keys_before
+    finally:
+        for alias in ("crude_oil_wti", "wti", "crude_oil", "crude", "oil"):
+            fred_mod.MACRO_SERIES.pop(alias, None)
+        daily_run._FRED_PATCHED = False
+
+
+def test_ensure_fred_aliases_discloses_full_map_in_tool_description():
+    """The tool the news analyst sees must list every alias and warn that
+    unlisted strings go to FRED verbatim (the model invented aliases because
+    only examples were disclosed)."""
+    import daily_run
+    import tradingagents.agents.utils.macro_data_tools as mdt
+    import tradingagents.dataflows.fred as fred_mod
+
+    daily_run._FRED_PATCHED = False
+    tool = mdt.get_macro_indicators
+    original_desc = tool.description
+    try:
+        daily_run._ensure_fred_aliases()
+        desc = tool.description
+        for alias in ("fed_funds_rate", "10y_treasury", "yield_curve"):
+            assert alias in desc
+        assert "DCOILWTICO" not in desc  # values are not exposed, names are
+        assert "verbatim" in desc
+        listed = desc.split("Known friendly aliases (prefer these):")[1].split(".")[0]
+        names = {a.strip() for a in listed.split(",") if a.strip()}
+        assert names == set(fred_mod.MACRO_SERIES)
+    finally:
+        tool.description = original_desc
+        daily_run._FRED_PATCHED = False
+
+
 def test_run_analyze_includes_holdings(cfg):
     """Held positions must be analyzed so sells are evaluated."""
     class FakeTradingAgentsGraph:

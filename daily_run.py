@@ -330,6 +330,45 @@ def _ensure_news_logging() -> None:
     _NEWS_LOGGING_PATCHED = True
 
 
+_FRED_PATCHED = False
+
+
+def _ensure_fred_aliases() -> None:
+    """Close the FRED alias-discovery gap without touching the framework.
+
+    The news analyst invents snake_case aliases (observed 2026-09-02:
+    ``crude_oil_wti``) because the tool description discloses only a handful
+    of examples and the framework passes any unmapped string to FRED verbatim
+    as a raw series ID, which then 400s. Two runtime patches, both idempotent:
+
+    1. Extend ``fred.MACRO_SERIES`` with the observed oil aliases (FRED's WTI
+       spot series is ``DCOILWTICO``) so such requests resolve.
+    2. Append the full alias map plus a "unlisted strings go to FRED verbatim"
+       warning to the live ``get_macro_indicators`` tool description, so the
+       model picks from the real map instead of inventing names.
+    """
+    global _FRED_PATCHED
+    if _FRED_PATCHED:
+        return
+    import tradingagents.agents.utils.macro_data_tools as mdt
+    import tradingagents.dataflows.fred as fred_mod
+
+    for alias in ("crude_oil_wti", "wti", "crude_oil", "crude", "oil"):
+        fred_mod.MACRO_SERIES.setdefault(alias, "DCOILWTICO")
+
+    tool = mdt.get_macro_indicators
+    base = getattr(tool, "_wrapped_original_description", tool.description)
+    tool._wrapped_original_description = base
+    alias_list = ", ".join(sorted(fred_mod.MACRO_SERIES))
+    tool.description = (
+        f"{base}\n\nKnown friendly aliases (prefer these): {alias_list}.\n"
+        "An indicator string NOT in that list is sent to FRED verbatim as a "
+        "series ID and will error if no such series exists — do not invent "
+        "aliases."
+    )
+    _FRED_PATCHED = True
+
+
 def _ensure_reddit_pacing() -> None:
     """Rate-limit Reddit fetches across parallel analyze workers.
 
@@ -512,6 +551,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_stocktwits_resilience()
     _ensure_graph_tool_callbacks()
     _ensure_news_logging()
+    _ensure_fred_aliases()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):
