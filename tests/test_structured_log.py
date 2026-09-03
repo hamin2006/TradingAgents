@@ -76,6 +76,21 @@ class TestLLMEvents:
         assert ev["response"].startswith("OK")
         assert ev["latency_s"] >= 0
 
+    def test_llm_end_records_finish_reason(self, logger_fx):
+        """finish_reason distinguishes completed (stop) from capped (length)
+        calls — the truncation signal for sizing max_tokens."""
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        msg = AIMessage(content="cut mid-report",
+                        response_metadata={"model_provider": "Relace",
+                                           "model_name": "m",
+                                           "finish_reason": "length"})
+        logger_fx.on_llm_end(ChatResult(generations=[ChatGeneration(message=msg)]),
+                             run_id=_rid())
+        ev = logger_fx._read_all()[-1]
+        assert ev["finish_reason"] == "length"
+
     def test_prompt_not_truncated_full_context(self, logger_fx):
         """Debugging needs the exact context the model saw: no truncation."""
         logger_fx.on_chat_model_start({}, [[_fake_prompt("x" * 5000)]], run_id=_rid())

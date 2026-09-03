@@ -325,6 +325,7 @@ class StructuredRunLogger(BaseCallbackHandler):
                     "model": model, "provider_used": provider,
                     "token_usage": usage,
                     "latency_s": round(time.monotonic() - started, 2),
+                    "finish_reason": rm.get("finish_reason"),
                     "reasoning": reasoning,
                     "response": text})
 
