@@ -391,6 +391,44 @@ def test_analyst_report_passthrough_when_present(factory_name):
     assert out[report_key] == "full report text"
 
 
+# --- reasoning capture (SDK model_extra) -------------------------------------
+
+def test_ensure_reasoning_capture_stashes_model_extra():
+    """OpenRouter puts message.reasoning in the SDK model_extra; the wrapper
+    must stash it for the structured-log handler."""
+    from openai.resources.chat.completions import Completions
+
+    import daily_run
+    import structured_log
+
+    real_original = Completions.create
+    daily_run._reset_reasoning_capture()
+
+    class FakeMsg:
+        model_extra = {"reasoning": "chain of thought", "other": 1}
+
+    class FakeChoice:
+        message = FakeMsg()
+
+    class FakeResp:
+        choices = [FakeChoice()]
+
+    def fake_create(self, *args, **kwargs):
+        return FakeResp()
+
+    Completions.create = fake_create
+    daily_run._REASONING_CAPTURE_PATCHED = False
+    try:
+        daily_run._ensure_reasoning_capture()
+        wrapped = Completions.create
+        assert hasattr(wrapped, "_wrapped_original")
+        wrapped(None)
+        assert structured_log._pop_reasoning() == "chain of thought"
+    finally:
+        daily_run._reset_reasoning_capture()
+        Completions.create = real_original
+
+
 # --- portfolio-context injection (phantom-position fix) ----------------------
 
 

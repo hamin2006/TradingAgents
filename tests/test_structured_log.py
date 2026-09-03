@@ -227,6 +227,20 @@ class TestActiveLogger:
         assert ev["mode"] == "retry"
         assert ev["ticker"] == "AAPL"
 
+    def test_llm_end_uses_sdk_stashed_reasoning(self, logger_fx):
+        """LangChain drops OpenRouter's message.reasoning; the SDK-layer stash
+        must supply it to the llm_end event on the same thread."""
+        structured_log.stash_reasoning("deep secret thinking trace")
+        logger_fx.on_llm_end(_fake_llm_result(), run_id=_rid())
+        ev = logger_fx._read_all()[-1]
+        assert ev["reasoning"] == "deep secret thinking trace"
+        assert structured_log._pop_reasoning() == ""  # stash consumed once
+
+    def test_llm_error_discards_stashed_reasoning(self, logger_fx):
+        structured_log.stash_reasoning("orphan trace")
+        logger_fx.on_llm_error(RuntimeError("boom"), run_id=_rid())
+        assert structured_log._pop_reasoning() == ""
+
 
 class TestToolAttribution:
     def test_tools_node_maps_to_analyst(self, logger_fx):

@@ -775,6 +775,59 @@ def _ensure_analyst_report_recovery() -> None:
     _ANALYST_REPORT_RECOVERY_PATCHED = True
 
 
+# --- reasoning capture (LangChain drops OpenRouter message.reasoning) --------
+#
+# OpenRouter returns the model's thinking in ``message.reasoning``, which the
+# openai SDK surfaces in ``model_extra``; LangChain forwards only typed extras
+# and drops model_extra, so reasoning never reached the structured log
+# (verified live 2026-09-03: 0/19 llm_end events had reasoning, while the raw
+# API response carried it). Fix: wrap the SDK's Completions.create — the
+# response is parsed on the same thread as the subsequent llm_end callback,
+# so the reasoning is stashed thread-locally and popped by on_llm_end.
+
+_REASONING_CAPTURE_PATCHED = False
+_REASONING_CAPTURE_ORIGINAL = None
+
+
+def _reset_reasoning_capture() -> None:
+    """Restore the SDK seam (tests; safe anytime)."""
+    global _REASONING_CAPTURE_PATCHED, _REASONING_CAPTURE_ORIGINAL
+    if _REASONING_CAPTURE_PATCHED and _REASONING_CAPTURE_ORIGINAL is not None:
+        from openai.resources.chat.completions import Completions
+        Completions.create = _REASONING_CAPTURE_ORIGINAL
+    _REASONING_CAPTURE_PATCHED = False
+    _REASONING_CAPTURE_ORIGINAL = None
+
+
+def _ensure_reasoning_capture() -> None:
+    """Stash OpenRouter reasoning (SDK model_extra) for the log handler."""
+    global _REASONING_CAPTURE_PATCHED, _REASONING_CAPTURE_ORIGINAL
+    if _REASONING_CAPTURE_PATCHED:
+        return
+    from openai.resources.chat.completions import Completions
+
+    import structured_log
+
+    _REASONING_CAPTURE_ORIGINAL = Completions.create
+    original = Completions.create
+
+    def create_with_reasoning(self, *args, **kwargs):
+        response = original(self, *args, **kwargs)
+        try:
+            choice = (response.choices or [None])[0]
+            message = getattr(choice, "message", None)
+            extra = getattr(message, "model_extra", None) or {}
+            if extra.get("reasoning"):
+                structured_log.stash_reasoning(str(extra["reasoning"]))
+        except Exception:  # noqa: BLE001 - capture must never break calls
+            pass
+        return response
+
+    create_with_reasoning._wrapped_original = original
+    Completions.create = create_with_reasoning
+    _REASONING_CAPTURE_PATCHED = True
+
+
 def _reset_analyst_report_recovery() -> None:
     """Restore the analyst factory seams (tests; safe anytime)."""
     global _ANALYST_REPORT_RECOVERY_PATCHED
@@ -1015,6 +1068,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_fred_aliases()
     _ensure_structured_fallback_logging()
     _ensure_analyst_report_recovery()
+    _ensure_reasoning_capture()
     _ensure_portfolio_context(cfg)
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
