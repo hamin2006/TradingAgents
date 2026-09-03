@@ -418,7 +418,10 @@ _FRED_ALIAS_EXTENSIONS = {
 # injection (never assert a wrong book). Nothing under tradingagents/ changes.
 
 _PORTFOLIO_SNAPSHOT_TTL_S = 600.0
-_portfolio_cache: dict = {"ts": 0.0, "snap": None}
+# ts=None means "never fetched" -- a numeric 0.0 sentinel is wrong because
+# monotonic() starts near 0 on a freshly booted machine, so `now - 0.0 < TTL`
+# would treat an empty cache as a fresh cache hit of None.
+_portfolio_cache: dict = {"ts": None, "snap": None}
 _portfolio_lock = threading.Lock()
 _PORTFOLIO_PATCHED = False
 _PORTFOLIO_ORIGINALS: dict = {}
@@ -445,7 +448,8 @@ def _portfolio_snapshot(cfg: dict) -> dict | None:
     analyze run.
     """
     with _portfolio_lock:
-        if time.monotonic() - _portfolio_cache["ts"] < _PORTFOLIO_SNAPSHOT_TTL_S:
+        ts = _portfolio_cache["ts"]
+        if ts is not None and time.monotonic() - ts < _PORTFOLIO_SNAPSHOT_TTL_S:
             return _portfolio_cache["snap"]
     snap = _fetch_portfolio_snapshot(cfg)
     with _portfolio_lock:
@@ -630,7 +634,7 @@ def _reset_portfolio_context() -> None:
         _PORTFOLIO_ORIGINALS.clear()
         _PORTFOLIO_PATCHED = False
     with _portfolio_lock:
-        _portfolio_cache["ts"] = 0.0
+        _portfolio_cache["ts"] = None
         _portfolio_cache["snap"] = None
 
 

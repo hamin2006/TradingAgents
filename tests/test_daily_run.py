@@ -305,6 +305,35 @@ def test_portfolio_snapshot_builds_from_broker(cfg):
     assert snap["max_positions"] == 10
 
 
+def test_snapshot_fetches_on_freshly_booted_machine(cfg):
+    """Regression: the empty-cache sentinel must not look like a fresh cache
+    hit when monotonic() is near zero (machine booted < 10 min ago)."""
+    import daily_run
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 10}, 2000.0)
+    broker.get_position_details.return_value = {}
+    closes = {"AAPL": 190.0}
+    with patch("daily_run.time.monotonic", return_value=3.0), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", side_effect=lambda t: closes.get(t)), \
+         patch("tradingagents.agents.utils.agent_utils.resolve_instrument_identity",
+               return_value={"sector": "Technology"}):
+        daily_run._reset_portfolio_context()
+        snap = daily_run._portfolio_snapshot(cfg)
+        assert snap is not None  # cached-None hit would fail here
+        assert snap["holdings"]["AAPL"]["value"] == 1900.0
+        # second call within TTL serves the cache
+        snap2 = daily_run._portfolio_snapshot(cfg)
+        assert snap2 is snap
+        # after TTL the cache is refreshed, not served stale
+        broker.get_positions_and_cash.return_value = ({"AAPL": 20}, 2000.0)
+        with patch("daily_run.time.monotonic", return_value=900.0):
+            snap3 = daily_run._portfolio_snapshot(cfg)
+        assert snap3["holdings"]["AAPL"]["shares"] == 20
+    daily_run._reset_portfolio_context()
+
+
 def test_flat_book_stance_appended_to_resolved_context(cfg):
     """Flat book: every agent's context says 'no current position'."""
     import daily_run
