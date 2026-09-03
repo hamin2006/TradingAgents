@@ -5,12 +5,12 @@ llm_provider: openrouter
 quick_think_llm: deepseek/deepseek-v4-flash-0731   # dated snapshot, cheaper prompt pricing
 deep_think_llm: deepseek/deepseek-v4-pro
 output_language: English
-max_tokens: 12000         # output-token cap forwarded to every provider client:
+max_tokens: 15000         # output-token cap forwarded to every provider client:
                           # deepseek-v4-flash runs away uncapped (100K+ token
                           # outputs, 20+ min calls — upstream #1204). Measured
-                          # live 2026-09-03: the pathological 36K-char prompt
-                          # completed in 85s with full content at cap=8000;
-                          # 12K = headroom for reasoning on structured calls.
+                          # live 2026-09-03: pathological prompt completed in
+                          # 85s with full content at cap=8000; 15K = headroom
+                          # above typical content (~2-3K tok) + reasoning.
 
 # Pin OpenRouter routing per model slug (multiple hosts serve the same model;
 # pin to the preferred host; fallbacks stay enabled). Unknown models route unpinned.
