@@ -396,6 +396,244 @@ _FRED_ALIAS_EXTENSIONS = {
 }
 
 
+# --- Portfolio-context injection (phantom-position fix) -----------------------
+#
+# Every agent renders ``instrument_context`` from state at prompt time, but
+# nothing ever told an agent whether the analyzed ticker is actually held --
+# so the rating scale's holder verbs ("Hold: maintain current position") made
+# agents fabricate positions (10 of 15 PM decisions referenced phantom
+# holdings on a flat book, 2026-09-02). Two runtime patches:
+#
+#   Tier 1 (all agents): a stance line appended to the instrument context at
+#     resolve time -- flat book => "deciding whether to initiate", held =>
+#     shares/avg-cost/weight. Every agent embeds instrument_context, so the
+#     seed (and the contradiction) reaches the earliest reports.
+#   Tier 2 (decision tail only): the Research Manager, three risk debators,
+#     and Portfolio Manager additionally see a precomputed book-shape block
+#     (count/cash/sector mix by value) plus a no-cross-ticker-trades rule.
+#     Analysts/researchers/trader never see it -- book noise is a
+#     hallucination seed in evidence-gathering stages.
+#
+# Both tiers are keyed on a real broker snapshot; broker failure means NO
+# injection (never assert a wrong book). Nothing under tradingagents/ changes.
+
+_PORTFOLIO_SNAPSHOT_TTL_S = 600.0
+_portfolio_cache: dict = {"ts": 0.0, "snap": None}
+_portfolio_lock = threading.Lock()
+_PORTFOLIO_PATCHED = False
+_PORTFOLIO_ORIGINALS: dict = {}
+
+# The 5 decision-tail factories in tradingagents/graph/setup.py whose nodes
+# render instrument_context at prompt time (research_manager.py:28,
+# risk_mgmt/*:35, portfolio_manager.py:45).
+_TAIL_FACTORY_NAMES = (
+    "create_research_manager",
+    "create_aggressive_debator",
+    "create_neutral_debator",
+    "create_conservative_debator",
+    "create_portfolio_manager",
+)
+
+
+def _portfolio_snapshot(cfg: dict) -> dict | None:
+    """Memoized real-account snapshot: cash, positions (shares, avg entry,
+    mark value, sector), invested total, sector mix by value.
+
+    ``None`` when the broker is unreachable -- callers then skip portfolio
+    injection entirely. Retried after the TTL even after a failure so a
+    transient broker blip at run start does not disable injection for a long
+    analyze run.
+    """
+    with _portfolio_lock:
+        if time.monotonic() - _portfolio_cache["ts"] < _PORTFOLIO_SNAPSHOT_TTL_S:
+            return _portfolio_cache["snap"]
+    snap = _fetch_portfolio_snapshot(cfg)
+    with _portfolio_lock:
+        _portfolio_cache["ts"] = time.monotonic()
+        _portfolio_cache["snap"] = snap
+    return snap
+
+
+def _fetch_portfolio_snapshot(cfg: dict) -> dict | None:
+    try:
+        broker = create_broker(cfg)
+        broker.connect()
+        try:
+            holdings, cash = broker.get_positions_and_cash()
+            details = {}
+            getter = getattr(broker, "get_position_details", None)
+            if getter is not None:
+                try:
+                    details = getter()
+                except Exception:  # noqa: BLE001 - details are optional
+                    logger.warning("portfolio snapshot: position details unavailable")
+        finally:
+            broker.disconnect()
+    except Exception as exc:  # noqa: BLE001 - never block analysis on the book
+        logger.warning("portfolio snapshot unavailable (%s); no stance/shape "
+                       "injection this run", exc)
+        return None
+
+    from tradingagents.agents.utils.agent_utils import resolve_instrument_identity
+
+    normalized: dict[str, dict] = {}
+    invested = 0.0
+    sector_value: dict[str, float] = {}
+    for ticker, shares in (holdings or {}).items():
+        price = _last_close(ticker)
+        value = price * shares if price else None
+        sector = "Unknown"
+        try:
+            identity = resolve_instrument_identity(ticker) or {}
+            sector = identity.get("sector") or "Unknown"
+        except Exception:  # noqa: BLE001 - sector enrichment is best-effort
+            pass
+        avg = None
+        detail = (details or {}).get(ticker)
+        if detail:
+            avg = detail.get("avg_entry_price")
+        normalized[ticker] = {"shares": int(shares),
+                              "avg_entry_price": avg,
+                              "value": value,
+                              "sector": sector}
+        if value is not None:
+            invested += value
+            sector_value[sector] = sector_value.get(sector, 0.0) + value
+    return {"cash": float(cash or 0.0),
+            "max_positions": int(cfg.get("max_positions", 10)),
+            "holdings": normalized,
+            "invested": invested,
+            "sectors": sector_value}
+
+
+def _portfolio_stance_line(ticker: str, snap: dict | None) -> str:
+    """Ground truth for the analyzed ticker: initiate vs add/trim."""
+    if not snap:
+        return ""
+    holding = snap["holdings"].get(ticker)
+    if holding is None:
+        return (
+            f"Portfolio context (ground truth): no current position in "
+            f"{ticker}. You are deciding whether to initiate. References to "
+            f"an existing position in {ticker} are incorrect."
+        )
+    parts = [f"Portfolio context (ground truth): holding {holding['shares']} "
+             f"shares of {ticker}"]
+    if holding.get("avg_entry_price"):
+        parts.append(f"at avg cost ${holding['avg_entry_price']:.2f}")
+    if holding.get("value") is not None:
+        total = snap["invested"] + snap["cash"]
+        if total > 0:
+            parts.append(f"({holding['value'] / total * 100:.1f}% of the book)")
+    parts.append("Trim/add language must match this position.")
+    return " ".join(parts)
+
+
+def _portfolio_book_shape(ticker: str, snap: dict | None) -> str:
+    """Precomputed book facts for the decision tail -- no raw lists, no
+    arithmetic left to the model."""
+    if not snap:
+        return ""
+    total = snap["invested"] + snap["cash"]
+    invested_pct = snap["invested"] / total * 100 if total > 0 else 0.0
+    mix = []
+    for sector, value in sorted(snap["sectors"].items(),
+                                key=lambda kv: -kv[1]):
+        names = sorted(t for t, h in snap["holdings"].items()
+                       if h.get("sector") == sector)
+        pct = value / total * 100 if total > 0 else 0.0
+        label = f"{sector} {pct:.0f}%"
+        if names:
+            label += f" ({', '.join(names)})"
+        mix.append(label)
+    sector_line = ("Sector mix by value: " + "; ".join(mix) if mix
+                   else "Sector mix by value: none (flat book).")
+    return (
+        f"Current book (ground truth): {len(snap['holdings'])}/"
+        f"{snap['max_positions']} positions, ${snap['invested']:,.0f} invested "
+        f"({invested_pct:.0f}% of ${total:,.0f}), ${snap['cash']:,.0f} cash.\n"
+        f"{sector_line}\n"
+        f"Rule: never propose trades outside {ticker}; other holdings are "
+        f"concentration/sizing context only."
+    )
+
+
+def _ensure_portfolio_context(cfg: dict) -> None:
+    """Install the two-tier portfolio injection (idempotent, revertible).
+
+    Tier 1 wraps TradingAgentsGraph.resolve_instrument_context -- the single
+    seam propagate() uses (trading_graph.py:519) to seed the context every
+    agent renders. Tier 2 wraps the 5 decision-tail factories resolved by
+    tradingagents.graph.setup so only their nodes see the book shape.
+    """
+    global _PORTFOLIO_PATCHED
+    if _PORTFOLIO_PATCHED:
+        return
+    import tradingagents.graph.setup as setup_mod
+    import tradingagents.graph.trading_graph as tg_mod
+
+    original_resolve = tg_mod.TradingAgentsGraph.resolve_instrument_context
+
+    def resolve_with_stance(self, ticker: str, asset_type: str = "stock") -> str:
+        base = original_resolve(self, ticker, asset_type)
+        snap = _portfolio_snapshot(cfg)
+        line = _portfolio_stance_line(ticker, snap) if snap else ""
+        return f"{base}\n\n{line}".strip() if line else base
+
+    resolve_with_stance._wrapped_original = original_resolve
+    tg_mod.TradingAgentsGraph.resolve_instrument_context = resolve_with_stance
+
+    def shape_factory(factory_name: str, original_factory):
+        def wrapped_factory(llm):
+            node = original_factory(llm)
+
+            def node_with_shape(state):
+                snap = _portfolio_snapshot(cfg)
+                if snap:
+                    ctx = state.get("instrument_context")
+                    if isinstance(ctx, str) and ctx.strip():
+                        block = _portfolio_book_shape(
+                            state.get("company_of_interest") or "", snap)
+                        if block:
+                            state = {**state,
+                                     "instrument_context": ctx + "\n\n" + block}
+                return node(state)
+
+            node_with_shape._wrapped_original = node
+            return node_with_shape
+
+        wrapped_factory._wrapped_original = original_factory
+        return wrapped_factory
+
+    for name in _TAIL_FACTORY_NAMES:
+        original_factory = getattr(setup_mod, name)
+        wrapped = shape_factory(name, original_factory)
+        setattr(setup_mod, name, wrapped)
+        _PORTFOLIO_ORIGINALS[name] = original_factory
+    _PORTFOLIO_ORIGINALS["resolve_instrument_context"] = original_resolve
+    _PORTFOLIO_PATCHED = True
+
+
+def _reset_portfolio_context() -> None:
+    """Restore the framework seams (tests; also safe to call at any time)."""
+    global _PORTFOLIO_PATCHED
+    if _PORTFOLIO_PATCHED:
+        import tradingagents.graph.setup as setup_mod
+        import tradingagents.graph.trading_graph as tg_mod
+
+        for name in _TAIL_FACTORY_NAMES:
+            if name in _PORTFOLIO_ORIGINALS:
+                setattr(setup_mod, name, _PORTFOLIO_ORIGINALS[name])
+        if "resolve_instrument_context" in _PORTFOLIO_ORIGINALS:
+            tg_mod.TradingAgentsGraph.resolve_instrument_context = (
+                _PORTFOLIO_ORIGINALS["resolve_instrument_context"])
+        _PORTFOLIO_ORIGINALS.clear()
+        _PORTFOLIO_PATCHED = False
+    with _portfolio_lock:
+        _portfolio_cache["ts"] = 0.0
+        _portfolio_cache["snap"] = None
+
+
 def _ensure_reddit_pacing() -> None:
     """Rate-limit Reddit fetches across parallel analyze workers.
 
@@ -579,6 +817,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_graph_tool_callbacks()
     _ensure_news_logging()
     _ensure_fred_aliases()
+    _ensure_portfolio_context(cfg)
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):

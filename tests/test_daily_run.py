@@ -201,6 +201,212 @@ def test_ensure_fred_aliases_discloses_full_map_in_tool_description():
         daily_run._FRED_PATCHED = False
 
 
+# --- portfolio-context injection (phantom-position fix) ----------------------
+
+def _portfolio_snap(cash=9_999.31, max_positions=10, holdings=None):
+    """Build a snapshot dict in the shape _fetch_portfolio_snapshot returns."""
+    holdings = holdings or {}
+    invested = sum(h["value"] for h in holdings.values() if h.get("value"))
+    sectors = {}
+    for _, h in holdings.items():
+        if h.get("value") and h.get("sector"):
+            sectors[h["sector"]] = sectors.get(h["sector"], 0.0) + h["value"]
+    return {"cash": cash, "max_positions": max_positions, "holdings": holdings,
+            "invested": invested, "sectors": sectors}
+
+
+class _RecordingLLM:
+    """Stub LLM: captures every prompt; no structured output (freetext path)."""
+
+    def __init__(self):
+        self.prompts = []
+
+    def with_structured_output(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def invoke(self, prompt, *args, **kwargs):
+        from langchain_core.messages import AIMessage
+        self.prompts.append(prompt if isinstance(prompt, str) else str(prompt))
+        return AIMessage(content="ok")
+
+
+def _tail_state(ticker="COP", snap=None):
+    """Minimal AgentState a decision-tail node can render without network."""
+    import daily_run
+    base_ctx = f"The instrument to analyze is `{ticker}`."
+    if snap is not None:
+        stance = daily_run._portfolio_stance_line(ticker, snap)
+        if stance:
+            base_ctx = f"{base_ctx}\n\n{stance}"
+    return {
+        "company_of_interest": ticker,
+        "instrument_context": base_ctx,
+        "investment_debate_state": {"history": "", "count": 0},
+        "risk_debate_state": {"history": "", "count": 0,
+                              "aggressive_history": "",
+                              "conservative_history": "",
+                              "neutral_history": "",
+                              "current_aggressive_response": "",
+                              "current_conservative_response": "",
+                              "current_neutral_response": ""},
+        "market_report": "market", "sentiment_report": "sentiment",
+        "news_report": "news", "fundamentals_report": "fundamentals",
+        "investment_plan": "plan", "trader_investment_plan": "trader",
+        "past_context": "",
+    }
+
+
+def _install_portfolio_context(daily_run, cfg, snap):
+    """Context manager: install the wrappers and keep the fake snapshot
+    active so nodes invoked inside see it (wrappers read the module global
+    at call time)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        daily_run._reset_portfolio_context()
+        daily_run._PORTFOLIO_PATCHED = False
+        with patch("daily_run._portfolio_snapshot", return_value=snap):
+            daily_run._ensure_portfolio_context(cfg)
+            try:
+                yield
+            finally:
+                daily_run._reset_portfolio_context()
+
+    return _cm()
+
+
+def test_portfolio_snapshot_builds_from_broker(cfg):
+    """Shares + avg entry from the broker, marked to last close, sector-mixed."""
+    import daily_run
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 10, "MSFT": 5},
+                                                  2000.0)
+    broker.get_position_details.return_value = {
+        "AAPL": {"shares": 10, "avg_entry_price": 180.0},
+        "MSFT": {"shares": 5, "avg_entry_price": None},
+    }
+    closes = {"AAPL": 190.0, "MSFT": 400.0}
+    daily_run._reset_portfolio_context()
+    with patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", side_effect=lambda t: closes.get(t)), \
+         patch("tradingagents.agents.utils.agent_utils.resolve_instrument_identity",
+               return_value={"sector": "Technology"}):
+        snap = daily_run._portfolio_snapshot(cfg)
+    daily_run._reset_portfolio_context()
+    assert snap is not None
+    assert snap["cash"] == 2000.0
+    assert snap["invested"] == 1900.0 + 2000.0
+    assert snap["holdings"]["AAPL"]["avg_entry_price"] == 180.0
+    assert snap["holdings"]["AAPL"]["value"] == 1900.0
+    assert snap["holdings"]["MSFT"]["avg_entry_price"] is None
+    assert snap["sectors"]["Technology"] == 3900.0
+    assert snap["max_positions"] == 10
+
+
+def test_flat_book_stance_appended_to_resolved_context(cfg):
+    """Flat book: every agent's context says 'no current position'."""
+    import daily_run
+    import tradingagents.graph.trading_graph as tg
+
+    snap = _portfolio_snap(holdings={}, cash=9_999.31)
+    with _install_portfolio_context(daily_run, cfg, snap), \
+         patch("tradingagents.graph.trading_graph.resolve_instrument_identity",
+               return_value={}):
+        ctx = tg.TradingAgentsGraph.resolve_instrument_context(object(), "AAPL")
+    assert "no current position in AAPL" in ctx
+    assert "deciding whether to initiate" in ctx
+    assert "existing position in AAPL are incorrect" in ctx
+
+
+def test_held_stance_includes_cost_and_weight(cfg):
+    """Held ticker: shares, avg cost, and book weight anchor add/trim talk."""
+    import daily_run
+    import tradingagents.graph.trading_graph as tg
+
+    snap = _portfolio_snap(holdings={"AAPL": {"shares": 42,
+                                              "avg_entry_price": 221.10,
+                                              "value": 9500.0,
+                                              "sector": "Technology"}},
+                           cash=500.0)
+    with _install_portfolio_context(daily_run, cfg, snap), \
+         patch("tradingagents.graph.trading_graph.resolve_instrument_identity",
+               return_value={}):
+        ctx = tg.TradingAgentsGraph.resolve_instrument_context(object(), "AAPL")
+    assert "holding 42 shares of AAPL" in ctx
+    assert "avg cost $221.10" in ctx
+    assert "95.0% of the book" in ctx  # 9500 of a 10k book
+
+
+@pytest.mark.parametrize("factory_name", [
+    "create_research_manager", "create_aggressive_debator",
+    "create_neutral_debator", "create_conservative_debator",
+    "create_portfolio_manager",
+])
+def test_book_shape_reaches_tail_node_prompt(cfg, factory_name):
+    """The decision tail renders stance + shape in the actual prompt text."""
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    snap = _portfolio_snap(holdings={
+        "PSX": {"shares": 10, "avg_entry_price": None, "value": 3000.0,
+                "sector": "Energy"},
+        "VLO": {"shares": 5, "avg_entry_price": None, "value": 2000.0,
+                "sector": "Energy"},
+        "AAPL": {"shares": 15, "avg_entry_price": None, "value": 4900.0,
+                 "sector": "Technology"},
+    }, cash=100.0)
+    with _install_portfolio_context(daily_run, cfg, snap):
+        original = getattr(setup_mod, factory_name)
+        assert hasattr(original, "_wrapped_original")  # factory was wrapped
+        llm = _RecordingLLM()
+        state = _tail_state("COP", snap)
+        node = original(llm)
+        node(state)
+        prompt = llm.prompts[-1]
+    assert "no current position in COP" in prompt  # stance (flat for COP)
+    assert "Current book (ground truth): 3/10 positions" in prompt
+    assert "Energy 50% (PSX, VLO)" in prompt
+    assert "never propose trades outside COP" in prompt
+
+
+def test_evidence_stages_are_not_wrapped(cfg):
+    """Analysts/researchers/trader see stance only -- never the book shape."""
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    with _install_portfolio_context(daily_run, cfg, _portfolio_snap(holdings={})):
+        for name in ("create_market_analyst", "create_sentiment_analyst",
+                     "create_news_analyst", "create_fundamentals_analyst",
+                     "create_bull_researcher", "create_bear_researcher",
+                     "create_trader"):
+            assert not hasattr(getattr(setup_mod, name), "_wrapped_original"), name
+        for name in daily_run._TAIL_FACTORY_NAMES:
+            assert hasattr(getattr(setup_mod, name), "_wrapped_original"), name
+
+
+def test_broker_failure_skips_injection(cfg):
+    """No broker snapshot => no stance, no shape: never assert a wrong book."""
+    import daily_run
+    import tradingagents.graph.trading_graph as tg
+
+    with patch("daily_run.create_broker",
+               side_effect=RuntimeError("broker down")):
+        daily_run._reset_portfolio_context()
+        snap = daily_run._portfolio_snapshot(cfg)
+        daily_run._reset_portfolio_context()
+    assert snap is None
+    assert daily_run._portfolio_stance_line("AAPL", None) == ""
+    assert daily_run._portfolio_book_shape("AAPL", None) == ""
+
+    with _install_portfolio_context(daily_run, cfg, None), \
+         patch("tradingagents.graph.trading_graph.resolve_instrument_identity",
+               return_value={}):
+        ctx = tg.TradingAgentsGraph.resolve_instrument_context(object(), "AAPL")
+    assert "Portfolio context" not in ctx
+
+
 def test_run_analyze_includes_holdings(cfg):
     """Held positions must be analyzed so sells are evaluated."""
     class FakeTradingAgentsGraph:

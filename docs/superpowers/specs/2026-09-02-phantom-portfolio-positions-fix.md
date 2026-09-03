@@ -1,7 +1,9 @@
 # Phantom Portfolio Positions — Bug Fix Design
 
 Date: 2026-09-02
-Status: Draft
+Status: Implemented (2026-09-02; live end-to-end verification deferred until
+the F2 information-forwarding change lands, per decision — one combined
+ticker analysis will validate both)
 Framework: TradingAgents v0.4.0 (upstream `0e9de89`; used as a library, NOT modified)
 
 ## 1. Symptom

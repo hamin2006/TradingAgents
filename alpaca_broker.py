@@ -90,6 +90,27 @@ class AlpacaBroker:
             cash = 0.0
         return holdings, cash
 
+    def get_position_details(self) -> dict[str, dict]:
+        """Per-position share counts and average entry prices.
+
+        Optional interface addition (the base broker contract only requires
+        ``get_positions_and_cash``): the portfolio-context injection uses avg
+        entry cost to ground trim/add language, and gracefully degrades to
+        shares-only when a backend does not provide it.
+        """
+        details: dict[str, dict] = {}
+        for pos in self._client.get_all_positions():
+            qty = int(pos.qty)
+            if not qty:
+                continue
+            try:
+                avg = (float(pos.avg_entry_price)
+                       if getattr(pos, "avg_entry_price", None) else None)
+            except (TypeError, ValueError):
+                avg = None
+            details[pos.symbol] = {"shares": qty, "avg_entry_price": avg}
+        return details
+
     def place_market_orders(self, orders: list[Order], dry_run: bool = False) -> list[dict]:
         reports = []
         if dry_run:
