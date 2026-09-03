@@ -32,6 +32,11 @@ def TODAY_ET() -> date:
 
 
 def extract_rating(signal_text: str) -> str:
+    # REVIEW is a visible no-op, NOT a Hold: parse_rating would silently
+    # fabricate Hold for an unparseable decision (#1170 spirit). Consumers
+    # (compute_orders) ignore REVIEW -- it trades nothing.
+    if signal_text and str(signal_text).strip().upper() == "REVIEW":
+        return "REVIEW"
     return parse_rating(signal_text)
 
 
@@ -638,6 +643,57 @@ def _reset_portfolio_context() -> None:
         _portfolio_cache["snap"] = None
 
 
+# --- structured-output fallback visibility (F3) ------------------------------
+#
+# When an agent's structured-output invocation fails (schema rejection,
+# malformed JSON, or a reasoning model answering in prose without calling
+# the schema tool), the framework retries once as free text and only logs a
+# warning on its own logger -- nothing ties the fallback to the ticker, and
+# nothing downstream can tell a run fell back. A logging handler on that
+# module logger routes each fallback into the per-ticker structured log.
+# The rating guard (in _propagate_with_structured_log) then ensures a
+# header-less fallback decision cannot silently pick a rating by prose-word
+# guess.
+
+_STRUCTURED_FALLBACK_HANDLER: logging.Handler | None = None
+
+
+def _reset_structured_fallback_logging() -> None:
+    """Detach the fallback handler (tests; safe to call anytime)."""
+    global _STRUCTURED_FALLBACK_HANDLER
+    if _STRUCTURED_FALLBACK_HANDLER is not None:
+        import tradingagents.agents.utils.structured as structured_mod
+        structured_mod.logger.removeHandler(_STRUCTURED_FALLBACK_HANDLER)
+        _STRUCTURED_FALLBACK_HANDLER = None
+
+
+def _ensure_structured_fallback_logging() -> None:
+    """Route the framework's structured-fallback warnings into the log."""
+    global _STRUCTURED_FALLBACK_HANDLER
+    if _STRUCTURED_FALLBACK_HANDLER is not None:
+        return
+    import structured_log
+    import tradingagents.agents.utils.structured as structured_mod
+
+    class FallbackHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:  # noqa: A003
+            try:
+                message = record.getMessage()
+                agent = str(record.args[0]) if record.args else "unknown"
+                error = str(record.args[1]) if len(record.args) > 1 else message
+                mode = ("retry"
+                        if "structured-output invocation failed" in message
+                        else "permanent")
+                structured_log.emit_structured_fallback(
+                    agent=agent, error=error, mode=mode)
+            except Exception:  # noqa: BLE001 - logging must never throw
+                pass
+
+    _STRUCTURED_FALLBACK_HANDLER = FallbackHandler()
+    _STRUCTURED_FALLBACK_HANDLER.setLevel(logging.WARNING)
+    structured_mod.logger.addHandler(_STRUCTURED_FALLBACK_HANDLER)
+
+
 def _ensure_reddit_pacing() -> None:
     """Rate-limit Reddit fetches across parallel analyze workers.
 
@@ -779,14 +835,57 @@ def _propagate_with_structured_log(ticker: str, today_str: str, cfg: dict,
     into the invoke config — that is what makes ToolNode executions (FRED,
     stock data, news tools) emit events. Constructor callbacks alone never
     reach tools. Cleared in finally so parallel workers don't cross-talk.
+
+    Rating safety (F3): propagate returns ``(state, signal)`` where the
+    signal was parsed from the PM decision text by the framework's
+    two-pass regex. Pass 1 (an explicit ``Rating:`` label) is trustworthy;
+    pass 2 (first standalone 5-tier word anywhere in prose) is a guess that
+    only ever fires when the PM fell back to free text without emitting a
+    header. When the decision has no header we force REVIEW (a visible
+    no-op) rather than let a prose word silently pick the rating.
     """
     import structured_log
     structured_log.set_active_logger(run_log)
     try:
-        _, signal = TradingAgentsGraph(config=cfg).propagate(ticker, today_str)
+        state, signal = TradingAgentsGraph(config=cfg).propagate(ticker, today_str)
+        decision = (state.get("final_trade_decision")
+                    if isinstance(state, dict) else None)
+        if isinstance(decision, str) and decision.strip() \
+                and not _header_rating(decision):
+            logger.warning(
+                "%s: PM decision has no explicit 'Rating:' header; framework "
+                "signal %r came from a prose-word scan — forcing REVIEW "
+                "(trades nothing) instead of trusting it", ticker, signal)
+            structured_log.emit_structured_fallback(
+                agent="Portfolio Manager",
+                error=(f"header-less decision; framework signal {signal!r} "
+                       "from prose-word scan; forced REVIEW"),
+                mode="rating_guard")
+            return "REVIEW"
         return extract_rating(signal)
     finally:
         structured_log.clear_active_logger()
+
+
+def _header_rating(decision: str | None) -> str | None:
+    """Explicit ``Rating:`` label only — never a prose-word guess.
+
+    Reuses the framework's label regex and vocabulary (pinned version) but
+    skips its pass-2 standalone-word scan, which misreads narrative sentences
+    (e.g. "we should not sell into weakness" -> Sell).
+    """
+    if not decision:
+        return None
+    import unicodedata
+
+    from tradingagents.agents.utils import rating as rating_mod
+
+    norm = unicodedata.normalize("NFKC", str(decision))
+    for line in norm.splitlines():
+        match = rating_mod._RATING_LABEL_RE.search(line)
+        if match and match.group(1).lower() in rating_mod._RATING_SET:
+            return match.group(1).capitalize()
+    return None
 
 
 def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
@@ -821,6 +920,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_graph_tool_callbacks()
     _ensure_news_logging()
     _ensure_fred_aliases()
+    _ensure_structured_fallback_logging()
     _ensure_portfolio_context(cfg)
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 

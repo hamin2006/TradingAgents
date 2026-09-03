@@ -42,7 +42,8 @@ decisions referenced phantom positions on a flat book.
 **Tracked separately:** `2026-09-02-phantom-portfolio-positions-fix.md`
 (tiered stance + book-shape injection design; not yet implemented).
 
-### F2 — Information is re-judged from scratch, not forwarded (HIGH)
+### F2 — Information is re-judged from scratch, not forwarded (DROPPED — intentional design)
+
 - RM sees only the debate history, NOT the four analyst reports
   (`research_manager.py:43-44`); a distortion in debate text is invisible to
   correct.
@@ -51,10 +52,24 @@ decisions referenced phantom positions on a flat book.
 - Memory lessons (`past_context`) reach only the PM
   (`portfolio_manager.py:36-41`); RM — who sets the directional
   recommendation everything follows — never sees them.
-**Our lever:** extend the phantom-fix tail-tier wrappers (5 factories) to
-also append lessons + analyst reports to RM/debator context.
 
-### F3 — Structured-output fallback is unvalidated and invisible (HIGH)
+**Disposition (2026-09-02): deliberate upstream design, not a defect.**
+Evidence: (1) the upstream README explicitly documents PM-only lesson
+injection ("injects ... lessons into the Portfolio Manager prompt"); (2) the
+RM's role contract is debate adjudication — module docstring "turns the
+bull/bear debate into a structured investment plan", prompt "critically
+evaluate this round of debate" — piping raw reports in would make the
+adversarial debate ceremonial; (3) bull/bear and the risk debators ALREADY
+see all four reports (F2's "reports into debators" premise was wrong); (4)
+upstream's evolution pattern is targeted grounding at the failing layer
+(#814 identity, #1167 trader market report), never broadcast. The original
+F2 motivation (RM escalating phantom positions from debate text) is resolved
+by the tier-1 stance injection of the phantom fix, which reaches RM's
+context at the source. Revisit only if memory-log analytics show systematic
+repeat errors at one layer — then inject narrowly at that layer.
+
+### F3 — Structured-output fallback is unvalidated and invisible (RESOLVED 2026-09-02)
+
 On any structured failure `invoke_structured_or_freetext` falls back to one
 plain invoke whose text is used as-is (`structured.py:82-89`) — no rating
 re-extraction, and no consumer can tell a run fell back. 2026-09-02: 3 of
@@ -62,9 +77,29 @@ re-extraction, and no consumer can tell a run fell back. 2026-09-02: 3 of
 extraction is then a fragile two-pass regex (`rating.py`) that can misread
 "we should not sell into weakness" as a Sell when the `**Rating**:` header is
 absent.
-**Our lever:** wrap `invoke_structured_or_freetext` at runtime to emit a
-`mode: structured|freetext` event into the structured log (observability).
-Regex robustness itself would need a framework change.
+
+**Fix (runtime, shipped 2026-09-02):**
+1. *Observability* — `daily_run._ensure_structured_fallback_logging()`
+   attaches a logging handler to the framework's `structured` module logger;
+   every fallback warning (agent + cause, retry vs permanent-freetext) is
+   routed into the per-ticker structured log as a `structured_fallback`
+   event. Fallback rate is now measurable per agent/ticker/run.
+2. *Safety guard* — structured-success output always carries the
+   `**Rating**:` header (the renderer emits it); a header-less decision can
+   only come from a freetext fallback, so `_propagate_with_structured_log`
+   now re-checks the decision text with a header-only parse
+   (`_header_rating`, reusing the framework's pinned label regex). No
+   header ⇒ the framework signal came from the prose-word pass ⇒ forced
+   `REVIEW` (visible no-op) + loud log + `structured_fallback` event
+   (`mode=rating_guard`).
+3. *Honest REVIEW* — `daily_run.extract_rating` no longer maps `REVIEW` to a
+   fabricated `Hold` (via `parse_rating` default); REVIEW passes through and
+   trades nothing (`compute_orders` no-op).
+
+**Known residual (documented):** the framework stores the memory-log tag
+inside `propagate`, before the guard, using the same prose-word parse — on a
+guard-triggered run the memory tag may carry the guessed word while orders
+skip. Rare, logged loudly; analytics caveat accepted.
 
 ### F4 — Unbounded outputs + "more detail" pressure (MED)
 Market/fundamentals prompts demand "very detailed"/"as much detail as
@@ -115,10 +150,10 @@ guard, no retry, no graph assertion.
 
 - F1: do NOT build standalone — the tiered stance/book-shape injection is
   already speced in the phantom-position fix doc.
-- F2: fold lessons/analyst-report forwarding into the same tail-tier wrapper
-  set when the phantom fix is implemented.
-- F3: wrap `invoke_structured_or_freetext` for mode observability (runtime
-  patch, ~1 event field).
+- F2: DROPPED — intentional upstream design (see F2 entry); phantom-fix
+  tier-1 stance resolves the original motivation.
+- F3: RESOLVED — fallback observability handler + header-only rating guard +
+  honest REVIEW passthrough (see F3 entry).
 - F4/F6: config levers; test on dev runs first.
 - F5/F7/F8: accepted as upstream design debt; revisit only if a fork-patch
   registry is ever established.

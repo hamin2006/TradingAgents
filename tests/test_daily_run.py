@@ -201,7 +201,125 @@ def test_ensure_fred_aliases_discloses_full_map_in_tool_description():
         daily_run._FRED_PATCHED = False
 
 
+# --- structured-output fallback visibility + safety (F3) ---------------------
+
+def test_extract_rating_passes_review_through():
+    """REVIEW must not silently become a fabricated Hold in the ratings file."""
+    import daily_run
+
+    assert daily_run.extract_rating("REVIEW") == "REVIEW"
+    assert daily_run.extract_rating("**Rating**: Buy") == "Buy"
+
+
+def test_header_rating_requires_explicit_label():
+    """A Rating: header is trustworthy; prose tier words are not."""
+    import daily_run
+
+    assert daily_run._header_rating("**Rating**: Overweight\nplan") == "Overweight"
+    assert daily_run._header_rating("Rating - **Sell**") == "Sell"
+    assert daily_run._header_rating("we should not sell into weakness") is None
+    assert daily_run._header_rating("REVIEW") is None
+    assert daily_run._header_rating("") is None
+    assert daily_run._header_rating(None) is None
+
+
+def test_propagate_reviews_headerless_pm_decision(cfg, tmp_path):
+    """A header-less PM decision (freetext fallback) must not let the
+    framework's prose-word scan pick the rating -- force REVIEW instead."""
+    import daily_run
+    import structured_log
+
+    class FakeGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return ({"final_trade_decision": "The risk is contained; "
+                                             "we should not sell into weakness."},
+                    "Sell")  # framework pass-2 prose guess
+
+    run_log = structured_log.StructuredRunLogger(
+        ticker="AAPL", today="2026-09-02", out_dir=str(tmp_path / "s"))
+    with patch("daily_run.TradingAgentsGraph", FakeGraph):
+        rating = daily_run._propagate_with_structured_log(
+            "AAPL", "2026-09-02", cfg, run_log)
+    assert rating == "REVIEW"
+    events = [json.loads(line) for line in run_log.path.read_text().strip().splitlines()]
+    fb = [e for e in events if e["type"] == "structured_fallback"]
+    assert fb and fb[-1]["mode"] == "rating_guard"
+
+
+def test_propagate_keeps_signal_when_header_present(cfg, tmp_path):
+    import daily_run
+    import structured_log
+
+    class FakeGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return ({"final_trade_decision": "**Rating**: Buy\nPlan..."}, "Buy")
+
+    run_log = structured_log.StructuredRunLogger(
+        ticker="AAPL", today="2026-09-02", out_dir=str(tmp_path / "s"))
+    with patch("daily_run.TradingAgentsGraph", FakeGraph):
+        rating = daily_run._propagate_with_structured_log(
+            "AAPL", "2026-09-02", cfg, run_log)
+    assert rating == "Buy"
+
+
+def test_propagate_keeps_signal_when_state_unavailable(cfg, tmp_path):
+    """Falsy state (legacy fake graphs) falls back to signal extraction."""
+    import daily_run
+    import structured_log
+
+    class FakeGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return None, "**Rating**: Hold"
+
+    run_log = structured_log.StructuredRunLogger(
+        ticker="AAPL", today="2026-09-02", out_dir=str(tmp_path / "s"))
+    with patch("daily_run.TradingAgentsGraph", FakeGraph):
+        rating = daily_run._propagate_with_structured_log(
+            "AAPL", "2026-09-02", cfg, run_log)
+    assert rating == "Hold"
+
+
+def test_structured_fallback_handler_emits_event(tmp_path):
+    """F3: the framework's fallback warning is captured per ticker."""
+    import logging
+
+    import daily_run
+    import structured_log
+
+    logger_mod = logging.getLogger("tradingagents.agents.utils.structured")
+    daily_run._reset_structured_fallback_logging()
+    try:
+        daily_run._ensure_structured_fallback_logging()
+        run_log = structured_log.StructuredRunLogger(
+            ticker="MRK", today="2026-09-02", out_dir=str(tmp_path / "s"))
+        structured_log.set_active_logger(run_log)
+        try:
+            logger_mod.warning(
+                "%s: structured-output invocation failed (%s); retrying once "
+                "as free text", "Research Manager",
+                "structured output returned no parsed result")
+        finally:
+            structured_log.clear_active_logger()
+    finally:
+        daily_run._reset_structured_fallback_logging()
+    events = [json.loads(line) for line in run_log.path.read_text().strip().splitlines()]
+    fb = [e for e in events if e["type"] == "structured_fallback"]
+    assert fb and fb[-1]["agent"] == "Research Manager"
+    assert "no parsed result" in fb[-1]["error"]
+    assert fb[-1]["mode"] == "retry"
+
+
 # --- portfolio-context injection (phantom-position fix) ----------------------
+
 
 def _portfolio_snap(cash=9_999.31, max_positions=10, holdings=None):
     """Build a snapshot dict in the shape _fetch_portfolio_snapshot returns."""

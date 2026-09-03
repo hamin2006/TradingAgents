@@ -210,6 +210,23 @@ class TestActiveLogger:
         tb.join()
         assert seen == {"a": "A", "b": "B"}
 
+    def test_emit_structured_fallback_event(self, logger_fx):
+        """F3: a structured-output fallback is recorded per ticker with cause."""
+        structured_log.set_active_logger(logger_fx)
+        try:
+            structured_log.emit_structured_fallback(
+                agent="Portfolio Manager",
+                error="structured output returned no parsed result",
+                mode="retry")
+        finally:
+            structured_log.clear_active_logger()
+        ev = logger_fx._read_all()[-1]
+        assert ev["type"] == "structured_fallback"
+        assert ev["agent"] == "Portfolio Manager"
+        assert ev["error"] == "structured output returned no parsed result"
+        assert ev["mode"] == "retry"
+        assert ev["ticker"] == "AAPL"
+
 
 class TestToolAttribution:
     def test_tools_node_maps_to_analyst(self, logger_fx):

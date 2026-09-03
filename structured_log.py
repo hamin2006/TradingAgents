@@ -165,6 +165,21 @@ def emit_fetch(*, source: str, agent: str, mode: str,
                        bytes=bytes, error=error)
 
 
+def emit_structured_fallback(*, agent: str, error: str,
+                             mode: str = "retry") -> None:
+    """Emit a structured_fallback event into the current thread's log.
+
+    Records when an agent's structured-output invocation failed and the
+    framework retried as free text (F3 observability), and when the rating
+    guard forces REVIEW on a header-less decision. No-op outside an analyze
+    run.
+    """
+    run_log = get_active_logger()
+    if run_log is None:
+        return
+    run_log.emit_structured_fallback(agent=agent, error=error, mode=mode)
+
+
 class StructuredRunLogger(BaseCallbackHandler):
     """LangChain callback handler writing one JSONL event per pipeline action."""
 
@@ -195,6 +210,11 @@ class StructuredRunLogger(BaseCallbackHandler):
         self._emit({"type": "fetch_end", "agent": agent, "source": source,
                     "mode": mode, "retries": retries, "latency_s": latency_s,
                     "bytes": bytes, "error": error})
+
+    def emit_structured_fallback(self, *, agent: str, error: str,
+                                 mode: str = "retry") -> None:
+        self._emit({"type": "structured_fallback", "agent": agent,
+                    "error": error, "mode": mode})
 
     def _agent_for(self, parent_run_id: UUID | None,
                    metadata: dict | None = None) -> str:
