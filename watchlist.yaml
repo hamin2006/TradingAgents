@@ -14,10 +14,8 @@ max_tokens: 12000         # output-token cap forwarded to every provider client:
 
 # Pin OpenRouter routing per model slug (multiple hosts serve the same model;
 # pin to the preferred host; fallbacks stay enabled). Unknown models route unpinned.
-# Flash is deliberately UNPINNED (2026-09-03): Relace wedged silently on
-# large-context requests (hung 20+ min, raw-API reproducible, cap did not bind);
-# unpinned routing spreads requests across healthy hosts.
 openrouter_provider_pins:
+  deepseek/deepseek-v4-flash-0731: Relace
   deepseek/deepseek-v4-pro: StreamLake
 
 capital: 10000            # paper capital (matches real paper-account cash)
