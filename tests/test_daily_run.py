@@ -391,42 +391,58 @@ def test_analyst_report_passthrough_when_present(factory_name):
     assert out[report_key] == "full report text"
 
 
-# --- reasoning capture (SDK model_extra) -------------------------------------
+# --- reasoning capture (langchain converter drops model_extra) ---------------
 
-def test_ensure_reasoning_capture_stashes_model_extra():
-    """OpenRouter puts message.reasoning in the SDK model_extra; the wrapper
-    must stash it for the structured-log handler."""
-    from openai.resources.chat.completions import Completions
+def test_ensure_reasoning_capture_keeps_reasoning_in_additional_kwargs():
+    """OpenRouter returns message.reasoning as an extra field; langchain_openai
+    1.6 reaches the SDK via with_raw_response.parse (never Completions.create)
+    and _convert_dict_to_message silently drops unknown keys, so the reasoning
+    never reached the structured log. The wrapper must patch the converter so
+    the extra key lands in additional_kwargs where _reasoning_of reads it."""
+    from langchain_openai.chat_models import base as base_mod
+
+    import daily_run
+
+    daily_run._reset_reasoning_capture()
+    daily_run._ensure_reasoning_capture()
+    try:
+        msg = base_mod._convert_dict_to_message(
+            {"role": "assistant", "content": "hello",
+             "reasoning": "deep chain of thought"})
+        assert msg.additional_kwargs["reasoning_content"] == "deep chain of thought"
+        assert base_mod._convert_dict_to_message._wrapped_original  # tagged
+    finally:
+        daily_run._reset_reasoning_capture()
+    # Unwrapped, the converter drops the unknown key again (seam is ours).
+    dropped = base_mod._convert_dict_to_message(
+        {"role": "assistant", "content": "hello", "reasoning": "trace"})
+    assert "reasoning_content" not in dropped.additional_kwargs
+
+
+def test_reasoning_capture_flows_into_llm_end_event():
+    """End to end through the real seam: converter keeps reasoning -> AIMessage
+    -> on_llm_end -> event['reasoning'] (no SDK stash involved)."""
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from langchain_openai.chat_models import base as base_mod
 
     import daily_run
     import structured_log
 
-    real_original = Completions.create
+    logger = structured_log.StructuredRunLogger(
+        ticker="AAPL", out_dir="/tmp/structlog_reasoning_test")
     daily_run._reset_reasoning_capture()
-
-    class FakeMsg:
-        model_extra = {"reasoning": "chain of thought", "other": 1}
-
-    class FakeChoice:
-        message = FakeMsg()
-
-    class FakeResp:
-        choices = [FakeChoice()]
-
-    def fake_create(self, *args, **kwargs):
-        return FakeResp()
-
-    Completions.create = fake_create
-    daily_run._REASONING_CAPTURE_PATCHED = False
+    daily_run._ensure_reasoning_capture()
     try:
-        daily_run._ensure_reasoning_capture()
-        wrapped = Completions.create
-        assert hasattr(wrapped, "_wrapped_original")
-        wrapped(None)
-        assert structured_log._pop_reasoning() == "chain of thought"
+        msg = base_mod._convert_dict_to_message(
+            {"role": "assistant", "content": "ok",
+             "reasoning": "e2e thinking trace"})
+        logger.on_llm_end(
+            ChatResult(generations=[ChatGeneration(message=msg)]),
+            run_id=__import__("uuid").uuid4())
+        ev = json.loads(logger.path.read_text(encoding="utf-8").strip().splitlines()[-1])
+        assert ev["reasoning"] == "e2e thinking trace"
     finally:
         daily_run._reset_reasoning_capture()
-        Completions.create = real_original
 
 
 # --- portfolio-context injection (phantom-position fix) ----------------------

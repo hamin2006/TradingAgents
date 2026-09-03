@@ -105,6 +105,30 @@ class TestLLMEvents:
         ev = logger_fx._read_all()[-1]
         assert ev["reasoning"] == "deep thinking trace"
 
+    def test_llm_end_records_structured_tool_calls_payload(self, logger_fx):
+        """Structured-output calls (Sentiment Analyst, Trader, RM/PM) carry
+        their real content in message.tool_calls while response text stays
+        empty — the payload must land in the event or the call is
+        content-less (live 2026-09-03: Sentiment Analyst emitted 4675 output
+        tokens, llm_end showed response '')."""
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        payload = {"action": "Buy", "confidence": 0.6,
+                   "rationale": "full 4675-token report body"}
+        msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "final_decision", "args": payload,
+                         "id": "call_1", "type": "tool_call"}],
+            response_metadata={"model_provider": "Relace",
+                               "model_name": "deepseek/deepseek-v4-flash-0731"})
+        logger_fx.on_llm_end(ChatResult(generations=[ChatGeneration(message=msg)]),
+                             run_id=_rid())
+        ev = logger_fx._read_all()[-1]
+        assert ev["response"] == ""
+        assert ev["tool_calls"][0]["name"] == "final_decision"
+        assert ev["tool_calls"][0]["args"] == payload
+
     def test_response_full_not_truncated(self, logger_fx):
         long_text = "R" * 30000
         logger_fx.on_llm_end(_fake_llm_result(text=long_text), run_id=_rid())
@@ -241,20 +265,6 @@ class TestActiveLogger:
         assert ev["error"] == "structured output returned no parsed result"
         assert ev["mode"] == "retry"
         assert ev["ticker"] == "AAPL"
-
-    def test_llm_end_uses_sdk_stashed_reasoning(self, logger_fx):
-        """LangChain drops OpenRouter's message.reasoning; the SDK-layer stash
-        must supply it to the llm_end event on the same thread."""
-        structured_log.stash_reasoning("deep secret thinking trace")
-        logger_fx.on_llm_end(_fake_llm_result(), run_id=_rid())
-        ev = logger_fx._read_all()[-1]
-        assert ev["reasoning"] == "deep secret thinking trace"
-        assert structured_log._pop_reasoning() == ""  # stash consumed once
-
-    def test_llm_error_discards_stashed_reasoning(self, logger_fx):
-        structured_log.stash_reasoning("orphan trace")
-        logger_fx.on_llm_error(RuntimeError("boom"), run_id=_rid())
-        assert structured_log._pop_reasoning() == ""
 
 
 class TestToolAttribution:

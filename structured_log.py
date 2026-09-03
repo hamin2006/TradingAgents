@@ -147,24 +147,6 @@ def clear_active_logger() -> None:
     _thread_local.run_log = None
 
 
-def stash_reasoning(text: str | None) -> None:
-    """Park the model's reasoning text for the llm_end handler on this thread.
-
-    OpenRouter returns ``message.reasoning`` in the SDK message's
-    ``model_extra``; LangChain forwards only typed extras (``refusal``) and
-    drops ``model_extra``, so the reasoning never reaches the callback
-    handler. The daily_run SDK-layer wrapper stashes it here; on_llm_end
-    picks it up in the same synchronous call stack.
-    """
-    _thread_local.reasoning = text or ""
-
-
-def _pop_reasoning() -> str:
-    value = getattr(_thread_local, "reasoning", "") or ""
-    _thread_local.reasoning = None
-    return value
-
-
 def emit_fetch(*, source: str, agent: str, mode: str,
                retries: int = 0, latency_s: float = 0.0, bytes: int = 0,
                error: str | None = None) -> None:
@@ -317,23 +299,26 @@ class StructuredRunLogger(BaseCallbackHandler):
         self._total_tokens += usage.get("input", 0) + usage.get("output", 0)
         reasoning = (_reasoning_of(msg) if gen is not None
                      and getattr(gen, "message", None) is not None else "")
-        if not reasoning:
-            reasoning = _pop_reasoning()  # SDK-layer stash (LangChain drops it)
-        self._emit({"type": "llm_end", "agent": agent,
-                    "run_id": str(run_id),
-                    "parent_run_id": str(parent_run_id) if parent_run_id else None,
-                    "model": model, "provider_used": provider,
-                    "token_usage": usage,
-                    "latency_s": round(time.monotonic() - started, 2),
-                    "finish_reason": rm.get("finish_reason"),
-                    "reasoning": reasoning,
-                    "response": text})
+        event = {"type": "llm_end", "agent": agent,
+                 "run_id": str(run_id),
+                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
+                 "model": model, "provider_used": provider,
+                 "token_usage": usage,
+                 "latency_s": round(time.monotonic() - started, 2),
+                 "finish_reason": rm.get("finish_reason"),
+                 "reasoning": reasoning,
+                 "response": text}
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            # Structured-output calls leave response text empty and put the
+            # real content (ratings, rationale) in message.tool_calls args.
+            event["tool_calls"] = tool_calls
+        self._emit(event)
 
     def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs) -> None:
         started_info = self._llm_starts.pop(str(run_id), None)
         started = started_info["t0"] if started_info else time.monotonic()
         agent = started_info["agent"] if started_info else self._agent_for(parent_run_id)
-        _pop_reasoning()  # discard any stashed reasoning for the failed call
         self._emit({"type": "error", "agent": agent,
                     "run_id": str(run_id),
                     "parent_run_id": str(parent_run_id) if parent_run_id else None,

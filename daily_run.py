@@ -775,56 +775,59 @@ def _ensure_analyst_report_recovery() -> None:
     _ANALYST_REPORT_RECOVERY_PATCHED = True
 
 
-# --- reasoning capture (LangChain drops OpenRouter message.reasoning) --------
+# --- reasoning capture (langchain drops OpenRouter message.reasoning) --------
 #
-# OpenRouter returns the model's thinking in ``message.reasoning``, which the
-# openai SDK surfaces in ``model_extra``; LangChain forwards only typed extras
-# and drops model_extra, so reasoning never reached the structured log
-# (verified live 2026-09-03: 0/19 llm_end events had reasoning, while the raw
-# API response carried it). Fix: wrap the SDK's Completions.create — the
-# response is parsed on the same thread as the subsequent llm_end callback,
-# so the reasoning is stashed thread-locally and popped by on_llm_end.
+# OpenRouter returns the model's thinking in ``message.reasoning``; the openai
+# SDK (3.x) keeps it as an extra field (extra="allow", so it survives
+# ``model_dump``). Two layers then drop it before the structured log:
+#   1. langchain_openai 1.6 reaches the SDK via
+#      ``chat.completions.with_raw_response.parse()`` — never
+#      ``Completions.create`` (the original SDK-patch seam never fired;
+#      verified live 2026-09-03: 0/300+ llm_end events had reasoning).
+#   2. ``_convert_dict_to_message`` copies only known keys into the AIMessage.
+# Fix: patch the converter so a ``reasoning``/``reasoning_content`` extra lands
+# in ``additional_kwargs["reasoning_content"]`` — the channel ``_reasoning_of``
+# already reads in structured_log's llm_end handler. No thread stash needed:
+# the AIMessage carries the reasoning straight into the callback.
 
 _REASONING_CAPTURE_PATCHED = False
 _REASONING_CAPTURE_ORIGINAL = None
 
 
 def _reset_reasoning_capture() -> None:
-    """Restore the SDK seam (tests; safe anytime)."""
+    """Restore the converter seam (tests; safe anytime)."""
     global _REASONING_CAPTURE_PATCHED, _REASONING_CAPTURE_ORIGINAL
     if _REASONING_CAPTURE_PATCHED and _REASONING_CAPTURE_ORIGINAL is not None:
-        from openai.resources.chat.completions import Completions
-        Completions.create = _REASONING_CAPTURE_ORIGINAL
+        from langchain_openai.chat_models import base as base_mod
+
+        base_mod._convert_dict_to_message = _REASONING_CAPTURE_ORIGINAL
     _REASONING_CAPTURE_PATCHED = False
     _REASONING_CAPTURE_ORIGINAL = None
 
 
 def _ensure_reasoning_capture() -> None:
-    """Stash OpenRouter reasoning (SDK model_extra) for the log handler."""
+    """Keep OpenRouter reasoning on the AIMessage for the log handler."""
     global _REASONING_CAPTURE_PATCHED, _REASONING_CAPTURE_ORIGINAL
     if _REASONING_CAPTURE_PATCHED:
         return
-    from openai.resources.chat.completions import Completions
+    from langchain_openai.chat_models import base as base_mod
 
-    import structured_log
+    original = base_mod._convert_dict_to_message
+    _REASONING_CAPTURE_ORIGINAL = original
 
-    _REASONING_CAPTURE_ORIGINAL = Completions.create
-    original = Completions.create
+    def convert_with_reasoning(_dict):
+        msg = original(_dict)
+        if getattr(msg, "type", None) == "ai" and isinstance(_dict, dict):
+            for key in ("reasoning", "reasoning_content", "thinking"):
+                value = _dict.get(key)
+                if value:
+                    msg.additional_kwargs["reasoning_content"] = (
+                        value if isinstance(value, str) else str(value))
+                    break
+        return msg
 
-    def create_with_reasoning(self, *args, **kwargs):
-        response = original(self, *args, **kwargs)
-        try:
-            choice = (response.choices or [None])[0]
-            message = getattr(choice, "message", None)
-            extra = getattr(message, "model_extra", None) or {}
-            if extra.get("reasoning"):
-                structured_log.stash_reasoning(str(extra["reasoning"]))
-        except Exception:  # noqa: BLE001 - capture must never break calls
-            pass
-        return response
-
-    create_with_reasoning._wrapped_original = original
-    Completions.create = create_with_reasoning
+    convert_with_reasoning._wrapped_original = original
+    base_mod._convert_dict_to_message = convert_with_reasoning
     _REASONING_CAPTURE_PATCHED = True
 
 
