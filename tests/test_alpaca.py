@@ -239,6 +239,77 @@ def test_gap_down_undo_failure_still_attaches_no_stop(broker):
     assert reports[0]["filled"] == 0
 
 
+def test_partial_fill_counts_and_stops_filled_qty(broker):
+    """2026-09-03 live: EL filled 8/9 in 25s but stayed `partially_filled`;
+    the old poll (counting only a `filled` status) saw filled 0, cancelled at
+    the deadline, and never attached the stop — 8 shares left naked. A
+    partial fill must count, shed the unfilled remainder, and size the stop
+    to what is actually held."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "partially_filled"
+    entry.filled_qty = "8"
+    entry.filled_avg_price = "102.0"
+    stop = MagicMock()
+    stop.id = "stop-1"
+    stop.status = "new"
+    mock_client.submit_order.side_effect = [entry, stop]
+    mock_client.get_order_by_id.return_value = entry
+    ticks = iter([100.0, 100.0, 100.0, 161.0])  # partial persists to deadline
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="EL", action="BUY", shares=9, reason="entry",
+                   protection_price=106.21, stop_price=93.06)])
+    mock_client.cancel_order_by_id.assert_called_once_with("order-1")  # remainder
+    calls = mock_client.submit_order.call_args_list
+    assert len(calls) == 2            # entry + stop
+    stop_req = calls[1][0][0]
+    assert stop_req.qty == 8          # stop sizes to the held shares
+    assert stop_req.side.value == "sell"
+    assert stop_req.type.value == "stop"
+    assert stop_req.stop_price == 93.06
+    assert reports[0] == {"ticker": "EL", "action": "BUY", "shares": 9,
+                          "filled": 8, "avg_price": 102.0}
+
+
+def test_late_fill_caught_by_grace_check(broker):
+    """2026-09-03 live: REGN filled at +59s — the last poll missed it and the
+    cancel raced the fill (order left filled with no stop attached, log said
+    0). The post-deadline grace query must see the late fill, skip the
+    cancel, and attach the stop."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "new"
+    late = MagicMock()
+    late.id = "order-1"
+    late.status = "filled"
+    late.filled_qty = "1"
+    late.filled_avg_price = "859.24"
+    stop = MagicMock()
+    stop.id = "stop-1"
+    stop.status = "new"
+    mock_client.submit_order.side_effect = [entry, stop]
+    mock_client.get_order_by_id.side_effect = [entry, entry, entry, late]
+    # deadline computation eats one monotonic tick, so 5 ticks = 3 polls + exit
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 161.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="REGN", action="BUY", shares=1, reason="entry",
+                   protection_price=894.63, stop_price=783.87)])
+    mock_client.cancel_order_by_id.assert_not_called()
+    calls = mock_client.submit_order.call_args_list
+    assert len(calls) == 2            # entry + stop; no cancel in between
+    stop_req = calls[1][0][0]
+    assert stop_req.qty == 1
+    assert stop_req.stop_price == 783.87
+    assert reports[0] == {"ticker": "REGN", "action": "BUY", "shares": 1,
+                          "filled": 1, "avg_price": 859.24}
+
+
 def test_sell_cancels_open_stops_for_symbol(broker):
     b, mock_client, _ = broker
     open_stop = MagicMock()

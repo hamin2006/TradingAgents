@@ -44,6 +44,29 @@ FILL_TIMEOUT_S = 60
 POLL_INTERVAL_S = 5
 
 
+def _filled_qty(status) -> int:
+    """Order.filled_qty is a str ('' until fills land). Only str values are
+    real (test fakes without the attribute auto-create MagicMock children,
+    whose __int__ lies and returns 1)."""
+    val = getattr(status, "filled_qty", None)
+    if not isinstance(val, str) or not val.strip():
+        return 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _filled_avg(status) -> float:
+    val = getattr(status, "filled_avg_price", None)
+    if not isinstance(val, str) or not val.strip():
+        return 0.0
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class AlpacaBroker:
     def __init__(self, cfg: dict):
         alpaca_cfg = cfg.get("alpaca", {})
@@ -144,48 +167,69 @@ class AlpacaBroker:
                 deadline = time.monotonic() + FILL_TIMEOUT_S
                 while time.monotonic() < deadline:
                     status = self._client.get_order_by_id(submitted.id)
-                    if status.status == "filled":
-                        filled = int(status.filled_qty)
-                        avg_price = float(status.filled_avg_price or 0.0)
+                    filled = _filled_qty(status)
+                    avg_price = _filled_avg(status)
+                    if status.status == "filled" or filled >= o.shares:
                         break
                     time.sleep(POLL_INTERVAL_S)
+                else:
+                    # Deadline reached with the order not fully filled: one
+                    # final query before any cancel — a fill landing just past
+                    # the last poll must not be cancelled (live 2026-09-03:
+                    # REGN filled at +59s and the cancel lost the race, leaving
+                    # the position without its stop and the log at filled 0).
+                    status = self._client.get_order_by_id(submitted.id)
+                    filled = _filled_qty(status)
+                    avg_price = _filled_avg(status)
                 if filled == 0:
                     self._client.cancel_order_by_id(submitted.id)
                     logger.warning("order for %s not filled in %ds; cancelled",
                                    o.ticker, FILL_TIMEOUT_S)
-                elif o.action == "BUY" and o.stop_price and avg_price <= o.stop_price:
-                    # Gap-down guard: the fill at/below the stop level (last
-                    # close x 0.92) means the stock gapped through the stop at
-                    # the open — the position would be dead on arrival (stop
-                    # fires immediately at a guaranteed loss). Undo the entry
-                    # with an immediate market sell; never attach the stop.
-                    logger.warning(
-                        "gap-down entry for %s: filled %.2f at/below stop %.2f; "
-                        "undoing the position", o.ticker, avg_price, o.stop_price)
-                    try:
-                        undo = MarketOrderRequest(
-                            symbol=o.ticker, qty=o.shares, side=OrderSide.SELL,
-                            type=OrderType.MARKET,
-                            time_in_force=TimeInForce.DAY, extended_hours=False,
+                else:
+                    if filled < o.shares and status.status != "filled":
+                        # Partial fill: shed the unfilled remainder so holdings
+                        # and stop qty match (the DAY limit would otherwise
+                        # keep working beyond the poll window as an unstopped
+                        # add-on).
+                        self._client.cancel_order_by_id(submitted.id)
+                        logger.info("partial fill %d/%d for %s; remainder "
+                                    "cancelled", filled, o.shares, o.ticker)
+                    if o.action == "BUY" and o.stop_price and avg_price <= o.stop_price:
+                        # Gap-down guard: the fill at/below the stop level (last
+                        # close x 0.92) means the stock gapped through the stop at
+                        # the open — the position would be dead on arrival (stop
+                        # fires immediately at a guaranteed loss). Undo the entry
+                        # with an immediate market sell; never attach the stop.
+                        logger.warning(
+                            "gap-down entry for %s: filled %.2f at/below stop %.2f; "
+                            "undoing the position", o.ticker, avg_price, o.stop_price)
+                        try:
+                            undo = MarketOrderRequest(
+                                symbol=o.ticker, qty=filled, side=OrderSide.SELL,
+                                type=OrderType.MARKET,
+                                time_in_force=TimeInForce.DAY, extended_hours=False,
+                            )
+                            self._client.submit_order(undo)
+                            filled = 0
+                        except Exception as exc:  # noqa: BLE001 - position left naked; log loudly
+                            logger.error("gap-down undo SELL failed for %s: %s "
+                                         "(position left without a stop!)", o.ticker, exc)
+                            filled = 0
+                    elif o.action == "BUY" and o.stop_price:
+                        # Two-step: attach the GTC stop-loss only once the entry
+                        # filled, so the position is protected 24/7 between runs.
+                        # Sized to the FILLED qty — never the intended qty (a
+                        # partial fill must not over-size the stop).
+                        stop_request = StopOrderRequest(
+                            symbol=o.ticker, qty=filled, side=OrderSide.SELL,
+                            type=OrderType.STOP, stop_price=o.stop_price,
+                            time_in_force=TimeInForce.GTC, extended_hours=False,
                         )
-                        self._client.submit_order(undo)
-                        filled = 0
-                    except Exception as exc:  # noqa: BLE001 - position left naked; log loudly
-                        logger.error("gap-down undo SELL failed for %s: %s "
-                                     "(position left without a stop!)", o.ticker, exc)
-                        filled = 0
-                elif o.action == "BUY" and o.stop_price:
-                    # Two-step: attach the GTC stop-loss only once the entry
-                    # filled, so the position is protected 24/7 between runs.
-                    stop_request = StopOrderRequest(
-                        symbol=o.ticker, qty=o.shares, side=OrderSide.SELL,
-                        type=OrderType.STOP, stop_price=o.stop_price,
-                        time_in_force=TimeInForce.GTC, extended_hours=False,
-                    )
-                    self._client.submit_order(stop_request)
-                    logger.info("attached GTC stop %s for %s", o.stop_price, o.ticker)
-                elif o.action == "SELL":
-                    self._cancel_open_stops(o.ticker)
+                        self._client.submit_order(stop_request)
+                        logger.info("attached GTC stop %s for %s (%d shares)",
+                                    o.stop_price, o.ticker, filled)
+                    elif o.action == "SELL":
+                        self._cancel_open_stops(o.ticker)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
             reports.append({"ticker": o.ticker, "action": o.action,
