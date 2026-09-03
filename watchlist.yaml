@@ -5,12 +5,18 @@ llm_provider: openrouter
 quick_think_llm: deepseek/deepseek-v4-flash-0731   # dated snapshot, cheaper prompt pricing
 deep_think_llm: deepseek/deepseek-v4-pro
 output_language: English
-max_tokens: null            # unused; tracks upstream config surface so merges stay clean
+max_tokens: 30000         # output-token cap forwarded to every provider client:
+                          # bounds deepseek-v4-flash unbounded-reasoning hangs
+                          # (upstream #1204; observed live 2026-09-03 00:xx ET —
+                          # market-analyst call stalled 20+ min with no cap).
+                          # Largest legit output seen: 17.6K tokens (30K = headroom).
 
 # Pin OpenRouter routing per model slug (multiple hosts serve the same model;
 # pin to the preferred host; fallbacks stay enabled). Unknown models route unpinned.
+# Flash is deliberately UNPINNED (2026-09-03): Relace wedged silently on
+# large-context requests (hung 20+ min, raw-API reproducible, cap did not bind);
+# unpinned routing spreads requests across healthy hosts.
 openrouter_provider_pins:
-  deepseek/deepseek-v4-flash-0731: Relace
   deepseek/deepseek-v4-pro: StreamLake
 
 capital: 10000            # paper capital (matches real paper-account cash)
