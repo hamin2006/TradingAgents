@@ -130,11 +130,24 @@ temperature (`setup.py:83-91`); debates are exactly 2 and 3 speeches with
 **Our lever:** both are upstream config keys our merge layer can override —
 bump rounds to 2 on a dev run and measure quality/latency before production.
 
-### F7 — Report capture can silently drop content (MED)
+### F7 — Report capture can silently drop content (RESOLVED 2026-09-02)
+
 Analysts persist their report only when the final message has zero tool_calls
-(`market_analyst.py:87-88` etc.); a message mixing text + tool call yields an
-empty report, which then flows downstream as an empty context section — no
-guard, no retry, no graph assertion.
+(`market_analyst.py:87-88` etc.). **Corrected mechanics** (investigated
+2026-09-02): the router exits the analyst loop only on a zero-tool-call
+message, so mid-loop mixed text+tool-call messages do NOT lose the final
+report — the genuine loss case is a final message with EMPTY content, where
+substantive analysis the model wrote in earlier turns (messages that also
+carried tool calls) vanishes: the clear node wipes the history and
+bull/bear/debators never see it.
+
+**Fix (runtime, shipped 2026-09-02):**
+`daily_run._ensure_analyst_report_recovery()` wraps the three tool-loop
+analyst factories (market/news/fundamentals); when the returned report is
+empty, it rebuilds it from the analyst's own accumulated AIMessage content
+in the state history (tool results excluded) before the clear node runs.
+Non-empty reports pass through untouched. Sentiment analyst untouched
+(structured render, no tool loop).
 
 ### F8 — Minor (LOW)
 - Inconsistent prompt API shapes (raw strings / message lists /
@@ -155,7 +168,8 @@ guard, no retry, no graph assertion.
 - F3: RESOLVED — fallback observability handler + header-only rating guard +
   honest REVIEW passthrough (see F3 entry).
 - F4/F6: config levers; test on dev runs first.
-- F5/F7/F8: accepted as upstream design debt; revisit only if a fork-patch
+- F7: RESOLVED — analyst report recovery wrapper (see F7 entry).
+- F5/F8: accepted as upstream design debt; revisit only if a fork-patch
   registry is ever established.
 
 ## 5. Reference

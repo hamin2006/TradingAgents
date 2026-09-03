@@ -694,6 +694,99 @@ def _ensure_structured_fallback_logging() -> None:
     structured_mod.logger.addHandler(_STRUCTURED_FALLBACK_HANDLER)
 
 
+# --- analyst report recovery (F7) --------------------------------------------
+#
+# The tool-loop analysts (market/news/fundamentals) capture their report only
+# from the CURRENT message's content when it has zero tool calls
+# (e.g. market_analyst.py:87-88). The router exits the loop only on a
+# zero-tool-call message, so the normal path is fine -- but when the model's
+# final message has EMPTY content, the report is empty and any substantive
+# analysis the analyst wrote in earlier turns (messages that also carried
+# tool calls) is lost downstream: the clear node wipes the history and
+# bull/bear/debators never see it. Runtime fix: wrap the three analyst
+# factories; when the returned report is empty, rebuild it from the
+# analyst's own accumulated AIMessage content (tool results stay out).
+
+_ANALYST_REPORT_RECOVERY_PATCHED = False
+_ANALYST_REPORT_RECOVERY_ORIGINALS: dict = {}
+
+_ANALYST_REPORT_KEYS = {
+    "create_market_analyst": "market_report",
+    "create_news_analyst": "news_report",
+    "create_fundamentals_analyst": "fundamentals_report",
+}
+
+
+def _content_to_text(content) -> str:
+    """Render a message payload to text (strings pass through; content-block
+    lists join their text blocks)."""
+    if content is None:
+        return ""
+    if not isinstance(content, list):
+        return str(content)
+    bits = []
+    for block in content:
+        if isinstance(block, dict):
+            bits.append(str(block.get("text", "") or block))
+        else:
+            bits.append(str(block))
+    return "\n".join(b for b in bits if b)
+
+
+def _ensure_analyst_report_recovery() -> None:
+    """Wrap the 3 tool-loop analyst factories to rebuild empty reports from
+    the analyst's own stranded message text (idempotent, revertible)."""
+    global _ANALYST_REPORT_RECOVERY_PATCHED
+    if _ANALYST_REPORT_RECOVERY_PATCHED:
+        return
+    import tradingagents.graph.setup as setup_mod
+
+    for factory_name, report_key in _ANALYST_REPORT_KEYS.items():
+        original_factory = getattr(setup_mod, factory_name)
+
+        def wrapped_factory(llm, _key=report_key, _orig=original_factory):
+            node = _orig(llm)
+
+            def node_with_recovery(state):
+                out = node(state)
+                report = out.get(_key)
+                if report is None or (isinstance(report, str)
+                                      and not report.strip()):
+                    texts = []
+                    for msg in state.get("messages") or []:
+                        if getattr(msg, "type", "") == "ai":
+                            text = _content_to_text(getattr(msg, "content", None))
+                            if text.strip():
+                                texts.append(text.strip())
+                    for msg in out.get("messages") or []:
+                        text = _content_to_text(getattr(msg, "content", None))
+                        if text.strip():
+                            texts.append(text.strip())
+                    if texts:
+                        out = {**out, _key: "\n\n".join(texts)}
+                return out
+
+            node_with_recovery._wrapped_original = node
+            return node_with_recovery
+
+        wrapped_factory._wrapped_original = original_factory
+        setattr(setup_mod, factory_name, wrapped_factory)
+        _ANALYST_REPORT_RECOVERY_ORIGINALS[factory_name] = original_factory
+    _ANALYST_REPORT_RECOVERY_PATCHED = True
+
+
+def _reset_analyst_report_recovery() -> None:
+    """Restore the analyst factory seams (tests; safe anytime)."""
+    global _ANALYST_REPORT_RECOVERY_PATCHED
+    if _ANALYST_REPORT_RECOVERY_PATCHED:
+        import tradingagents.graph.setup as setup_mod
+
+        for name, original in _ANALYST_REPORT_RECOVERY_ORIGINALS.items():
+            setattr(setup_mod, name, original)
+        _ANALYST_REPORT_RECOVERY_ORIGINALS.clear()
+        _ANALYST_REPORT_RECOVERY_PATCHED = False
+
+
 def _ensure_reddit_pacing() -> None:
     """Rate-limit Reddit fetches across parallel analyze workers.
 
@@ -921,6 +1014,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_news_logging()
     _ensure_fred_aliases()
     _ensure_structured_fallback_logging()
+    _ensure_analyst_report_recovery()
     _ensure_portfolio_context(cfg)
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 

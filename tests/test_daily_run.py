@@ -318,6 +318,79 @@ def test_structured_fallback_handler_emits_event(tmp_path):
     assert fb[-1]["mode"] == "retry"
 
 
+# --- analyst report recovery (F7) --------------------------------------------
+
+@pytest.mark.parametrize("factory_name", [
+    "create_market_analyst", "create_news_analyst", "create_fundamentals_analyst",
+])
+def test_analyst_report_rebuilt_from_stranded_history(factory_name):
+    """F7: an empty final report is rebuilt from the analyst's own earlier
+    prose (mixed text+tool-call turns) before the clear node wipes it."""
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    report_key = daily_run._ANALYST_REPORT_KEYS[factory_name]
+    original_factory = getattr(setup_mod, factory_name)
+    history = [
+        AIMessage(content="Margins are eroding ~40bps a quarter; guide down "
+                          "implies more pressure ahead."),
+        ToolMessage(content="<csv table>", tool_call_id="t1", name="get_indicators"),
+        AIMessage(content="Let me double-check the cash flow statement before "
+                          "concluding."),
+    ]
+
+    def fake_node(state):
+        return {"messages": [AIMessage(content="")], report_key: ""}
+
+    daily_run._reset_analyst_report_recovery()
+    daily_run._ANALYST_REPORT_RECOVERY_PATCHED = False
+    setattr(setup_mod, factory_name, lambda llm: fake_node)
+    try:
+        daily_run._ensure_analyst_report_recovery()
+        node = getattr(setup_mod, factory_name)(None)
+        out = node({"messages": history})
+    finally:
+        daily_run._reset_analyst_report_recovery()
+        setattr(setup_mod, factory_name, original_factory)
+    rebuilt = out[report_key]
+    assert "Margins are eroding" in rebuilt
+    assert "double-check the cash flow" in rebuilt
+    assert "csv table" not in rebuilt  # tool outputs stay out of the report
+    assert "<" not in rebuilt
+
+
+@pytest.mark.parametrize("factory_name", [
+    "create_market_analyst", "create_news_analyst", "create_fundamentals_analyst",
+])
+def test_analyst_report_passthrough_when_present(factory_name):
+    """A captured report is never touched."""
+    from langchain_core.messages import AIMessage
+
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    report_key = daily_run._ANALYST_REPORT_KEYS[factory_name]
+    original_factory = getattr(setup_mod, factory_name)
+
+    def fake_node(state):
+        return {"messages": [AIMessage(content="full report text")],
+                report_key: "full report text"}
+
+    daily_run._reset_analyst_report_recovery()
+    daily_run._ANALYST_REPORT_RECOVERY_PATCHED = False
+    setattr(setup_mod, factory_name, lambda llm: fake_node)
+    try:
+        daily_run._ensure_analyst_report_recovery()
+        node = getattr(setup_mod, factory_name)(None)
+        out = node({"messages": [AIMessage(content="stale prose")]})
+    finally:
+        daily_run._reset_analyst_report_recovery()
+        setattr(setup_mod, factory_name, original_factory)
+    assert out[report_key] == "full report text"
+
+
 # --- portfolio-context injection (phantom-position fix) ----------------------
 
 
@@ -519,18 +592,27 @@ def test_book_shape_reaches_tail_node_prompt(cfg, factory_name):
 
 
 def test_evidence_stages_are_not_wrapped(cfg):
-    """Analysts/researchers/trader see stance only -- never the book shape."""
+    """Stance/shape/recovery wrap the right layers and nothing else."""
     import daily_run
     import tradingagents.graph.setup as setup_mod
 
+    daily_run._reset_analyst_report_recovery()
+    daily_run._reset_portfolio_context()
     with _install_portfolio_context(daily_run, cfg, _portfolio_snap(holdings={})):
-        for name in ("create_market_analyst", "create_sentiment_analyst",
-                     "create_news_analyst", "create_fundamentals_analyst",
-                     "create_bull_researcher", "create_bear_researcher",
-                     "create_trader"):
-            assert not hasattr(getattr(setup_mod, name), "_wrapped_original"), name
-        for name in daily_run._TAIL_FACTORY_NAMES:
-            assert hasattr(getattr(setup_mod, name), "_wrapped_original"), name
+        daily_run._ANALYST_REPORT_RECOVERY_PATCHED = False
+        daily_run._ensure_analyst_report_recovery()
+        try:
+            for name in ("create_sentiment_analyst",
+                         "create_bull_researcher", "create_bear_researcher",
+                         "create_trader"):
+                assert not hasattr(getattr(setup_mod, name), "_wrapped_original"), name
+            for name in ("create_market_analyst", "create_news_analyst",
+                         "create_fundamentals_analyst"):
+                assert hasattr(getattr(setup_mod, name), "_wrapped_original"), name
+            for name in daily_run._TAIL_FACTORY_NAMES:
+                assert hasattr(getattr(setup_mod, name), "_wrapped_original"), name
+        finally:
+            daily_run._reset_analyst_report_recovery()
 
 
 def test_broker_failure_skips_injection(cfg):
