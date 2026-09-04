@@ -328,3 +328,23 @@ def test_sell_cancels_open_stops_for_symbol(broker):
         b.place_market_orders(
             [Order(ticker="TSLA", action="SELL", shares=40, reason="rating exit")])
     mock_client.cancel_order_by_id.assert_called_with("stop-1")
+
+
+def test_cancel_stops_for_only_requests_listed_symbols(broker):
+    """The pre-open exit guard: resting GTC stops on SELL-bound symbols must
+    be cancelled BEFORE the open (a stop and a same-size market sell both
+    live at the 09:30 auction could double-sell into a short). Other
+    symbols' stops are untouched."""
+    b, mock_client, _ = broker
+    el_stop = MagicMock()
+    el_stop.symbol = "EL"
+    el_stop.type = "stop"
+    el_stop.id = "stop-el"
+    regn_stop = MagicMock()
+    regn_stop.symbol = "REGN"
+    regn_stop.type = "stop"
+    regn_stop.id = "stop-regn"
+    mock_client.get_orders.return_value = [el_stop, regn_stop]
+    b.cancel_stops_for(["EL"])
+    cancelled = [c.args[0] for c in mock_client.cancel_order_by_id.call_args_list]
+    assert cancelled == ["stop-el"]

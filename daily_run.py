@@ -1365,11 +1365,8 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
     # Orders are submitted AT the open and then polled for fills (60s). A fill
     # can't happen before 09:30 ET, so a pre-open run must wait: submitting
     # early and polling would time out and cancel a perfectly valid order.
-    # Dry-runs never wait (they're previews).
-    wait = _seconds_until_open()
-    if wait > 0 and not dry_run:
-        logger.info("market opens in %.0fs; waiting before placing orders", wait)
-        time.sleep(wait)
+    # Dry-runs never wait (they're previews). The wait happens AFTER orders
+    # are computed so exits can disarm their resting stops pre-open.
 
     payload = json.loads(ratings_path.read_text(encoding="utf-8"))
     broker = create_broker(cfg)
@@ -1409,6 +1406,21 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 logger.warning("regime STRESS: suppressing %d new buy order(s); "
                                "exit orders only", len(buys))
             orders = [o for o in orders if o.action == "SELL"]
+
+        # Exit guard: disarm resting GTC stops on SELL-bound symbols BEFORE
+        # the open. With both the stop and the market sell live at the 09:30
+        # auction, a gap through the stop level could double-sell the
+        # position into an unintended short (EL-class exit, 2026-09-04).
+        sells = [o.ticker for o in orders if o.action == "SELL"]
+        if sells and hasattr(broker, "cancel_stops_for") and not dry_run:
+            logger.info("cancelling stops before the open for exit(s): %s",
+                        ", ".join(sells))
+            broker.cancel_stops_for(sells)
+
+        wait = _seconds_until_open()
+        if wait > 0 and not dry_run:
+            logger.info("market opens in %.0fs; waiting before placing orders", wait)
+            time.sleep(wait)
 
         # Two-phase execution log: write the "submitted" mark BEFORE placing
         # orders so a crash mid-submit can never double-execute on rerun

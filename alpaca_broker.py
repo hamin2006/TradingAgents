@@ -237,6 +237,17 @@ class AlpacaBroker:
                             "avg_price": round(float(avg_price), 4)})
         return reports
 
+    def cancel_stops_for(self, tickers: list[str]) -> None:
+        """Cancel resting GTC stops for symbols being sold (exit guard).
+
+        Called by the execute pass BEFORE the market opens: if a rating exit
+        sells at the open while its stop is still resting, a gap through the
+        stop level could fill BOTH orders at the auction (stop + market
+        sell) and double-sell the position into an unintended short.
+        """
+        for ticker in tickers:
+            self._cancel_open_stops(ticker)
+
     def _cancel_open_stops(self, symbol: str) -> None:
         """Cancel leftover stop orders for a symbol after a rating exit."""
         try:
