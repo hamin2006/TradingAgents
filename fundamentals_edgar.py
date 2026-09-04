@@ -34,7 +34,8 @@ _REVENUE_TAGS = ["RevenueFromContractWithCustomerExcludingAssessedTax",
 _GP_TAGS = ["GrossProfit"]
 _OPINC_TAGS = ["OperatingIncomeLoss"]
 _NI_TAGS = ["NetIncomeLoss"]
-_CFO_TAGS = ["NetCashProvidedByUsedInOperatingActivities"]
+_CFO_TAGS = ["NetCashProvidedByUsedInOperatingActivities",
+             "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"]
 _CAPEX_TAGS = ["PaymentsToAcquirePropertyPlantAndEquipment"]
 _BUYBACK_TAGS = ["PaymentsForRepurchaseOfCommonStock",
                  "PaymentsForRepurchaseOfCommonStock1"]

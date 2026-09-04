@@ -167,8 +167,8 @@ def events_block(ticker: str, since: str | None = None) -> str:
                         xml = edgar._http_get(_form4_url(
                             cik_num, filing["accession_number"]))
                         rendered = _render_trades(parse_form4(xml.decode()))
-                        if rendered:
-                            lines.append(f"{filing['filing_date']} {rendered}")
+                        for line in rendered.splitlines():
+                            lines.append(f"{filing['filing_date']} {line}")
                     except Exception:  # noqa: BLE001 - skip one bad filing
                         continue
                 elif filing["form"] == "8-K":

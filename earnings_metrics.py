@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import re
 import threading
 
 import edgar
+
+logger = logging.getLogger(__name__)
 
 _EARNINGS_WINDOW_DAYS = 180
 _ARCHIVES = "https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/{name}"
@@ -118,13 +121,16 @@ def _call_extract_llm(text: str, filing_date: str) -> dict:
         base_url=os.environ.get("OPENROUTER_BASE_URL",
                                 "https://openrouter.ai/api/v1"),
         max_tokens=int(os.environ.get("EDGAR_EXTRACT_MAX_TOKENS", "1200")),
-        temperature=0.0, timeout=180)
+        temperature=0.0, timeout=int(os.environ.get("EDGAR_EXTRACT_TIMEOUT_S", "300")))
     prompt = (
         f"This is the earnings release of a company filed on {filing_date}.\n"
         "Extract from the RELEASE's own words only: the reporting period, "
         "reported quarterly revenue, reported quarterly EPS, and any explicit "
-        "forward guidance sentence. Leave fields empty when the release does "
-        "not state them. Do not invent numbers.\n\nRelease text:\n" + text[:45000])
+        "forward guidance. For guidance, quote the SPECIFIC figures if present "
+        "(e.g. \"FY26 revenue growth ~10%, GAAP EPS $45-$47\") in one short "
+        "sentence; if the release only restates boilerplate without figures, "
+        "leave guidance empty. Do not invent numbers.\n\nRelease text:\n"
+        + text[:45000])
     out = llm.with_structured_output(Metrics).invoke(prompt)
     return {"period": out.period or "", "revenue": out.revenue or "",
             "eps": out.eps or "", "guidance": out.guidance or ""}
@@ -158,5 +164,6 @@ def earnings_line(ticker: str) -> str:
         if cached.get("guidance"):
             parts.append(f"Guidance: {cached['guidance']}")
         return "Latest " + "; ".join(parts) + "."
-    except Exception:  # noqa: BLE001 - context decoration never breaks runs
+    except Exception as exc:  # noqa: BLE001 - context decoration never breaks runs
+        logger.warning("earnings_line failed for %s: %s", ticker, exc)
         return ""
