@@ -23,6 +23,7 @@ Credentials: ALPACA_API_KEY / ALPACA_SECRET_KEY env vars (secrets never live
 in watchlist.yaml). ``cfg["alpaca"]["paper"]`` defaults to True.
 """
 
+import contextlib
 import logging
 import os
 import time
@@ -151,6 +152,11 @@ class AlpacaBroker:
                                 "shares": o.shares, "filled": 0, "avg_price": 0.0})
             return reports
 
+        # Phase 1: submit EVERY order before polling any. Sequential
+        # submit+poll per order let each full poll window delay the next
+        # order (live 2026-09-04: NOW was submitted 4.5 minutes after EL);
+        # submitting together queues them all at the open simultaneously.
+        submissions = []  # (order, submitted | None, submit_error | None)
         for o in orders:
             side = OrderSide.BUY if o.action == "BUY" else OrderSide.SELL
             if o.action == "BUY" and o.protection_price:
@@ -167,17 +173,48 @@ class AlpacaBroker:
                     type=OrderType.MARKET,
                     time_in_force=TimeInForce.DAY, extended_hours=False,
                 )
-            filled = 0
-            avg_price = 0.0
             try:
                 submitted = self._client.submit_order(request)
-                status = self._poll_until_filled(submitted, o)
-                filled = _filled_qty(status)
-                avg_price = _filled_avg(status)
+                submissions.append((o, submitted, None))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("order submission failed for %s: %s", o.ticker, exc)
+                submissions.append((o, None, exc))
+
+        # Phase 2: poll every outstanding order in one shared round-robin
+        # loop. Wall time tracks the SLOWEST fill (paper engine: 30-70s),
+        # not the sum of all fills.
+        final = self._poll_all_concurrently(
+            [(o, s) for o, s, _ in submissions if s is not None])
+
+        # Phase 3: finalize each order (cancel/shed/gap-down/stop) in the
+        # original order so reports keep the caller's sequence.
+        for o, submitted, exc in submissions:
+            if submitted is None:
+                reports.append({"ticker": o.ticker, "action": o.action,
+                                "shares": o.shares, "filled": 0, "avg_price": 0.0})
+                continue
+            status = final[submitted.id]
+            filled = _filled_qty(status)
+            avg_price = _filled_avg(status)
+            try:
                 if filled == 0:
-                    self._client.cancel_order_by_id(submitted.id)
-                    logger.warning("order for %s not filled in %ds; cancelled",
-                                   o.ticker, FILL_TIMEOUT_S)
+                    # Only reached after the main window + grace requeries.
+                    # A cancel exception means the cancel raced a late fill
+                    # (the 2026-09-03/04 failure class): requery before
+                    # giving up, so a filled order is never reported at 0
+                    # and left without its stop.
+                    try:
+                        self._client.cancel_order_by_id(submitted.id)
+                        logger.warning("order for %s not filled in %ds; cancelled",
+                                       o.ticker, FILL_TIMEOUT_S)
+                    except Exception as cancel_exc:  # noqa: BLE001
+                        with contextlib.suppress(Exception):
+                            status = self._client.get_order_by_id(submitted.id)
+                        filled = _filled_qty(status)
+                        avg_price = _filled_avg(status)
+                        if filled == 0:
+                            logger.error("cancel failed for %s: %s "
+                                         "(fill status unknown)", o.ticker, cancel_exc)
                 else:
                     if filled < o.shares and status.status != "filled":
                         # Partial fill: shed the unfilled remainder so holdings
@@ -208,7 +245,7 @@ class AlpacaBroker:
                             logger.error("gap-down undo SELL failed for %s: %s "
                                          "(position left without a stop!)", o.ticker, exc)
                             filled = 0
-                    elif o.action == "BUY" and o.stop_price:
+                    elif o.action == "BUY" and o.stop_price and filled > 0:
                         # Two-step: attach the GTC stop-loss only once the entry
                         # filled, so the position is protected 24/7 between runs.
                         # Sized to the FILLED qty — never the intended qty (a
@@ -221,7 +258,7 @@ class AlpacaBroker:
                         self._client.submit_order(stop_request)
                         logger.info("attached GTC stop %s for %s (%d shares)",
                                     o.stop_price, o.ticker, filled)
-                    elif o.action == "SELL":
+                    elif o.action == "SELL" and filled > 0:
                         self._cancel_open_stops(o.ticker)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
@@ -230,30 +267,51 @@ class AlpacaBroker:
                             "avg_price": round(float(avg_price), 4)})
         return reports
 
-    def _poll_until_filled(self, submitted, order) -> object:
-        """Poll an order until it fills or the deadline + grace window passes.
+    def _poll_all_concurrently(self, submissions) -> dict[str, object]:
+        """Poll every outstanding order together, round-robin, until each
+        fills or the main window + grace requeries elapse.
 
-        The Alpaca PAPER engine queues open-window orders and fills them with
-        30-70s latency; a single 60s window with one last query cancelled
-        fills mid-race (live: REGN +59s 2026-09-03; EL/DASH/DXCM ~+60s
-        2026-09-04 — three orders cancelled just before their fills landed,
-        EL left naked because its exit had pre-disarmed the stop). Never
-        cancels here: returns the last status object for the caller's
-        filled==0 decision, which now happens only after the grace requeries.
+        Submission order skew is sub-second, so one shared deadline from
+        right after the last submit gives every order its full window.
+        Wall time ~= latency of the slowest fill (~60-150s for the whole
+        batch), not the sum. Never cancels here: returns the last known
+        status per order id; the caller cancels/sheds/attaches afterwards.
+        Per-round fetch errors (429 throttling etc.) keep the last known
+        status and try again next round — Alpaca does not publish fixed
+        limits; the contract is 429 + X-RateLimit headers, and sandbox
+        limits are lower than production (worst case here: <=10 orders /
+        5s round ≈ 120 req/min).
         """
+        by_id = {s.id: (o, s, s) for o, s in submissions}
         deadline = time.monotonic() + FILL_TIMEOUT_S
-        status = submitted
-        while time.monotonic() < deadline:
-            status = self._client.get_order_by_id(submitted.id)
-            if status.status == "filled" or _filled_qty(status) >= order.shares:
-                break
+
+        def outstanding() -> dict:
+            return {oid: v for oid, v in by_id.items()
+                    if not (v[2].status == "filled"
+                            or _filled_qty(v[2]) >= v[0].shares)}
+
+        while outstanding() and time.monotonic() < deadline:
+            for oid, (o, s, _last) in outstanding().items():
+                try:
+                    by_id[oid] = (o, s, self._client.get_order_by_id(oid))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("fill poll failed for %s (%s); retrying next round",
+                                   o.ticker, exc)
             time.sleep(POLL_INTERVAL_S)
+
         for _ in range(FILL_GRACE_REQUERIES):
-            if status.status == "filled" or _filled_qty(status) >= order.shares:
+            pend = outstanding()
+            if not pend:
                 break
             time.sleep(FILL_GRACE_INTERVAL_S)
-            status = self._client.get_order_by_id(submitted.id)
-        return status
+            for oid, (o, s, _last) in pend.items():
+                try:
+                    by_id[oid] = (o, s, self._client.get_order_by_id(oid))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("grace fill poll failed for %s (%s)",
+                                   o.ticker, exc)
+
+        return {oid: last for oid, (_o, _s, last) in by_id.items()}
 
     def cancel_stops_for(self, tickers: list[str]) -> None:
         """Cancel resting GTC stops for symbols being sold (exit guard).

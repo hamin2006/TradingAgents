@@ -405,3 +405,54 @@ def test_cancel_stops_for_only_requests_listed_symbols(broker):
     b.cancel_stops_for(["EL"])
     cancelled = [c.args[0] for c in mock_client.cancel_order_by_id.call_args_list]
     assert cancelled == ["stop-el"]
+
+
+def test_multi_order_submitted_then_polled_concurrently(broker):
+    """2026-09-04: sequential submit+poll per order let each full poll window
+    delay the next — NOW was submitted 4.5 minutes after EL. All orders must
+    be submitted FIRST, then polled round-robin in the same rounds, so wall
+    time tracks the slowest fill, not the sum."""
+    b, mock_client, _ = broker
+    order_a = MagicMock()
+    order_a.id = "ord-A"
+    order_a.status = "new"
+    order_b = MagicMock()
+    order_b.id = "ord-B"
+    order_b.status = "new"
+    mock_client.submit_order.side_effect = [order_a, order_b]
+    new_a = MagicMock(status="new", filled_qty="", filled_avg_price="")
+    filled_a = MagicMock(status="filled", filled_qty="3",
+                         filled_avg_price="214.85")
+    new_b = MagicMock(status="new", filled_qty="", filled_avg_price="")
+    seq = {"ord-A": [new_a, new_a, filled_a],
+           "ord-B": [new_b, new_b, new_b, new_b, new_b, new_b]}
+    mock_client.get_order_by_id.side_effect = lambda oid: seq[oid].pop(0)
+    ticks = iter([100.0, 100.0, 100.0, 250.0])  # deadline 220; 2 main rounds
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders([
+            Order(ticker="DASH", action="BUY", shares=3, reason="entry",
+                  protection_price=233.1, stop_price=204.24),
+            Order(ticker="DXCM", action="BUY", shares=9, reason="entry",
+                  protection_price=94.2, stop_price=82.53)])
+
+    # Both entries submitted before any polling began.
+    submit_calls = [c[0][0].symbol for c in mock_client.submit_order.call_args_list]
+    assert submit_calls[:2] == ["DASH", "DXCM"]
+
+    # Round-robin: both order ids fetched within the same first round.
+    poll_ids = [c.args[0] for c in mock_client.get_order_by_id.call_args_list]
+    assert poll_ids[0] in ("ord-A", "ord-B")
+    assert set(poll_ids[:2]) == {"ord-A", "ord-B"}
+
+    # A filled at the grace requery -> kept + stop attached. B never filled
+    # -> cancelled once (the grace requeries all ran before any cancel).
+    stop_reqs = [c[0][0] for c in mock_client.submit_order.call_args_list
+                 if c[0][0].type.value == "stop"]
+    assert len(stop_reqs) == 1
+    assert stop_reqs[0].qty == 3
+    assert stop_reqs[0].stop_price == 204.24
+    mock_client.cancel_order_by_id.assert_called_once_with("ord-B")
+    assert reports[0] == {"ticker": "DASH", "action": "BUY", "shares": 3,
+                          "filled": 3, "avg_price": 214.85}
+    assert reports[1]["filled"] == 0
