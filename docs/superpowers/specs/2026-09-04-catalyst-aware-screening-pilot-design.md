@@ -1,12 +1,13 @@
 # Catalyst-Aware Screening Pilot (2026-09-04)
 
-Status: **Gate PASSED (ADOPT) 2026-09-04** — design approved; backtest go/no-go
-executed (6y crash-in-sample, `burst_gate.py`, report `docs/research/burst-gate-results.md`):
-union(4/6) continues (+0.10% 5d / +0.48% 10d mean alpha, n=32,164) but **the signal is
-entirely post-2023** (pre-2023 incl. the 2022 crash mean-reverts); adoption rests on the
-regime-gate pairing (STRESS suppresses buys in exactly the failing era) + the
-`--by-surfacing` analytics stop condition. Thresholds stay provisional 4/6. Next step:
-implementation plan.
+Status: **GATE EXECUTED 2026-09-04 — DEFERRED (user decision)** — design approved;
+backtest go/no-go executed (6y crash-in-sample, `burst_gate.py`, full report
+`docs/research/burst-gate-results.md`): union(4/6) continues (+0.10% 5d / +0.48% 10d
+mean alpha, n=32,164) but **the signal is entirely post-2023** (pre-2023 incl. the 2022
+crash mean-reverts, t5d −2.52). User's read: the price evidence is too weak to justify
+building on its own; the gate's value was the measured answer, not a green light. **Do
+not build unprompted; revisit later** (e.g., alongside PM-execution machinery or with a
+better catalyst feed). Thresholds stay provisional 4/6. Findings embedded in §4.4.
 
 ## 1. Problem
 
@@ -158,6 +159,47 @@ Verdict rules:
 
 The gate is a script run against local CSVs — no network, no LLM, no broker; it can run
 in dev days before any other implementation.
+
+#### Gate results (executed 2026-09-04)
+
+Data: `backtest_prices_y6.csv` (2020-08-31 .. 2026-08-28, 1506 sessions × 500 tickers).
+Baseline: same-session cross-sectional mean forward return (S&P universe).
+
+| Rule | n | alpha 1d % | alpha 3d % | alpha 5d % | alpha 10d % | pos 5d % | pos 10d % | t 5d | t 10d |
+|---|---|---|---|---|---|---|---|---|---|
+| 1d rule >= 3% | 42694 | +0.05 | +0.03 | +0.09 | +0.33 | 49.2 | 49.2 | +2.90 | +8.26 |
+| 1d rule >= 4% | 21838 | +0.09 | +0.03 | +0.09 | +0.48 | 48.6 | 49.7 | +1.84 | +7.62 |
+| 1d rule >= 5% | 12236 | +0.11 | +0.06 | +0.12 | +0.61 | 48.9 | 49.6 | +1.79 | +6.60 |
+| 1d rule >= 6% | 7477 | +0.10 | +0.03 | +0.06 | +0.72 | 48.5 | 49.2 | +0.68 | +5.66 |
+| 2d rule >= 3% | 86348 | +0.01 | -0.02 | +0.03 | +0.19 | 48.8 | 48.9 | +1.48 | +7.47 |
+| 2d rule >= 4% | 51090 | +0.01 | -0.04 | +0.05 | +0.28 | 48.8 | 48.9 | +1.89 | +7.59 |
+| 2d rule >= 5% | 31278 | +0.01 | -0.05 | +0.07 | +0.39 | 48.7 | 49.1 | +1.76 | +7.76 |
+| 2d rule >= 6% | 20149 | -0.01 | -0.09 | +0.06 | +0.50 | 48.4 | 49.3 | +1.21 | +7.37 |
+| **union 4/6** | **32164** | **+0.05** | **+0.01** | **+0.10** | **+0.48** | 48.7 | 49.6 | +2.58 | +9.32 |
+| union 4/8 | 25569 | +0.08 | +0.02 | +0.10 | +0.54 | 48.6 | 49.7 | +2.31 | +9.05 |
+| union 5/6 | 25033 | +0.04 | -0.01 | +0.11 | +0.53 | 48.8 | 49.5 | +2.60 | +8.67 |
+| union 5/8 | 16924 | +0.07 | +0.02 | +0.13 | +0.65 | 48.9 | 49.6 | +2.33 | +8.18 |
+| union 4/6 (pre 2023-01-01) | 13943 | -0.05 | -0.28 | -0.13 | -0.06 | 48.0 | 48.3 | -2.52 | -0.80 |
+| **union 4/6 (post 2023-01-01)** | **18221** | **+0.12** | **+0.23** | **+0.27** | **+0.90** | 49.2 | 50.5 | +5.15 | +12.27 |
+
+Findings:
+
+1. **The mean is carried by a right tail.** Pos-5d/10d ~48–49% full-sample (50.5%
+   post-2023 at 10d): most bursts fade slightly; rare takeover/squeeze-class winners
+   carry the average. Positive-EV lottery, not a coin-flip edge.
+2. **Horizon shape argues against fast flips.** 1–3d alpha ~0/negative (digestion);
+   continuation shows at +5d and dominates at +10d — consistent with multi-week
+   rating-machine management, not quick-turn exits.
+3. **Regime dependence (the disqualifying caveat).** Pre-2023 (incl. the 2022 crash)
+   mean-reverts at every horizon (t5d −2.52). Burst continuation is a 2023+
+   trending-tape phenomenon. The regime gate (STRESS suppresses buys) would have
+   avoided the failing era, but the user's 2026-09-04 call: price evidence too weak
+   to justify the build on its own — deferred.
+4. **Threshold 4/6 is mid-family** on alpha and n (≈26 burst events/day market-wide,
+   ~4/day post-exclusion — inside the ≤2/day pool cap); not tuned further since the
+   pilot (if ever built) is the tuning instrument.
+
+Reproduce: `python burst_gate.py <csv> --out <md> --split 2023-01-01`.
 
 ### 4.5 Config
 
