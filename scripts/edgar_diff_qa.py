@@ -118,6 +118,24 @@ def main(tickers: list[str]) -> int:
     return 1 if flagged else 0
 
 
+def default_pool() -> list[str]:
+    """Most recent ratings pool (any day) plus the current holdings."""
+    import glob
+    import os
+
+    tickers = set()
+    files = sorted(glob.glob(os.path.expanduser(
+        "~/.tradingagents/logs/ratings_*.json")))
+    if files:
+        try:
+            d = json.load(open(files[-1]))
+            tickers |= set(d.get("ratings", {}).keys())
+        except (OSError, ValueError):
+            pass
+    tickers |= {"EL", "REGN"}
+    return sorted(tickers)
+
+
 if __name__ == "__main__":
-    tickers = [t.upper() for t in sys.argv[1:]] or ["REGN", "EL"]
+    tickers = [t.upper() for t in sys.argv[1:]] or default_pool()
     raise SystemExit(main(tickers))
