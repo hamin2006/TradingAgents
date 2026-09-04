@@ -53,11 +53,11 @@ def _disk_load(ticker: str, accn: str) -> dict | None:
 
 
 def _disk_store(ticker: str, accn: str, payload: dict) -> None:
-    try:
+    import contextlib
+
+    with contextlib.suppress(OSError):  # cache is best-effort
         edgar._cache_write("earnings-metrics", _disk_key(ticker, accn),
                            json.dumps(payload).encode())
-    except OSError:
-        pass  # cache is best-effort
 
 
 def find_latest_earnings_8k(ticker: str, window_days: int = _EARNINGS_WINDOW_DAYS
