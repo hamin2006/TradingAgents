@@ -22,6 +22,8 @@ capital: 10000            # paper capital (matches real paper-account cash)
 max_positions: 10          # position-count cap AND equal-weight denominator
 max_order_value_cap: 15000 # per-day total buy cap
 stop_loss_pct: 8.0         # broker-side GTC stop on every buy (0 disables)
+tripwire_gap_pct: 5.0     # pre-open pause: BUY skipped if pre-market quote is
+                          # this % below the reference close (overnight events)
 fundamentals_source: edgar  # "edgar" = SEC companyfacts as-filed statements
                             # + 8-K announced-quarter freshness layer (live
                             # 2026-09-04); yfinance fallback stays automatic

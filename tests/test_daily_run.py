@@ -1387,3 +1387,92 @@ def test_openrouter_pin_injects_provider_body():
         oc.OpenAIClient.get_llm = original_attr
         daily_run._OPENROUTER_PINS = {}
         daily_run._OPENROUTER_PINS_APPLIED = False
+
+
+def _executed_payload(cfg, day="2026-08-31"):
+    from daily_run import Path
+    p = Path(cfg["results_dir"]) / f"executed_{day}.json"
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _tripwire_harness(cfg, ratings, broker, day="2026-08-31"):
+    _ratings_file(cfg, ratings, day=day)
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg)
+    return rc
+
+
+def test_run_execute_tripwire_pauses_buy_on_material_gap_down(cfg):
+    """Overnight-event class (CEO death / disaster): the pre-market quote
+    drops far below the reference close the debate rated on. The buy must
+    be paused — never submitted into a falling knife the analysis never
+    saw — while a same-day rating exit still executes."""
+    c = cfg.copy()
+    c["tripwire_gap_pct"] = 5.0
+    _ratings_file(c, {"AAPL": "Sell", "EL": "Overweight"}, day="2026-08-31")
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 5}, 100_000.0)
+    broker.place_market_orders.return_value = []
+    broker.get_current_price.side_effect = lambda t: 94.0 if t == "EL" else 100.0
+    rc = _tripwire_harness(c, {"AAPL": "Sell", "EL": "Overweight"}, broker)
+    assert rc == 0
+    args = broker.place_market_orders.call_args[0][0]
+    assert [o.ticker for o in args] == ["AAPL"]          # sell survives
+    assert all(o.action == "SELL" for o in args)
+    log = _executed_payload(c)
+    assert log["paused"][0]["ticker"] == "EL"
+    assert log["paused"][0]["move_pct"] == pytest.approx(-6.0)
+
+
+def test_run_execute_tripwire_small_gap_still_buys(cfg):
+    c = cfg.copy()
+    c["tripwire_gap_pct"] = 5.0
+    _ratings_file(c, {"AAPL": "Buy"}, day="2026-08-31")
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = []
+    broker.get_current_price.return_value = 97.0          # -3%: normal noise
+    rc = _tripwire_harness(c, {"AAPL": "Buy"}, broker)
+    assert rc == 0
+    args = broker.place_market_orders.call_args[0][0]
+    assert [o.ticker for o in args] == ["AAPL"]
+    log = _executed_payload(c)
+    assert not log.get("paused")
+
+
+def test_run_execute_tripwire_missing_quote_proceeds(cfg):
+    """No pre-market quote (thin name / feed gap) must not block the order —
+    the existing +5% cap and post-fill gap-down guard still protect."""
+    c = cfg.copy()
+    c["tripwire_gap_pct"] = 5.0
+    _ratings_file(c, {"AAPL": "Buy"}, day="2026-08-31")
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = []
+    broker.get_current_price.return_value = None
+    rc = _tripwire_harness(c, {"AAPL": "Buy"}, broker)
+    assert rc == 0
+    args = broker.place_market_orders.call_args[0][0]
+    assert [o.ticker for o in args] == ["AAPL"]
+
+
+def test_run_execute_tripwire_disabled_at_zero(cfg):
+    c = cfg.copy()
+    c["tripwire_gap_pct"] = 0.0
+    _ratings_file(c, {"AAPL": "Buy"}, day="2026-08-31")
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.place_market_orders.return_value = []
+
+    def boom(t):
+        raise AssertionError("tripwire must not query when disabled")
+    broker.get_current_price.side_effect = boom
+    rc = _tripwire_harness(c, {"AAPL": "Buy"}, broker)
+    assert rc == 0
+    args = broker.place_market_orders.call_args[0][0]
+    assert [o.ticker for o in args] == ["AAPL"]

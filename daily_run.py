@@ -1408,6 +1408,40 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
             stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
             conviction_weights=cfg.get("conviction_weights"))
 
+        # Overnight-move tripwire: an event between the analysis cutoff and
+        # the open (CEO death, disaster, guidance cut) shows up in the
+        # pre-market quote before it reaches any article feed we parse. A
+        # buy into a material gap-down catches a falling knife the debate
+        # never saw — pause that ticker's order and log it for review.
+        # Rating exits are never paused (selling at a gap-down open IS the
+        # intended exit). 0 disables.
+        tripwire_pct = float(cfg.get("tripwire_gap_pct", 0.0))
+        paused = []
+        if tripwire_pct > 0 and hasattr(broker, "get_current_price"):
+            kept = []
+            for o in orders:
+                if o.action != "BUY":
+                    kept.append(o)
+                    continue
+                ref = last_close.get(o.ticker)
+                live = broker.get_current_price(o.ticker)
+                if not ref or live is None:
+                    kept.append(o)  # no quote: existing caps still protect
+                    continue
+                move_pct = (live - ref) / ref * 100
+                if move_pct <= -tripwire_pct:
+                    logger.warning(
+                        "TRIPWIRE: %s pre-market %.2f is %.1f%% below the "
+                        "reference close %.2f — material overnight move; "
+                        "pausing today's buy", o.ticker, live, move_pct, ref)
+                    paused.append({"ticker": o.ticker, "reference": ref,
+                                   "pre_market": live,
+                                   "move_pct": round(move_pct, 2)})
+                    continue
+                kept.append(o)
+            if paused:
+                orders = kept
+
         # Regime gate (execute side): STRESS suppresses new BUY orders —
         # rating-based exits still execute. Mirrors the pool-side pause.
         if load_regime(cfg) == "STRESS":
@@ -1442,11 +1476,13 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
             log_path.write_text(json.dumps({
                 "date": _today_str(), "dry_run": False, "status": "submitted",
                 "orders": [o.__dict__ for o in orders], "reports": [],
+                "paused": paused,
             }, indent=2), encoding="utf-8")
 
         reports = broker.place_market_orders(orders, dry_run=dry_run)
         log = {"date": _today_str(), "dry_run": dry_run, "status": "completed",
-               "orders": [o.__dict__ for o in orders], "reports": reports}
+               "orders": [o.__dict__ for o in orders], "reports": reports,
+               "paused": paused}
         if not dry_run:
             log_path.write_text(json.dumps(log, indent=2), encoding="utf-8")
         return 0

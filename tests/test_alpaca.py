@@ -550,3 +550,17 @@ def test_multi_order_submitted_then_polled_concurrently(broker):
     assert reports[0] == {"ticker": "DASH", "action": "BUY", "shares": 3,
                           "filled": 3, "avg_price": 214.85}
     assert reports[1]["filled"] == 0
+
+
+def test_get_current_price_returns_last_trade(broker):
+    b, mock_client, _ = broker
+    trade = MagicMock()
+    trade.price = "94.5"
+    mock_client.get_last_trade.return_value = trade
+    assert b.get_current_price("EL") == 94.5
+
+
+def test_get_current_price_none_on_error(broker):
+    b, mock_client, _ = broker
+    mock_client.get_last_trade.side_effect = Exception("feed down")
+    assert b.get_current_price("EL") is None

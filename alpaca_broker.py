@@ -345,6 +345,20 @@ class AlpacaBroker:
 
         return {oid: last for oid, (_o, _s, last) in by_id.items()}
 
+    def get_current_price(self, ticker: str) -> float | None:
+        """Latest trade price, extended-hours sessions included (tripwire).
+
+        A pre-market quote is the market's own aggregation of overnight
+        events (news, guidance cuts, CEO deaths) long before any article
+        reaches our feeds — run_execute's tripwire compares it against the
+        reference close used for the morning's orders.
+        """
+        try:
+            trade = self._client.get_last_trade(ticker)
+            return float(trade.price)
+        except Exception:  # noqa: BLE001 - a quote is best-effort, never blocking
+            return None
+
     def cancel_stops_for(self, tickers: list[str]) -> None:
         """Cancel resting GTC stops for symbols being sold (exit guard).
 

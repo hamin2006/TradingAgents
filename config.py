@@ -13,6 +13,7 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
     ["seed_watchlist", "capital", "max_positions", "max_order_value_cap",
      "screener", "ibkr", "alpaca", "broker", "trading_enabled",
      "analyze_max_workers", "stop_loss_pct", "conviction_weights",
+     "tripwire_gap_pct",
      "openrouter_provider_pins", "fundamentals_source"]
 )
 
@@ -27,6 +28,10 @@ APP_DEFAULTS = {
     # Broker-side stop-loss attached to every buy (GTC, % below last close).
     # Enforced 24/7 by the broker between daily runs. 0 disables.
     "stop_loss_pct": 8.0,
+    # Overnight-move tripwire at execute time (pct below the reference
+    # close that pauses a BUY; 0 disables). Catches material events between
+    # the analysis cutoff and the 09:30 open via the pre-market quote.
+    "tripwire_gap_pct": 5.0,
     # Conviction-scaled sizing: slice multiplier per rating (base = capital /
     # max_positions). A Buy gets 1.5x an Overweight's exposure.
     "conviction_weights": {"Buy": 1.5, "Overweight": 1.0},
