@@ -193,3 +193,28 @@ def earnings_line(ticker: str) -> str:
     except Exception as exc:  # noqa: BLE001 - context decoration never breaks runs
         logger.warning("earnings_line failed for %s: %s", ticker, exc)
         return ""
+
+
+def reported_headline(ticker: str) -> dict | None:
+    """Cached 8-K earnings headline (period/revenue/eps/guidance/filed).
+
+    Cache-only on purpose: the fundamentals freshness layer calls this on
+    every render, so it must never trigger an LLM extraction. A cold cache
+    (first morning after an earnings 8-K) returns None and the caller
+    falls back to the yfinance payload that day.
+    """
+    try:
+        filing = find_latest_earnings_8k(ticker)
+        if filing is None:
+            return None
+        accn = filing["accession_number"]
+        with _lock:
+            cached = _cache.get((ticker, accn), "missing")
+        if cached == "missing":
+            cached = _disk_load(ticker, accn)
+        if not cached:
+            return None
+        return {k: cached.get(k, "") for k in
+                ("period", "revenue", "eps", "guidance", "filed")}
+    except Exception:  # noqa: BLE001 - routine cold-cache misses are silent
+        return None

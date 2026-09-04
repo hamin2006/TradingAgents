@@ -134,3 +134,50 @@ class TestExtraction:
     def test_html_stripped_before_extraction(self):
         text = em._strip_html("<p>Q2 <b>revenue</b> up</p>")
         assert "revenue" in text and "<" not in text
+
+
+class TestReportedHeadline:
+    def test_returns_cached_metrics_without_extracting(self, http, tmp_path,
+                                                       monkeypatch):
+        """The fundamentals freshness layer must read the 8-K headline from
+        cache only — it must never trigger a fresh LLM extraction."""
+        calls = {"n": 0}
+
+        def fake_extract(text, filing_date):
+            calls["n"] += 1
+            return {"period": "Q2 2026", "revenue": "$4.29B", "eps": "$15.50",
+                    "guidance": "FY26 GAAP EPS $60.61-$62.00"}
+
+        monkeypatch.setattr(em, "_call_extract_llm", fake_extract)
+        http["index.json"] = edgar._jb(INDEX_JSON)
+        http["exh_991.htm"] = RELEASE_HTML.encode()
+        http["submissions/CIK0000872589.json"] = edgar._jb(
+            submissions(extra_forms=["8-K"]))
+        em.reset_cache()
+        assert em.earnings_line("REGN") != ""   # warms the disk cache
+        assert calls["n"] == 1
+        em.reset_cache()                        # fresh process simulation
+        head = em.reported_headline("REGN")
+        assert head is not None
+        assert head["period"] == "Q2 2026"
+        assert head["revenue"] == "$4.29B"
+        assert head["filed"] == "2026-09-03"
+        assert calls["n"] == 1                  # no new extraction
+
+    def test_returns_none_when_cache_missing(self, http, monkeypatch):
+        """Without a warm cache (and no LLM allowed), headline is None —
+        the caller falls back rather than blocking on an extraction."""
+        def boom(_t, _d):
+            raise AssertionError("must not extract")
+        monkeypatch.setattr(em, "_call_extract_llm", boom)
+        http["submissions/CIK0000872589.json"] = edgar._jb(
+            submissions(extra_forms=["8-K"]))
+        http["index.json"] = edgar._jb(INDEX_JSON)
+        http["exh_991.htm"] = RELEASE_HTML.encode()
+        em.reset_cache()
+        assert em.reported_headline("REGN") is None
+
+    def test_no_8k_returns_none(self, http):
+        http["submissions/CIK0000872589.json"] = edgar._jb(
+            submissions(extra_forms=["10-Q"]))
+        assert em.reported_headline("REGN") is None
