@@ -99,12 +99,17 @@ _cik_cache: dict[str, str] = {}
 
 
 def _cik_map() -> dict[str, str]:
-    """ticker (upper) -> zero-padded CIK; loaded once per process."""
+    """ticker (upper) -> zero-padded CIK; loaded once per process.
+
+    SEC has served company_tickers.json as both an array of rows and an
+    object keyed by index — accept either shape.
+    """
     if not _cik_cache:
         try:
-            rows = json.loads(_http_get(_CIK_URL))
+            payload = json.loads(_http_get(_CIK_URL))
         except (EdgarError, json.JSONDecodeError) as exc:
             raise EdgarError(f"could not load EDGAR ticker map: {exc}") from exc
+        rows = payload.values() if isinstance(payload, dict) else payload
         for row in rows:
             _cik_cache[str(row["ticker"]).upper()] = str(row["cik_str"]).zfill(10)
     return _cik_cache
