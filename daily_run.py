@@ -295,6 +295,53 @@ def _ensure_graph_tool_callbacks() -> None:
 
 _NEWS_LOGGING_PATCHED = False
 
+_NEWS_DATING_PATCHED = False
+_NEWS_DATING_ORIGINALS: dict[str, object] = {}
+
+
+def _reset_news_dating() -> None:
+    """Restore the news tool .funcs (tests; safe anytime).
+
+    Restores to the recorded pre-install functions, so it is safe whether or
+    not _ensure_news_logging wrapped on top afterwards.
+    """
+    global _NEWS_DATING_PATCHED
+    if not _NEWS_DATING_PATCHED:
+        return
+    import tradingagents.agents.utils.news_data_tools as ndt
+
+    ndt.get_news.func = _NEWS_DATING_ORIGINALS["get_news"]
+    ndt.get_global_news.func = _NEWS_DATING_ORIGINALS["get_global_news"]
+    _NEWS_DATING_ORIGINALS.clear()
+    _NEWS_DATING_PATCHED = False
+
+
+def _ensure_news_dating() -> None:
+    """Make news tool outputs carry publication dates + the verified-snapshot
+    anchor (2026-09-03 audit: the yfinance feed drops per-article pub_dates at
+    render time, so the News Analyst could not date "REGN pulled back 4.8%" —
+    an Aug-28 claim — against a $852.03 Sep-2 verified close).
+
+    Replaces .func on the shared news Tool objects (news_data_tools module
+    level; agent_utils re-exports the same instances, so the News Analyst
+    ToolNode and the Sentiment Analyst's direct pre-fetch both pick it up).
+    Install BEFORE _ensure_news_logging so the logging wrapper stays outermost
+    and the sentiment pre-fetch keeps emitting fetch_end events.
+    """
+    global _NEWS_DATING_PATCHED
+    if _NEWS_DATING_PATCHED:
+        return
+    import tradingagents.agents.utils.news_data_tools as ndt
+    from news_dating import render_global_news, render_ticker_news
+
+    _NEWS_DATING_ORIGINALS["get_news"] = ndt.get_news.func
+    _NEWS_DATING_ORIGINALS["get_global_news"] = ndt.get_global_news.func
+    render_ticker_news._wrapped_original = _NEWS_DATING_ORIGINALS["get_news"]
+    render_global_news._wrapped_original = _NEWS_DATING_ORIGINALS["get_global_news"]
+    ndt.get_news.func = render_ticker_news
+    ndt.get_global_news.func = render_global_news
+    _NEWS_DATING_PATCHED = True
+
 
 def _ensure_news_logging() -> None:
     """Wrap the sentiment analyst's direct get_news call for structured logs.
@@ -1067,6 +1114,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_reddit_archive()
     _ensure_stocktwits_resilience()
     _ensure_graph_tool_callbacks()
+    _ensure_news_dating()  # before news logging: logging must stay outermost
     _ensure_news_logging()
     _ensure_fred_aliases()
     _ensure_structured_fallback_logging()
