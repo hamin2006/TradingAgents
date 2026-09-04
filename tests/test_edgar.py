@@ -52,6 +52,19 @@ class TestCikResolution:
 
 
 class TestAsOfSemantics:
+    def test_annual_10k_row_excluded_from_quarters(self, http):
+        """A 10-K full-year row ending Dec-31 shares the Revenue tag with the
+        quarters (real REGN payload); it must never masquerade as Q4."""
+        routes, _ = http
+        routes["companyfacts/CIK0000872589.json"] = edgar._jb(companyfacts())
+        f = edgar.load_facts("REGN")
+        ends = [r["end"] for r in f.quarters("Revenues", as_of="2026-08-01")]
+        assert ends == ["2025-09-30", "2025-12-31", "2026-03-31", "2026-06-30"]
+        # Q4'25 is the 10-Q row (3.9B), NOT the 10-K annual (15.2B)
+        q4 = [r for r in f.quarters("Revenues", as_of="2026-08-01")
+              if r["end"] == "2025-12-31"][0]
+        assert q4["val"] == pytest.approx(3_900_000_000)
+
     def test_latest_quarter_excludes_future_filings(self, http):
         """Point-in-time: a 10-Q filed after the as-of date must not leak."""
         routes, _ = http
@@ -61,37 +74,41 @@ class TestAsOfSemantics:
         q1 = f.quarters("Revenues", as_of="2026-06-15")
         assert [r["end"] for r in q1] == ["2025-09-30", "2025-12-31", "2026-03-31"]
         ttm = f.ttm("Revenues", as_of="2026-06-15")
-        assert ttm == pytest.approx(3800 + 3900 + 4000)  # 3 quarters on file
+        assert ttm == pytest.approx((3800 + 3900 + 4000) * 1e6)
         ttm2 = f.ttm("Revenues", as_of="2026-08-01")
-        assert ttm2 == pytest.approx(3800 + 3900 + 4000 + 4290)
+        assert ttm2 == pytest.approx((3800 + 3900 + 4000 + 4290) * 1e6)
 
     def test_amendment_dedupe_latest_filed_wins(self, http):
         """Two filings for the same quarter: the later-filed row wins."""
         raw = companyfacts()
         q2_rows = raw["facts"]["us-gaap"]["Revenues"]["units"]["USD"]
         q2_rows.append({
-            "start": "2026-04-01", "end": "2026-06-30", "val": 4300,
+            "start": "2026-04-01", "end": "2026-06-30", "val": 4_300_000_000,
             "accn": "ACC-AMEND", "fy": 2026, "fp": "Q2",
             "form": "10-Q/A", "filed": "2026-08-20", "frame": "CY2026Q2"})
         routes, _ = http
         routes["companyfacts/CIK0000872589.json"] = edgar._jb(raw)
         f = edgar.load_facts("REGN")
         ttm = f.ttm("Revenues", as_of="2026-09-01")
-        assert ttm == pytest.approx(3800 + 3900 + 4000 + 4300)  # restated 4300
+        assert ttm == pytest.approx((3800 + 3900 + 4000 + 4300) * 1e6)
 
 
 class TestTagAndComputation:
     def test_tag_fallback_chain(self, http):
         """When the canonical tag is absent, the fallback chain applies."""
         raw = companyfacts()
+        fallback_rows = [r for r in raw["facts"]["us-gaap"]["Revenues"]["units"]["USD"]
+                         if r["form"] == "10-Q"]
         del raw["facts"]["us-gaap"]["Revenues"]
-        raw["facts"]["us-gaap"]["RevenueFromContractWithCustomerExcludingAssessedTax"] = (
-            raw["facts"]["us-gaap"].pop("Revenues_fy"))
+        raw["facts"]["us-gaap"][
+            "RevenueFromContractWithCustomerExcludingAssessedTax"] = {
+            "label": "x", "description": "x", "units": {"USD": fallback_rows}}
         routes, _ = http
         routes["companyfacts/CIK0000872589.json"] = edgar._jb(raw)
         f = edgar.load_facts("REGN")
-        assert f.ttm(["RevenueFromContractWithCustomerExcludingAssessedTax",
-                      "Revenues"], as_of="2026-08-01") is not None
+        ttm = f.ttm(["RevenueFromContractWithCustomerExcludingAssessedTax",
+                     "Revenues"], as_of="2026-08-01")
+        assert ttm == pytest.approx((3800 + 3900 + 4000 + 4290) * 1e6)
 
     def test_ttm_missing_tag_returns_none(self, http):
         routes, _ = http
@@ -104,10 +121,10 @@ class TestTagAndComputation:
         routes["companyfacts/CIK0000872589.json"] = edgar._jb(companyfacts())
         f = edgar.load_facts("REGN")
         assert f.latest_instant("StockholdersEquity",
-                                as_of="2026-08-01") == pytest.approx(22900.0)
+                                as_of="2026-08-01") == pytest.approx(22_900_000_000.0)
         assert f.shares_outstanding(as_of="2026-08-01") == 103_100_000
         assert f.ttm("NetCashProvidedByUsedInOperatingActivities",
-                     as_of="2026-08-01") == pytest.approx(2350.0)
+                     as_of="2026-08-01") == pytest.approx(2_350_000_000.0)
 
 
 class TestClient:

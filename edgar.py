@@ -168,13 +168,21 @@ class Facts:
         if m:
             return int(m.group(1)), int(m.group(2))
         end = row.get("end")
-        if not end or row.get("start") is None:
+        start = row.get("start")
+        if not end or start is None:
             return None
         try:
-            dt = datetime.strptime(end, "%Y-%m-%d")
+            start_dt = datetime.strptime(start, "%Y-%m-%d")
+            end_dt = datetime.strptime(end, "%Y-%m-%d")
         except ValueError:
             return None
-        return dt.year, (dt.month - 1) // 3 + 1
+        # Frame-less rows: only true quarter-length durations qualify — a 10-K
+        # full-year row ending Dec-31 must NOT masquerade as a Q4 quarter
+        # (real REGN companyfacts carry both; the annual row is ~4x bigger).
+        days = (end_dt - start_dt).days
+        if days > 120:
+            return None
+        return end_dt.year, (end_dt.month - 1) // 3 + 1
 
     # -- quarterly duration facts -------------------------------------------
 

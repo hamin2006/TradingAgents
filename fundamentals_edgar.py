@@ -49,6 +49,11 @@ _CASH_TAGS = ["CashAndCashEquivalentsAtCarryingValue",
 _DEBT_TAGS = ["LongTermDebtNoncurrent", "LongTermDebt"]
 
 
+def _usd(raw):
+    """Companyfacts serves raw dollars; metrics render in USD M."""
+    return None if raw is None else raw / 1e6
+
+
 def _m(val) -> str:
     return "n/a" if val is None else f"{val:,.1f}"
 
@@ -134,15 +139,15 @@ def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
                                  f"as of {curr_date}); consensus via Yahoo "
                                  f"quote as of {today}"))
 
-    rev = revenue_ttm(facts, curr_date)
-    gp = _ttm(facts, _GP_TAGS, curr_date)
-    oi = _ttm(facts, _OPINC_TAGS, curr_date)
-    ni = _ttm(facts, _NI_TAGS, curr_date)
-    depr = _ttm(facts, _DEPR_TAGS, curr_date)
-    cfo = _ttm(facts, _CFO_TAGS, curr_date)
-    capex = _ttm(facts, _CAPEX_TAGS, curr_date)
-    buybacks = _ttm(facts, _BUYBACK_TAGS, curr_date)
-    dividends = _ttm(facts, _DIV_TAGS, curr_date)
+    rev = _usd(revenue_ttm(facts, curr_date))
+    gp = _usd(_ttm(facts, _GP_TAGS, curr_date))
+    oi = _usd(_ttm(facts, _OPINC_TAGS, curr_date))
+    ni = _usd(_ttm(facts, _NI_TAGS, curr_date))
+    depr = _usd(_ttm(facts, _DEPR_TAGS, curr_date))
+    cfo = _usd(_ttm(facts, _CFO_TAGS, curr_date))
+    capex = _usd(_ttm(facts, _CAPEX_TAGS, curr_date))
+    buybacks = _usd(_ttm(facts, _BUYBACK_TAGS, curr_date))
+    dividends = _usd(_ttm(facts, _DIV_TAGS, curr_date))
     n_q = len(facts.quarters(_REVENUE_TAGS, curr_date))
 
     rows.append(("Revenue (TTM)", f"{_m(rev)} {_USD_M}"
@@ -182,10 +187,10 @@ def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
     if consensus.get("dividend_rate"):
         rows.append(("Dividend rate (Yahoo)", str(consensus["dividend_rate"])))
 
-    equity = facts.latest_instant(_EQUITY_TAGS, curr_date)
-    assets = facts.latest_instant(_ASSETS_TAGS, curr_date)
-    cash = facts.latest_instant(_CASH_TAGS, curr_date)
-    debt = facts.latest_instant(_DEBT_TAGS, curr_date)
+    equity = _usd(facts.latest_instant(_EQUITY_TAGS, curr_date))
+    assets = _usd(facts.latest_instant(_ASSETS_TAGS, curr_date))
+    cash = _usd(facts.latest_instant(_CASH_TAGS, curr_date))
+    debt = _usd(facts.latest_instant(_DEBT_TAGS, curr_date))
     if equity:
         rows.append(("Stockholders Equity (latest)", f"{_m0(equity)} {_USD_M}"))
     if assets:
@@ -213,7 +218,7 @@ def _quarter_table(facts: edgar.Facts, as_of: str, metric_tags: list[tuple]):
     lines = ["| Metric | " + " | ".join(ends) + " |"]
     lines.append("| --- |" + " --- |" * len(ends))
     for tags, label in metric_tags:
-        by_end = {r["end"]: r["val"] for r in facts.quarters(tags, as_of)}
+        by_end = {r["end"]: _usd(r["val"]) for r in facts.quarters(tags, as_of)}
         cells = " | ".join(_m0(by_end.get(e)) for e in ends)
         lines.append(f"| {label} | {cells} |")
     return "\n".join(lines)
@@ -237,7 +242,7 @@ def _instant_table(facts: edgar.Facts, as_of: str,
         for row in facts._rows(tags) or []:
             if row.get("start") is None and row.get("end") and \
                     row.get("filed", "") <= as_of:
-                by_end[row["end"]] = row["val"]
+                by_end[row["end"]] = _usd(row["val"])
         cells = " | ".join(_m0(by_end.get(e)) for e in ends)
         lines.append(f"| {label} | {cells} |")
     return "\n".join(lines)
