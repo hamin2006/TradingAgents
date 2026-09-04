@@ -297,3 +297,17 @@ class TestOrdersFromExecutionSell:
             intent, ticker="EL", holdings={"EL": 8},
             last_close={"EL": 101.15})
         assert orders == []
+
+    def test_partial_sell_without_close_still_executes(self):
+        """Replay-found bug: share-based SELLs carry explicit floor/stop and
+        never needed the reference close, but a block-level close gate killed
+        them. The engine must honor them (stop left unclamped with a note)."""
+        intent = _intent([{"kind": "SELL", "shares": 2, "limit_px": 100.5,
+                           "stop_px": 95.6}])
+        orders, clamps = orders_from_execution(
+            intent, ticker="EL", holdings={"EL": 8}, last_close={},
+            stop_px_band_pct=(3, 25))
+        assert len(orders) == 1
+        assert (orders[0].action, orders[0].shares, orders[0].stop_price) == (
+            "SELL", 2, 95.6)
+        assert any("unclamped" in c for c in clamps)

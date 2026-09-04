@@ -115,11 +115,14 @@ def orders_from_execution(
     clamps: list[str] = []
     held = int(holdings.get(ticker, 0) or 0)
     price = last_close.get(ticker)
-    if price is None or price <= 0:
-        return None, [f"{ticker}: no reference close for execution sizing "
-                        "(legacy fallback)"]
+    has_price = price is not None and price > 0
     if not execution.orders:
         return [], clamps  # explicit empty = no order today (binding)
+    if not has_price and any(o.kind.value == "BUY" for o in execution.orders):
+        # BUY sizing/protection derives from the reference close; without it
+        # the legacy path is the fallback (it also skips closeless buys).
+        return None, [f"{ticker}: no reference close for buy sizing "
+                      "(legacy fallback)"]
 
     for o in execution.orders:
         if o.kind.value == "BUY":
@@ -166,11 +169,15 @@ def orders_from_execution(
                               "not executable"]
             floor = None if o.limit_px is None else round(o.limit_px, 2)
             remainder_stop = None
-            if held - shares > 0:
-                remainder_stop = (None if o.stop_px is None
-                                  else _clamp_stop(o.stop_px, price,
-                                                   stop_px_band_pct, clamps,
-                                                   ticker))
+            if held - shares > 0 and o.stop_px is not None:
+                if has_price:
+                    remainder_stop = _clamp_stop(o.stop_px, price,
+                                                 stop_px_band_pct, clamps,
+                                                 ticker)
+                else:
+                    remainder_stop = round(o.stop_px, 2)
+                    clamps.append(f"{ticker}: no reference close; remainder "
+                                  f"stop {o.stop_px:.2f} left unclamped")
             orders.append(Order(ticker=ticker, action="SELL", shares=shares,
                                 reason="pm-execution",
                                 protection_price=floor,
