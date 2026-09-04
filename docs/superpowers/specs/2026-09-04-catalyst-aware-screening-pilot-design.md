@@ -1,7 +1,12 @@
 # Catalyst-Aware Screening Pilot (2026-09-04)
 
-Status: **Design (approved 2026-09-04)** — spec written 2026-09-04. Next step: backtest
-go/no-go gate, then implementation plan (build from this spec when pursued).
+Status: **Gate PASSED (ADOPT) 2026-09-04** — design approved; backtest go/no-go
+executed (6y crash-in-sample, `burst_gate.py`, report `docs/research/burst-gate-results.md`):
+union(4/6) continues (+0.10% 5d / +0.48% 10d mean alpha, n=32,164) but **the signal is
+entirely post-2023** (pre-2023 incl. the 2022 crash mean-reverts); adoption rests on the
+regime-gate pairing (STRESS suppresses buys in exactly the failing era) + the
+`--by-surfacing` analytics stop condition. Thresholds stay provisional 4/6. Next step:
+implementation plan.
 
 ## 1. Problem
 
