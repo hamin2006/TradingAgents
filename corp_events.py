@@ -18,11 +18,14 @@ decoration must never break an analysis.
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from datetime import timedelta
 
 import edgar
+
+logger = logging.getLogger(__name__)
 
 _LOOKBACK_DAYS = 10
 _MAX_FORM4 = 3
@@ -179,7 +182,8 @@ def events_block(ticker: str, since: str | None = None) -> str:
         with _lock:
             _block_cache[key] = result
         return result
-    except Exception:  # noqa: BLE001 - context decoration never breaks runs
+    except Exception as exc:  # noqa: BLE001 - context decoration never breaks runs
+        logger.warning("corporate events failed for %s: %s", ticker, exc)
         with _lock:
             _block_cache[key] = ""
         return ""

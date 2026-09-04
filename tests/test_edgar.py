@@ -134,6 +134,40 @@ class TestClient:
         with pytest.raises(edgar.EdgarError):
             edgar.load_facts("REGN")
 
+    def test_throttle_and_5xx_retried_then_succeed(self, monkeypatch):
+        """SEC throttles (429/403) and 5xx are transient: retry with backoff
+        instead of killing the run's data."""
+        from urllib.error import HTTPError
+
+        calls = {"n": 0}
+
+        def flaky(url):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise HTTPError(url, 429 if calls["n"] == 1 else 500,
+                                "throttled", {}, None)
+            return b'{"ok": true}'
+
+        monkeypatch.setattr(edgar, "_http_get_impl", flaky)
+        monkeypatch.setattr(edgar, "_MIN_INTERVAL_S", 0.0)
+        monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+        edgar._reset_pacing()
+        assert edgar._http_get("https://x") == b'{"ok": true}'
+        assert calls["n"] == 3
+
+    def test_throttle_exhaustion_raises(self, monkeypatch):
+        from urllib.error import HTTPError
+
+        def always_429(url):
+            raise HTTPError(url, 429, "throttled", {}, None)
+
+        monkeypatch.setattr(edgar, "_http_get_impl", always_429)
+        monkeypatch.setattr(edgar, "_MIN_INTERVAL_S", 0.0)
+        monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+        edgar._reset_pacing()
+        with pytest.raises(edgar.EdgarError):
+            edgar._http_get("https://x")
+
     def test_disk_cache_avoids_refetch(self, http, tmp_path):
         routes, calls = http
         routes["companyfacts/CIK0000872589.json"] = edgar._jb(companyfacts())

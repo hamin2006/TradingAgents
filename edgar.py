@@ -46,23 +46,50 @@ def _jb(payload) -> bytes:
 
 _request_lock = threading.Lock()
 _last_request_at: float = 0.0
+_MAX_ATTEMPTS = 3
 
 
-def _http_get(url: str) -> bytes:
-    """Fetch a URL with SEC etiquette. Paced module-wide (worker threads)."""
+def _pace() -> None:
+    """SEC fair access: >=1s between requests, module-wide (worker threads
+    share the lock, so 4 parallel analyze workers stay at one request/s)."""
     global _last_request_at
     with _request_lock:
         wait = _MIN_INTERVAL_S - (time.monotonic() - _last_request_at)
         if wait > 0:
             time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _http_get_impl(url: str) -> bytes:
+    """The actual HTTP request (transport seam for hermetic tests)."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read()
+
+
+def _http_get(url: str) -> bytes:
+    """Fetch a URL with SEC etiquette and retry-on-throttle backoff.
+
+    Retries HTTP 429/403/5xx and transient network errors (the SEC throttles
+    rather than blocks; one 429 must not kill a whole run's ticker map).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        _pace()
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = resp.read()
-            _last_request_at = time.monotonic()
-            return body
-        except Exception as exc:  # noqa: BLE001
-            raise EdgarError(f"EDGAR fetch failed for {url}: {exc}") from exc
+            return _http_get_impl(url)
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            retriable = exc.code in (429, 403) or 500 <= exc.code < 600
+            if not retriable or attempt == _MAX_ATTEMPTS - 1:
+                break
+        except Exception as exc:  # noqa: BLE001 - transient network errors
+            last_exc = exc
+            if attempt == _MAX_ATTEMPTS - 1:
+                break
+        time.sleep(3 * (attempt + 1))
+    raise EdgarError(
+        f"EDGAR fetch failed for {url}: {last_exc}") from last_exc
 
 
 def _cache_dir() -> Path:
@@ -72,6 +99,13 @@ def _cache_dir() -> Path:
 def clear_cache() -> None:
     """Drop in-memory caches (tests)."""
     _cik_cache.clear()
+
+
+def _reset_pacing() -> None:
+    """Zero the pacing clock (tests)."""
+    global _last_request_at
+    with _request_lock:
+        _last_request_at = 0.0
 
 
 def _cache_read(kind: str, key: str) -> bytes | None:
