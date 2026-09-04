@@ -1591,3 +1591,17 @@ class TestPmExecutionBinding:
         orders = broker.place_market_orders.call_args[0][0]
         assert len(orders) == 1
         assert (orders[0].action, orders[0].shares) == ("SELL", 8)
+
+    def test_partial_sell_remainder_defaults_to_standard_stop(self, cfg):
+        """Last-line fallback: a partial sell with no PM stop and no cancelled
+        original stop must never leave the remainder naked — re-anchor at the
+        standard -8% stop instead."""
+        cfg["pm_execution"] = True
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        broker.cancel_stops_for.return_value = {}   # no original stop found
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert orders[0].stop_price == round(100.0 * 0.92, 2)  # -8% of close

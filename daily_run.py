@@ -1759,18 +1759,30 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         # Partial-sell remainder re-anchor fallback: a partial SELL without a
         # PM stop re-anchors the remainder at the ORIGINAL cancelled stop
         # level (spec: PM stop_px if given, else the cancelled original stop).
-        if cancelled:
-            from dataclasses import replace as replace_order
-            for i, o in enumerate(orders):
-                if (o.action == "SELL" and o.stop_price is None
-                        and o.shares < holdings.get(o.ticker, 0)):
-                    stops = cancelled.get(o.ticker) or []
-                    if stops and stops[0].get("stop_price"):
-                        logger.info(
-                            "%s: partial sell of %d/%d re-anchors remainder "
-                            "at original stop %.2f", o.ticker, o.shares,
-                            holdings.get(o.ticker, 0), stops[0]["stop_price"])
-                        orders[i] = replace_order(o, stop_price=stops[0]["stop_price"])
+        # Last line: no original stop found -> the standard -8% stop, so a
+        # remainder is never left naked between runs.
+        from dataclasses import replace as replace_order
+        for i, o in enumerate(orders):
+            if (o.action == "SELL" and o.stop_price is None
+                    and o.shares < holdings.get(o.ticker, 0)):
+                stops = cancelled.get(o.ticker) or []
+                if stops and stops[0].get("stop_price"):
+                    logger.info(
+                        "%s: partial sell of %d/%d re-anchors remainder "
+                        "at original stop %.2f", o.ticker, o.shares,
+                        holdings.get(o.ticker, 0), stops[0]["stop_price"])
+                    orders[i] = replace_order(o, stop_price=stops[0]["stop_price"])
+                elif last_close.get(o.ticker):
+                    default = round(
+                        last_close[o.ticker]
+                        * (1 - float(cfg.get("stop_loss_pct", 8.0)) / 100),
+                        2)
+                    logger.warning(
+                        "%s: partial sell of %d/%d has no PM stop and no "
+                        "original stop found; re-anchoring remainder at "
+                        "the standard stop %.2f", o.ticker, o.shares,
+                        holdings.get(o.ticker, 0), default)
+                    orders[i] = replace_order(o, stop_price=default)
 
         wait = _seconds_until_open()
         if wait > 0 and not dry_run:

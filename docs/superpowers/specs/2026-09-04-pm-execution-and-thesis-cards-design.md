@@ -337,3 +337,36 @@ card_flip_inject_max: 3       # fresh cards injected when the latest two ratings
 - Sector-level exposure logic.
 - Close-based (non-touch) stop execution.
 - Any framework change under `tradingagents/`.
+
+## 15. Schema follow-up (noted 2026-09-04, post-binding-flip observation)
+
+Probe + first-binding observations: the PM populates sizing + `limit_px` but keeps
+writing caps/stops into `future_notes` prose (schema-valid; the default −8% stop and
+the original-stop/−8% remainder fallbacks cover execution). Bounds the schema cannot
+express today:
+
+- **Standing max position cap** ("hard cap 12%", "cap ~6%"): `cap_value_usd` clamps
+  today's order only, not `held + new`. Proposed `max_position_value_usd` on the
+  order — engine clamps so held+order ≤ cap; carried on the dated card so future
+  days inherit the ceiling (deterministic standing intent without a standing-orders
+  store).
+- **Min-side bounds**: PM-expressed minimum entry / buy-zone lower edge ("$495–500":
+  fill ≤$500 but skip below $495) is not expressible — `limit_px` is one-sided
+  max-payable. Proposed BUY `min_px` strength-floor if the trend persists.
+
+Decision rule: do NOT extend the schema until several real binding batches show the
+cap/stop prose habit persisting (a schema change forces re-probing). Revisit after
+~3 observation days; the compliance event stream (`cap_value_usd`/`stop_px`
+population rates) is the trigger.
+
+## 16. Field-absence fallback chain (reference)
+
+| Field absent | Fallback (all hermetic-tested) |
+|---|---|
+| Sizing (value_usd/shares/fraction_held) | Impossible — schema requires exactly one; missing = invalid block → whole ticker takes the legacy tier path |
+| stop_px on BUY | Default −8% GTC stop from reference close (stop_loss_pct) |
+| limit_px on BUY | Protection ceiling (ref × (1 + entry_protection_pct)) — the legacy capped-limit entry |
+| limit_px on SELL | Market sell at the open |
+| stop_px on partial-sell remainder | Re-anchor at the cancelled original stop (cancel_stops_for return); none found → standard −8% stop (never naked) |
+| cap_value_usd | No per-order clamp; top-level bounds still apply (account cash, tripwire, STRESS, broker buying power) |
+| Entire execution block | Legacy path, byte-identical today behavior |
