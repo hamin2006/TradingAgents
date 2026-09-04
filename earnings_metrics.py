@@ -120,7 +120,7 @@ def _call_extract_llm(text: str, filing_date: str) -> dict:
         api_key=os.environ.get("OPENROUTER_API_KEY", "missing"),
         base_url=os.environ.get("OPENROUTER_BASE_URL",
                                 "https://openrouter.ai/api/v1"),
-        max_tokens=int(os.environ.get("EDGAR_EXTRACT_MAX_TOKENS", "1200")),
+        max_tokens=int(os.environ.get("EDGAR_EXTRACT_MAX_TOKENS", "4000")),
         temperature=0.0, timeout=int(os.environ.get("EDGAR_EXTRACT_TIMEOUT_S", "300")))
     prompt = (
         f"This is the earnings release of a company filed on {filing_date}.\n"
