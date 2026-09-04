@@ -146,6 +146,21 @@ class TestTagAndComputation:
         assert f.ttm("NetCashProvidedByUsedInOperatingActivities",
                      as_of="2026-08-01") == pytest.approx(2_350_000_000.0)
 
+    def test_shares_falls_back_to_weighted_average(self, http):
+        """EL class (live QA): no dei outstanding-shares instant ever filed;
+        the diluted weighted average (duration rows) is the fallback."""
+        raw = companyfacts()
+        del raw["facts"]["dei"]["EntityCommonStockSharesOutstanding"]
+        raw["facts"]["us-gaap"]["WeightedAverageNumberOfDilutedSharesOutstanding"] = {
+            "label": "x", "description": "x", "units": {"shares": [{
+                "start": "2026-04-01", "end": "2026-06-30",
+                "val": 105_000_000, "accn": "ACC-W", "fy": 2026, "fp": "Q2",
+                "form": "10-Q", "filed": "2026-07-24", "frame": "CY2026Q2"}]}}
+        routes, _ = http
+        routes["companyfacts/CIK0000872589.json"] = edgar._jb(raw)
+        f = edgar.load_facts("REGN")
+        assert f.shares_outstanding(as_of="2026-08-01") == 105_000_000
+
 
 class TestClient:
     def test_fetch_error_raises_edgar_error(self, http):

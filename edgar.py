@@ -284,9 +284,21 @@ class Facts:
         return None if best is None else float(best["val"])
 
     def shares_outstanding(self, as_of: str) -> int | None:
-        val = self.latest_instant("EntityCommonStockSharesOutstanding",
-                                  as_of, unit="shares", namespace="dei")
-        return None if val is None else int(val)
+        for tags, ns in ((["EntityCommonStockSharesOutstanding"], "dei"),
+                         (["CommonStockSharesOutstanding"], "us-gaap")):
+            val = self.latest_instant(tags, as_of, unit="shares", namespace=ns)
+            if val is not None:
+                return int(val)
+        # Filers like EL never tag an outstanding-shares instant; the diluted
+        # weighted average (quarterly duration) is the closest coverage.
+        best = None
+        for row in (self._rows("WeightedAverageNumberOfDilutedSharesOutstanding",
+                               unit="shares") or []):
+            if row.get("filed", "") > as_of:
+                continue
+            if best is None or (row.get("end") or "") >= (best.get("end") or ""):
+                best = row
+        return None if best is None else int(best["val"])
 
 
 def load_facts(ticker: str) -> Facts:
