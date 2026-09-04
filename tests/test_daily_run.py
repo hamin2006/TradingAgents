@@ -1605,3 +1605,18 @@ class TestPmExecutionBinding:
         assert _run_exec(cfg, broker) == 0
         orders = broker.place_market_orders.call_args[0][0]
         assert orders[0].stop_price == round(100.0 * 0.92, 2)  # -8% of close
+
+    def test_pm_buy_clamped_to_account_cash(self, cfg):
+        """PM orders size explicitly and bypass the legacy cash-derived slice
+        math — but the account cash still caps them: a block asking for more
+        than the account can cover must clamp, never oversize."""
+        cfg["pm_execution"] = True
+        cfg["capital"] = 100_000
+        _ratings_v2_file(cfg, {"NOW": "Overweight"}, {"NOW": {
+            "orders": [{"kind": "BUY", "value_usd": 50_000.0}]}})
+        broker = _exec_broker(cash=6_000.0)   # account can only cover ~$6k
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert len(orders) == 1
+        assert orders[0].action == "BUY"
+        assert orders[0].shares * 100.0 <= 6_000.0  # <= cash at $100 close

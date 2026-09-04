@@ -1698,6 +1698,28 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 orders = [o for o in orders if o.ticker != ticker]
                 orders.extend(block_orders)
 
+        # PM orders size explicitly and bypass the legacy cash-derived slice
+        # math — but the account cash still caps them. A block asking for
+        # more than the account can cover clamps to the cash-based share
+        # count (the broker would otherwise reject or the paper margin fill
+        # an unintended oversize).
+        if cfg.get("pm_execution", False):
+            from dataclasses import replace as replace_order
+            for i, o in enumerate(orders):
+                if (o.reason == "pm-execution" and o.action == "BUY"
+                        and last_close.get(o.ticker)):
+                    max_shares = int(capital / last_close[o.ticker])
+                    if max_shares < 1:
+                        max_shares = 1  # never below one share once priced in
+                    if o.shares > max_shares:
+                        logger.warning(
+                            "%s: PM buy %d shares (~$%.0f) exceeds the account "
+                            "cash-based cap; clamping to %d shares (~$%.0f)",
+                            o.ticker, o.shares,
+                            o.shares * last_close[o.ticker], max_shares,
+                            max_shares * last_close[o.ticker])
+                        orders[i] = replace_order(o, shares=max_shares)
+
         # Overnight-move tripwire: an event between the analysis cutoff and
         # the open (CEO death, disaster, guidance cut) shows up in the
         # pre-market quote before it reaches any article feed we parse. A

@@ -647,3 +647,63 @@ def test_cancel_stops_for_returns_cancelled_stops(broker):
     cancelled = b.cancel_stops_for(["EL"])
     assert cancelled == {"EL": [{"stop_price": 95.6, "qty": 8}]}
     assert mock_client.cancel_order_by_id.call_count == 1
+
+
+def test_partial_sell_unfilled_final_round_reattaches_whole_stop(broker):
+    """A floor-limited partial sell that never fills: the original stop was
+    disarmed pre-open, so the FINAL cancellation must re-anchor a stop for
+    the whole position — never leave it naked between runs."""
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-s1"
+    submitted.status = "new"
+    submitted.filled_qty = "0"
+    submitted.filled_avg_price = "0"
+    mock_client.submit_order.return_value = submitted
+    mock_client.get_order_by_id.return_value = submitted
+    mock_client.get_orders.return_value = []
+    pos = MagicMock()
+    pos.symbol = "EL"
+    pos.qty = "8"  # nothing was sold
+    mock_client.get_all_positions.return_value = [pos]
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0,
+                  500.0, 500.0, 500.0, 500.0, 650.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=2, reason="pm-execution",
+                   protection_price=100.5, stop_price=95.6)])
+    stop_requests = [c[0][0] for c in mock_client.submit_order.call_args_list
+                     if c[0][0].type.value == "stop"]
+    # round 1: cancelled + retried (no stop yet); round 2 (final): cancelled
+    # then the remainder stop must attach for the WHOLE position
+    assert len(stop_requests) == 1
+    assert stop_requests[0].qty == 8
+    assert stop_requests[0].stop_price == 95.6
+    assert reports[0]["filled"] == 0
+
+
+def test_partial_sell_unfilled_first_round_no_premature_stop(broker):
+    """Round 1 of an unfilled partial sell must NOT attach a stop while the
+    retry is still pending — a stop plus the live retry could double-sell."""
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-s1"
+    submitted.status = "new"
+    submitted.filled_qty = "0"
+    submitted.filled_avg_price = "0"
+    mock_client.submit_order.return_value = submitted
+    mock_client.get_order_by_id.return_value = submitted
+    mock_client.get_orders.return_value = []
+    mock_client.get_all_positions.return_value = []
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports, retryable = b._place_batch(
+            [Order(ticker="EL", action="SELL", shares=2, reason="pm-execution",
+                   protection_price=100.5, stop_price=95.6)])
+    stop_requests = [c[0][0] for c in mock_client.submit_order.call_args_list
+                     if c[0][0].type.value == "stop"]
+    assert stop_requests == []
+    assert len(retryable) == 1
+    assert reports[0]["filled"] == 0

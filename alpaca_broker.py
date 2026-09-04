@@ -164,12 +164,16 @@ class AlpacaBroker:
             logger.warning("retrying %d unfilled order(s) once: %s",
                            len(retryable),
                            ", ".join(o.ticker for o in retryable))
-            second_reports, _ = self._place_batch(retryable)
+            # The retry round is ALWAYS final: an order still unfilled after
+            # it must not be re-anchored-then-resubmitted (stop + live order
+            # could double-sell) nor left naked (its stop was disarmed).
+            second_reports, _ = self._place_batch(retryable, final_round=True)
             for o, r in zip(retryable, second_reports, strict=False):
                 results[id(o)] = r
         return [results[id(o)] for o in orders]
 
-    def _place_batch(self, orders: list[Order]) -> tuple[list[dict], list[Order]]:
+    def _place_batch(self, orders: list[Order],
+                     final_round: bool = False) -> tuple[list[dict], list[Order]]:
         """Submit + poll + finalize one batch of orders (no retries).
 
         Returns (reports in input order, orders to retry once): an order is
@@ -233,6 +237,8 @@ class AlpacaBroker:
             status = final[submitted.id]
             filled = _filled_qty(status)
             avg_price = _filled_avg(status)
+            cancelled_dead = False   # definitively dead this round
+            fill_unknown = False     # cancel raced a possible late fill
             try:
                 if filled == 0:
                     # Only reached after the main window + grace requeries.
@@ -244,13 +250,16 @@ class AlpacaBroker:
                         self._client.cancel_order_by_id(submitted.id)
                         logger.warning("order for %s not filled in %ds; cancelled",
                                        o.ticker, FILL_TIMEOUT_S)
-                        retryable.append(o)
+                        cancelled_dead = True
+                        if not final_round:
+                            retryable.append(o)
                     except Exception as cancel_exc:  # noqa: BLE001
                         with contextlib.suppress(Exception):
                             status = self._client.get_order_by_id(submitted.id)
                         filled = _filled_qty(status)
                         avg_price = _filled_avg(status)
                         if filled == 0:
+                            fill_unknown = True
                             logger.error("cancel failed for %s: %s "
                                          "(fill status unknown)", o.ticker, cancel_exc)
                 else:
@@ -296,29 +305,34 @@ class AlpacaBroker:
                         self._client.submit_order(stop_request)
                         logger.info("attached GTC stop %s for %s (%d shares)",
                                     o.stop_price, o.ticker, filled)
-                    elif o.action == "SELL" and filled > 0:
-                        # Leftover-stop cleanup first (never cancel the fresh
-                        # remainder stop below).
-                        self._cancel_open_stops(o.ticker)
-                        if o.stop_price:
-                            # PM execution: a partial sell re-anchors the
-                            # remainder. Sized to the ACTUAL remaining position
-                            # after the fill — never the intended remainder.
-                            remain = self._position_qty(o.ticker)
-                            if remain and remain > 0:
-                                stop_request = StopOrderRequest(
-                                    symbol=o.ticker, qty=remain,
-                                    side=OrderSide.SELL,
-                                    type=OrderType.STOP,
-                                    stop_price=o.stop_price,
-                                    time_in_force=TimeInForce.GTC,
-                                    extended_hours=False,
-                                )
-                                self._client.submit_order(stop_request)
-                                logger.info(
-                                    "re-anchored GTC stop %s for %s remainder "
-                                    "(%d shares)", o.stop_price, o.ticker,
-                                    remain)
+
+                # PM execution: a partial-sell remainder (or a partial sell
+                # that never filled and is now definitively dead) must be
+                # re-anchored — the pre-open disarm already cancelled the
+                # original stop, so skipping this would leave the position
+                # naked between runs. Never attach while a retry is pending
+                # (stop + live retry could double-sell) or when the fill
+                # status is unknown (the order may still fill today).
+                if (o.action == "SELL" and not fill_unknown
+                        and (filled > 0 or (cancelled_dead and final_round))):
+                    # Leftover-stop cleanup (full exits keep their belt-and-
+                    # braces cleanup; never cancels the fresh stop below).
+                    self._cancel_open_stops(o.ticker)
+                    if o.stop_price is not None:
+                        remain = self._position_qty(o.ticker)
+                        if remain and remain > 0:
+                            stop_request = StopOrderRequest(
+                                symbol=o.ticker, qty=remain,
+                                side=OrderSide.SELL,
+                                type=OrderType.STOP,
+                                stop_price=o.stop_price,
+                                time_in_force=TimeInForce.GTC,
+                                extended_hours=False,
+                            )
+                            self._client.submit_order(stop_request)
+                            logger.info(
+                                "re-anchored GTC stop %s for %s remainder "
+                                "(%d shares)", o.stop_price, o.ticker, remain)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
             reports.append({"ticker": o.ticker, "action": o.action,
