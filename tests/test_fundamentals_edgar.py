@@ -70,6 +70,17 @@ class TestFundamentalsPayload:
         assert "Forward EPS consensus" not in out
         assert "Revenue (TTM)" in out  # EDGAR core survives
 
+    def test_missing_quarter_warning(self, facts):
+        """BDX/MRNA class (live QA): a fiscal quarter absent from the rows
+        must be called out — a TTM built over the gap silently undercounts."""
+        ends = ["2025-06-30", "2025-12-31", "2026-03-31", "2026-06-30"]
+        missing = fe._missing_quarters(ends)
+        assert missing == ["2025-09-30"]
+
+    def test_no_warning_on_contiguous_quarters(self, facts):
+        ends = ["2025-09-30", "2025-12-31", "2026-03-31", "2026-06-30"]
+        assert fe._missing_quarters(ends) == []
+
 
 class TestStatementRenderers:
     def test_income_quarterly_columns(self, facts):

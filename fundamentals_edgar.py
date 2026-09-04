@@ -126,6 +126,32 @@ def _last_close(ticker: str) -> float | None:
 # renderers
 # --------------------------------------------------------------------------
 
+def _missing_quarters(ends: list[str]) -> list[str]:
+    """Calendar quarters between the oldest and newest coverage end that have
+    no statement row (e.g. BDX 2025-09-30, MRNA 2025-12-31 — live QA finds).
+    A TTM built over a gap silently undercounts; the payload must say so."""
+    if len(ends) < 4:
+        return []
+    import calendar as _cal
+    missing = []
+    try:
+        first = datetime.strptime(ends[0], "%Y-%m-%d")
+        last = datetime.strptime(ends[-1], "%Y-%m-%d")
+    except ValueError:
+        return []
+    seen = set(ends)
+    y, q = first.year, (first.month - 1) // 3 + 1
+    while (y, q) <= (last.year, (last.month - 1) // 3 + 1):
+        month_end = _cal.monthrange(y, q * 3)[1]
+        end = f"{y}-{q * 3:02d}-{month_end:02d}"
+        if end not in seen:
+            missing.append(end)
+        q += 1
+        if q > 4:
+            q, y = 1, y + 1
+    return missing
+
+
 def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
                         price: float | None, identity: dict,
                         consensus: dict, today: str | None = None) -> str:
@@ -148,6 +174,12 @@ def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
         # quarter as current.
         rows.append(("Latest filed quarter-end (statements)",
                      q_rows[-1]["end"]))
+        missing = _missing_quarters([r["end"] for r in q_rows])
+        if missing:
+            rows.append(("TTM coverage warning",
+                         "non-contiguous quarters: no statement rows for "
+                         + ", ".join(missing)
+                         + " — trailing sums may undercount"))
 
     rev = _usd(revenue_ttm(facts, curr_date))
     gp = _usd(_ttm(facts, _GP_TAGS, curr_date))
