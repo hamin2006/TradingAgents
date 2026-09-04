@@ -1,5 +1,6 @@
 """tests/test_decisions.py"""
-from decisions import compute_orders
+from decisions import compute_orders, orders_from_execution
+from pm_execution import ExecutionIntent, PmOrder
 
 RATINGS = {"AAPL": "Buy", "MSFT": "Hold", "NVDA": "Overweight", "TSLA": "Sell"}
 HOLDINGS = {"TSLA": 40}
@@ -148,3 +149,151 @@ def test_position_cap_prioritizes_buy_over_overweight():
     orders = compute_orders(ratings, holdings, close, capital=100_000, max_positions=10)
     buys = [o.ticker for o in orders if o.action == "BUY"]
     assert buys == ["B"]  # conviction wins the last slot
+
+
+def _intent(orders, **extra):
+    return ExecutionIntent(orders=[
+        PmOrder(**o) for o in orders], **extra)
+
+
+class TestOrdersFromExecutionBuy:
+    def test_value_usd_sizes_and_protects(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 200.0}])
+        orders, clamps = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25},
+            entry_protection_pct=2.0, stop_px_band_pct=(3, 25))
+        assert len(orders) == 1
+        o = orders[0]
+        assert (o.ticker, o.action, o.shares) == ("HPE", "BUY", 3)
+        assert o.protection_price == round(54.25 * 1.02, 2)  # ceiling
+        assert o.stop_price == round(54.25 * 0.92, 2)        # default -8%
+        assert o.reason == "pm-execution"
+        assert clamps == []
+
+    def test_pm_limit_only_tightens_the_ceiling(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 200.0,
+                           "limit_px": 54.0}])
+        orders, _ = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25},
+            entry_protection_pct=2.0, stop_px_band_pct=(3, 25))
+        assert orders[0].protection_price == 54.0
+
+    def test_pm_limit_above_ceiling_clamped_to_ceiling(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 200.0,
+                           "limit_px": 60.0}])
+        orders, _ = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25},
+            entry_protection_pct=2.0, stop_px_band_pct=(3, 25))
+        assert orders[0].protection_price == round(54.25 * 1.02, 2)
+
+    def test_stop_clamped_into_band(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 200.0,
+                           "stop_px": 40.0}])   # -26%: below the band
+        orders, clamps = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25},
+            stop_px_band_pct=(3, 25))
+        assert orders[0].stop_price == round(54.25 * 0.75, 2)  # 25% floor
+        assert any("stop" in c for c in clamps)
+
+    def test_stop_within_band_kept(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 200.0,
+                           "stop_px": 45.7}])   # -16%
+        orders, clamps = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25},
+            stop_px_band_pct=(3, 25))
+        assert orders[0].stop_price == 45.7
+        assert clamps == []
+
+    def test_cap_value_clamps_shares(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 500.0,
+                           "cap_value_usd": 200.0}])
+        orders, _ = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25})
+        assert orders[0].shares == 3  # 200 / 54.25
+
+    def test_order_below_minimum_skipped(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 10.0}])
+        orders, clamps = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25},
+            min_order_value_usd=50.0)
+        assert orders == []
+        assert any("minimum" in c for c in clamps)
+
+    def test_shares_sized_buy(self):
+        intent = _intent([{"kind": "BUY", "shares": 5}])
+        orders, _ = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25})
+        assert orders[0].shares == 5
+
+    def test_held_add_allowed(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 200.0}])
+        orders, _ = orders_from_execution(
+            intent, ticker="HPE", holdings={"HPE": 10},
+            last_close={"HPE": 54.25})
+        assert len(orders) == 1 and orders[0].action == "BUY"
+
+    def test_missing_close_falls_back_to_legacy(self):
+        intent = _intent([{"kind": "BUY", "value_usd": 200.0}])
+        orders, clamps = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={})
+        assert orders is None  # legacy skips tickers without a close anyway
+        assert any("close" in c for c in clamps)
+
+    def test_buy_with_fraction_invalid_falls_back(self):
+        intent = _intent([{"kind": "BUY", "fraction_held": 0.5}])
+        orders, clamps = orders_from_execution(
+            intent, ticker="HPE", holdings={}, last_close={"HPE": 54.25})
+        assert orders is None
+        assert any("fraction" in c for c in clamps)
+
+
+class TestOrdersFromExecutionSell:
+    def test_shares_partial_sell(self):
+        intent = _intent([{"kind": "SELL", "shares": 2, "limit_px": 100.5,
+                           "stop_px": 95.6}])
+        orders, _ = orders_from_execution(
+            intent, ticker="EL", holdings={"EL": 8},
+            last_close={"EL": 101.15}, stop_px_band_pct=(3, 25))
+        assert len(orders) == 1
+        o = orders[0]
+        assert (o.action, o.shares) == ("SELL", 2)
+        assert o.protection_price == 100.5   # floor limit
+        assert o.stop_price == 95.6          # remainder re-anchor
+        assert o.reason == "pm-execution"
+
+    def test_fraction_trim_rounds_down_to_whole(self):
+        intent = _intent([{"kind": "SELL", "fraction_held": 0.25}])
+        orders, _ = orders_from_execution(
+            intent, ticker="EL", holdings={"EL": 8},
+            last_close={"EL": 101.15})
+        assert orders[0].shares == 2
+
+    def test_fraction_one_sells_all(self):
+        intent = _intent([{"kind": "SELL", "fraction_held": 1.0}])
+        orders, _ = orders_from_execution(
+            intent, ticker="EL", holdings={"EL": 8},
+            last_close={"EL": 101.15})
+        assert orders[0].shares == 8
+        assert orders[0].stop_price is None  # nothing left to re-anchor
+
+    def test_sell_of_non_held_invalid_falls_back(self):
+        intent = _intent([{"kind": "SELL", "shares": 2}])
+        orders, clamps = orders_from_execution(
+            intent, ticker="EL", holdings={}, last_close={"EL": 101.15})
+        assert orders is None
+        assert any("not held" in c for c in clamps)
+
+    def test_sell_more_than_held_invalid(self):
+        intent = _intent([{"kind": "SELL", "shares": 9}])
+        orders, clamps = orders_from_execution(
+            intent, ticker="EL", holdings={"EL": 8},
+            last_close={"EL": 101.15})
+        assert orders is None
+        assert any("held" in c for c in clamps)
+
+    def test_empty_orders_is_explicit_no_order(self):
+        intent = _intent([])
+        orders, _ = orders_from_execution(
+            intent, ticker="EL", holdings={"EL": 8},
+            last_close={"EL": 101.15})
+        assert orders == []

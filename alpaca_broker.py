@@ -159,13 +159,13 @@ class AlpacaBroker:
         # the limit), so the retry catches paper-engine latency-cancels and
         # cap-edge fades without ever chasing a gap beyond the protection.
         first_reports, retryable = self._place_batch(orders)
-        results = {id(o): r for o, r in zip(orders, first_reports)}
+        results = {id(o): r for o, r in zip(orders, first_reports, strict=False)}
         if retryable:
             logger.warning("retrying %d unfilled order(s) once: %s",
                            len(retryable),
                            ", ".join(o.ticker for o in retryable))
             second_reports, _ = self._place_batch(retryable)
-            for o, r in zip(retryable, second_reports):
+            for o, r in zip(retryable, second_reports, strict=False):
                 results[id(o)] = r
         return [results[id(o)] for o in orders]
 
@@ -191,6 +191,14 @@ class AlpacaBroker:
             if o.action == "BUY" and o.protection_price:
                 # Plain protection-capped limit entry — NO OTO bracket (the
                 # paper engine inverts the pair at the open; see module doc).
+                request = LimitOrderRequest(
+                    symbol=o.ticker, qty=o.shares, side=side,
+                    type=OrderType.LIMIT, limit_price=o.protection_price,
+                    time_in_force=TimeInForce.DAY, extended_hours=False,
+                )
+            elif o.action == "SELL" and o.protection_price:
+                # PM execution: SELL with a floor limit — fills only if the
+                # auction print is at/above the floor; else day-expiry no-fill.
                 request = LimitOrderRequest(
                     symbol=o.ticker, qty=o.shares, side=side,
                     type=OrderType.LIMIT, limit_price=o.protection_price,
@@ -289,7 +297,28 @@ class AlpacaBroker:
                         logger.info("attached GTC stop %s for %s (%d shares)",
                                     o.stop_price, o.ticker, filled)
                     elif o.action == "SELL" and filled > 0:
+                        # Leftover-stop cleanup first (never cancel the fresh
+                        # remainder stop below).
                         self._cancel_open_stops(o.ticker)
+                        if o.stop_price:
+                            # PM execution: a partial sell re-anchors the
+                            # remainder. Sized to the ACTUAL remaining position
+                            # after the fill — never the intended remainder.
+                            remain = self._position_qty(o.ticker)
+                            if remain and remain > 0:
+                                stop_request = StopOrderRequest(
+                                    symbol=o.ticker, qty=remain,
+                                    side=OrderSide.SELL,
+                                    type=OrderType.STOP,
+                                    stop_price=o.stop_price,
+                                    time_in_force=TimeInForce.GTC,
+                                    extended_hours=False,
+                                )
+                                self._client.submit_order(stop_request)
+                                logger.info(
+                                    "re-anchored GTC stop %s for %s remainder "
+                                    "(%d shares)", o.stop_price, o.ticker,
+                                    remain)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
             reports.append({"ticker": o.ticker, "action": o.action,
@@ -359,27 +388,57 @@ class AlpacaBroker:
         except Exception:  # noqa: BLE001 - a quote is best-effort, never blocking
             return None
 
-    def cancel_stops_for(self, tickers: list[str]) -> None:
+    def _position_qty(self, symbol: str) -> int:
+        """Current share count for a symbol (0 when flat/unknown)."""
+        try:
+            for pos in self._client.get_all_positions():
+                if pos.symbol == symbol:
+                    return int(pos.qty)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not fetch position qty for %s: %s",
+                           symbol, exc)
+        return 0
+
+    def cancel_stops_for(self, tickers: list[str]) -> dict[str, list[dict]]:
         """Cancel resting GTC stops for symbols being sold (exit guard).
 
         Called by the execute pass BEFORE the market opens: if a rating exit
         sells at the open while its stop is still resting, a gap through the
         stop level could fill BOTH orders at the auction (stop + market
         sell) and double-sell the position into an unintended short.
-        """
-        for ticker in tickers:
-            self._cancel_open_stops(ticker)
 
-    def _cancel_open_stops(self, symbol: str) -> None:
-        """Cancel leftover stop orders for a symbol after a rating exit."""
+        Returns {ticker: [{"stop_price", "qty"}]} of the cancelled stops so
+        a partial-sell remainder can be re-anchored at the original level.
+        """
+        cancelled: dict[str, list[dict]] = {}
+        for ticker in tickers:
+            stops = self._cancel_open_stops(ticker)
+            if stops:
+                cancelled[ticker] = stops
+        return cancelled
+
+    def _cancel_open_stops(self, symbol: str) -> list[dict]:
+        """Cancel leftover stop orders for a symbol; return what was cancelled."""
+        cancelled = []
         try:
             request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
             for order in self._client.get_orders(request):
                 if (order.symbol == symbol and order.type == "stop"):
+                    try:
+                        stop_price = float(getattr(order, "stop_price", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        stop_price = 0.0
+                    try:
+                        qty = int(getattr(order, "qty", 0) or 0)
+                    except (TypeError, ValueError):
+                        qty = 0
                     self._client.cancel_order_by_id(order.id)
-                    logger.info("cancelled leftover stop %s for %s", order.id, symbol)
+                    logger.info("cancelled leftover stop %s for %s", order.id,
+                                symbol)
+                    cancelled.append({"stop_price": stop_price, "qty": qty})
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not cancel open stops for %s: %s", symbol, exc)
+        return cancelled
 
     def disconnect(self) -> None:
         pass  # stateless REST client; nothing to tear down

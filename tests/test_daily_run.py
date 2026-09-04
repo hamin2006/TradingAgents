@@ -1476,3 +1476,118 @@ def test_run_execute_tripwire_disabled_at_zero(cfg):
     assert rc == 0
     args = broker.place_market_orders.call_args[0][0]
     assert [o.ticker for o in args] == ["AAPL"]
+
+
+def _ratings_v2_file(cfg, ratings, execution, day="2026-09-04"):
+    import pathlib
+    payload = {"date": day, "ratings": ratings, "failures": [],
+               "schema_version": 2, "execution": execution}
+    path = pathlib.Path(cfg["results_dir"]) / f"ratings_{day}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _exec_broker(cash=10_000.0):
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, cash)
+    broker.cancel_stops_for.return_value = {}
+    broker.place_market_orders.return_value = []
+    return broker
+
+
+def _run_exec(cfg, broker, day="2026-09-04"):
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(
+            *[int(p) for p in day.split("-")])
+        return run_execute(cfg)
+
+
+class TestPmExecutionBinding:
+    def test_block_replaces_legacy_partial_sell(self, cfg):
+        cfg["pm_execution"] = True
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5,
+                        "stop_px": 95.6}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert len(orders) == 1
+        o = orders[0]
+        assert (o.action, o.shares, o.protection_price, o.stop_price) == (
+            "SELL", 2, 100.5, 95.6)
+        assert broker.cancel_stops_for.call_args[0][0] == ["EL"]
+
+    def test_explicit_empty_block_overrides_legacy_exit(self, cfg):
+        cfg["pm_execution"] = True
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {"orders": []}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert orders == []
+
+    def test_invalid_block_falls_back_to_legacy(self, cfg):
+        cfg["pm_execution"] = True
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2, "fraction_held": 0.5}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert len(orders) == 1
+        assert (orders[0].action, orders[0].shares) == ("SELL", 8)
+
+    def test_pm_buy_sizes_from_block_not_legacy(self, cfg):
+        cfg["pm_execution"] = True
+        cfg["capital"] = 100_000
+        _ratings_v2_file(cfg, {"NOW": "Overweight"}, {"NOW": {
+            "orders": [{"kind": "BUY", "value_usd": 500.0,
+                        "cap_value_usd": 1000.0}]}})
+        broker = _exec_broker(cash=100_000.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert len(orders) == 1
+        assert orders[0].action == "BUY"
+        assert orders[0].shares == 5          # 500 / 100.0 close
+        assert orders[0].reason == "pm-execution"
+
+    def test_partial_sell_without_pm_stop_reuses_original(self, cfg):
+        cfg["pm_execution"] = True
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        broker.cancel_stops_for.return_value = {
+            "EL": [{"stop_price": 95.6, "qty": 8}]}
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert orders[0].stop_price == 95.6  # original resting stop reused
+
+    def test_mixed_blocks_and_legacy_tickers(self, cfg):
+        cfg["pm_execution"] = True
+        cfg["capital"] = 100_000
+        _ratings_v2_file(cfg, {"EL": "Underweight", "AAPL": "Buy"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2}]}})
+        broker = _exec_broker(cash=100_000.0)
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 100_000.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        by_ticker = {o.ticker: o for o in orders}
+        assert by_ticker["EL"].shares == 2    # block governs
+        assert by_ticker["AAPL"].action == "BUY"  # legacy slice for others
+
+    def test_binding_off_ignores_blocks(self, cfg):
+        cfg["pm_execution"] = False
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert len(orders) == 1
+        assert (orders[0].action, orders[0].shares) == ("SELL", 8)

@@ -1661,6 +1661,43 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
             stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
             conviction_weights=cfg.get("conviction_weights"))
 
+        # PM execution binding (phase 2): per-ticker execution blocks from
+        # the ratings file (schema_version 2) replace the legacy tier orders
+        # for their tickers. present-valid + orders -> binding orders;
+        # explicit empty -> NO order today (overrides legacy, including a
+        # rating exit); invalid / absent / block the engine cannot honor ->
+        # the legacy compute_orders path for that ticker only.
+        if cfg.get("pm_execution", False) and isinstance(
+                payload.get("execution"), dict):
+            from decisions import orders_from_execution as orders_from_block
+            from pm_execution import EXECUTION_VALID, extract_execution
+
+            for ticker in sorted(payload["execution"]):
+                status, intent, reason = extract_execution(
+                    {"execution": payload["execution"][ticker]})
+                if status != EXECUTION_VALID:
+                    logger.warning("%s: invalid execution block (%s); "
+                                   "legacy path", ticker, reason)
+                    continue
+                block_orders, clamps = orders_from_block(
+                    intent, ticker=ticker, holdings=holdings,
+                    last_close=last_close,
+                    entry_protection_pct=float(cfg.get("screener", {}).get(
+                        "entry_protection_pct", 2.0)),
+                    stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
+                    stop_px_band_pct=tuple(cfg.get("stop_px_band_pct",
+                                                   [3.0, 25.0])),
+                    min_order_value_usd=float(
+                        cfg.get("min_order_value_usd", 50.0)))
+                for clamp in clamps:
+                    logger.warning("PM execution clamp: %s", clamp)
+                if block_orders is None:
+                    logger.warning("%s: execution block not honorable; "
+                                   "legacy path", ticker)
+                    continue
+                orders = [o for o in orders if o.ticker != ticker]
+                orders.extend(block_orders)
+
         # Overnight-move tripwire: an event between the analysis cutoff and
         # the open (CEO death, disaster, guidance cut) shows up in the
         # pre-market quote before it reaches any article feed we parse. A
@@ -1709,10 +1746,31 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         # auction, a gap through the stop level could double-sell the
         # position into an unintended short (EL-class exit, 2026-09-04).
         sells = [o.ticker for o in orders if o.action == "SELL"]
+        cancelled = {}
         if sells and hasattr(broker, "cancel_stops_for") and not dry_run:
             logger.info("cancelling stops before the open for exit(s): %s",
                         ", ".join(sells))
-            broker.cancel_stops_for(sells)
+            try:
+                cancelled = broker.cancel_stops_for(sells)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("stop disarm failed for %s: %s", sells, exc)
+            if not isinstance(cancelled, dict):
+                cancelled = {}
+        # Partial-sell remainder re-anchor fallback: a partial SELL without a
+        # PM stop re-anchors the remainder at the ORIGINAL cancelled stop
+        # level (spec: PM stop_px if given, else the cancelled original stop).
+        if cancelled:
+            from dataclasses import replace as replace_order
+            for i, o in enumerate(orders):
+                if (o.action == "SELL" and o.stop_price is None
+                        and o.shares < holdings.get(o.ticker, 0)):
+                    stops = cancelled.get(o.ticker) or []
+                    if stops and stops[0].get("stop_price"):
+                        logger.info(
+                            "%s: partial sell of %d/%d re-anchors remainder "
+                            "at original stop %.2f", o.ticker, o.shares,
+                            holdings.get(o.ticker, 0), stops[0]["stop_price"])
+                        orders[i] = replace_order(o, stop_price=stops[0]["stop_price"])
 
         wait = _seconds_until_open()
         if wait > 0 and not dry_run:

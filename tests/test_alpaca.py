@@ -564,3 +564,86 @@ def test_get_current_price_none_on_error(broker):
     b, mock_client, _ = broker
     mock_client.get_last_trade.side_effect = Exception("feed down")
     assert b.get_current_price("EL") is None
+
+
+def test_place_sell_with_floor_uses_limit(broker):
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-s1"
+    submitted.status = "filled"
+    submitted.filled_qty = "2"
+    submitted.filled_avg_price = "101.0"
+    mock_client.submit_order.return_value = submitted
+    mock_client.get_order_by_id.return_value = submitted
+    mock_client.get_orders.return_value = []
+    with patch("alpaca_broker.time.sleep"):
+        reports = b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=2, reason="pm-execution",
+                   protection_price=100.5, stop_price=95.6)])
+    req = mock_client.submit_order.call_args[0][0]
+    assert req.symbol == "EL"
+    assert req.side.value == "sell"
+    assert req.limit_price == 100.5
+    assert reports[0]["filled"] == 2
+
+
+def test_partial_sell_reattaches_stop_for_remainder(broker):
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-s1"
+    submitted.status = "filled"
+    submitted.filled_qty = "2"
+    submitted.filled_avg_price = "101.0"
+    mock_client.submit_order.return_value = submitted
+    mock_client.get_order_by_id.return_value = submitted
+    mock_client.get_orders.return_value = []  # no leftover stops
+
+    pos = MagicMock()
+    pos.symbol = "EL"
+    pos.qty = "6"  # 8 held - 2 sold
+    mock_client.get_all_positions.return_value = [pos]
+    with patch("alpaca_broker.time.sleep"):
+        b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=2, reason="pm-execution",
+                   stop_price=95.6)])
+    stop_requests = [c[0][0] for c in mock_client.submit_order.call_args_list
+                     if c[0][0].type.value == "stop"]
+    assert len(stop_requests) == 1
+    assert stop_requests[0].qty == 6
+    assert stop_requests[0].stop_price == 95.6
+
+
+def test_full_sell_without_stop_attaches_nothing(broker):
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-s1"
+    submitted.status = "filled"
+    submitted.filled_qty = "8"
+    submitted.filled_avg_price = "100.0"
+    mock_client.submit_order.return_value = submitted
+    mock_client.get_order_by_id.return_value = submitted
+    mock_client.get_orders.return_value = []
+    with patch("alpaca_broker.time.sleep"):
+        b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=8, reason="rating exit")])
+    assert not any(c[0][0].type.value == "stop"
+                   for c in mock_client.submit_order.call_args_list)
+
+
+def test_cancel_stops_for_returns_cancelled_stops(broker):
+    b, mock_client, _ = broker
+    stop = MagicMock()
+    stop.symbol = "EL"
+    stop.type = "stop"
+    stop.stop_price = "95.6"
+    stop.qty = "8"
+    other = MagicMock()
+    other.symbol = "EL"
+    other.type = "limit"
+    other_symbol = MagicMock()
+    other_symbol.symbol = "MSFT"
+    other_symbol.type = "stop"
+    mock_client.get_orders.return_value = [stop, other, other_symbol]
+    cancelled = b.cancel_stops_for(["EL"])
+    assert cancelled == {"EL": [{"stop_price": 95.6, "qty": 8}]}
+    assert mock_client.cancel_order_by_id.call_count == 1

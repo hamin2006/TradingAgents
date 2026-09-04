@@ -57,6 +57,21 @@ broker: alpaca
 alpaca:
   paper: true                # ALWAYS true for this system — never live
 
+# PM execution intent (spec 2026-09-04; all code landed, production OFF).
+# execution_intent = observe phase: the PM's structured decision gains an
+#   `execution` block; per-ticker dated decision cards are written and
+#   injected into future PM prompts (confirm-or-refute); compliance events
+#   stream. Engine behavior is unchanged (legacy tier sizing).
+# pm_execution = binding phase: valid execution blocks REPLACE the legacy
+#   tier orders for their tickers (sizes, limits, stops, partial sells);
+#   explicit empty block = no order today; invalid/absent = legacy fallback.
+execution_intent: false
+pm_execution: false
+stop_px_band_pct: [3, 25]  # PM stop clamp band (% below reference close)
+min_order_value_usd: 50    # order-size floor after rounding
+card_max_age_days: 21      # decision-card freshness gate for PM injection
+card_flip_inject_max: 3    # cards injected when the latest two ratings flip
+
 ibkr:
   host: 127.0.0.1
   port: 7497               # paper trading port
