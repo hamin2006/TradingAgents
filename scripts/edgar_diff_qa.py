@@ -12,6 +12,9 @@ Usage:
 
 from __future__ import annotations
 
+import glob
+import json
+import os
 import sys
 import time
 
@@ -122,6 +125,7 @@ def default_pool() -> list[str]:
     """Most recent ratings pool (any day) plus the current holdings."""
     import glob
     import os
+
 
     tickers = set()
     files = sorted(glob.glob(os.path.expanduser(
