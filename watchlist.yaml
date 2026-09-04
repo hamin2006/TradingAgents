@@ -34,7 +34,9 @@ screener:
   pool_size: 50            # ranked queue depth the daily draw may use
   candidate_slots: 8       # candidates drawn daily from the ranked queue
   min_watchlist_size: 5    # production gate (test: 1)
-  exclusion_days: 3        # churn guard; keep candidates as fresh as possible
+  exclusion_days: 0        # churn guard OFF (2026-09-04): rank alone spaces re-looks —
+                           # a name that doesn't move doesn't rank; one that rips (catalyst)
+                           # rises. Window only ever delayed re-entry (PLTR/HOOD class).
   entry_protection_pct: 5.0
   regime_gate: true        # SPY/SMA200 x VIX: WARN drops 1m tail, STRESS pauses buys
   min_buy_quota: 5         # keep analyzing deeper pool candidates until this many
