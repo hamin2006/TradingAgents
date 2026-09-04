@@ -13,7 +13,7 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
     ["seed_watchlist", "capital", "max_positions", "max_order_value_cap",
      "screener", "ibkr", "alpaca", "broker", "trading_enabled",
      "analyze_max_workers", "stop_loss_pct", "conviction_weights",
-     "openrouter_provider_pins"]
+     "openrouter_provider_pins", "fundamentals_source"]
 )
 
 # App-level defaults for keys the framework does not know about. These live
@@ -61,6 +61,11 @@ APP_DEFAULTS = {
     # Alpaca: secrets come from ALPACA_API_KEY / ALPACA_SECRET_KEY env vars,
     # never from yaml. paper=True is the safe default; flip only with intent.
     "alpaca": {"paper": True},
+    # Fundamentals source: "edgar" serves statements/metrics from SEC
+    # companyfacts (as-filed, point-in-time) with consensus kept from Yahoo;
+    # "yfinance" is the upstream vendor payload. EDGAR failures fall back to
+    # the yfinance path automatically, so a flip is safe.
+    "fundamentals_source": "yfinance",
     # IBKR (kept for the flip to a paper Gateway): host/port of the local
     # Gateway, not account credentials.
     "ibkr": {"host": "127.0.0.1", "port": 7497, "client_id": 1},

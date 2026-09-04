@@ -1,0 +1,258 @@
+"""edgar.py — SEC EDGAR client (companyfacts + submissions), as-of semantics.
+
+Read-only consumption of SEC public APIs (no key): companyfacts XBRL data and
+the submissions index. Everything the framework's fundamentals hybrid and the
+corporate-events feed need: CIK resolution, per-ticker companyfacts with
+point-in-time filtering (``filed <= as-of`` — no restatement lookahead),
+amendment dedupe, fiscal-quarter TTM math, tag fallback chains, and computed
+metrics (EBITDA, FCF, buybacks, dividends, shares).
+
+SEC etiquette: descriptive User-Agent, paced requests (>= 1s apart, shared
+RLock — the analyze run fans out over 4 worker threads). All fetches go
+through the module-level ``_http_get`` seam so hermetic tests inject fixtures
+without network. Companyfacts/submissions payloads cache to disk per CIK.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+UA = "TradingAgents research contact@example.com"
+DATA_BASE = "https://data.sec.gov"
+_CIK_URL = DATA_BASE + "/files/company_tickers.json"
+_FACTS_URL = DATA_BASE + "/api/xbrl/companyfacts/CIK{}.json"
+_SUBMISSIONS_URL = DATA_BASE + "/submissions/CIK{}.json"
+_CACHE_ENV = "EDGAR_CACHE_DIR"
+_MIN_INTERVAL_S = 1.0
+_CACHE_TTL_S = 24 * 3600
+
+_Q_FRAME = re.compile(r"^CY(\d{4})Q([1-4])$")
+
+class EdgarError(Exception):
+    """EDGAR fetch/parse failure (callers fall back, never crash the run)."""
+
+
+def _jb(payload) -> bytes:
+    return json.dumps(payload).encode()
+
+
+_request_lock = threading.Lock()
+_last_request_at: float = 0.0
+
+
+def _http_get(url: str) -> bytes:
+    """Fetch a URL with SEC etiquette. Paced module-wide (worker threads)."""
+    global _last_request_at
+    with _request_lock:
+        wait = _MIN_INTERVAL_S - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read()
+            _last_request_at = time.monotonic()
+            return body
+        except Exception as exc:  # noqa: BLE001
+            raise EdgarError(f"EDGAR fetch failed for {url}: {exc}") from exc
+
+
+def _cache_dir() -> Path:
+    return Path(os.environ.get(_CACHE_ENV, Path.home() / ".tradingagents" / "cache" / "edgar"))
+
+
+def clear_cache() -> None:
+    """Drop in-memory caches (tests)."""
+    _cik_cache.clear()
+
+
+def _cache_read(kind: str, key: str) -> bytes | None:
+    path = _cache_dir() / f"{kind}-{key}.json"
+    try:
+        if path.stat().st_mtime < time.time() - _CACHE_TTL_S:
+            return None
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _cache_write(kind: str, key: str, body: bytes) -> None:
+    try:
+        path = _cache_dir() / f"{kind}-{key}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(body)
+        tmp.rename(path)
+    except OSError:
+        pass  # cache is best-effort
+
+
+_cik_cache: dict[str, str] = {}
+
+
+def _cik_map() -> dict[str, str]:
+    """ticker (upper) -> zero-padded CIK; loaded once per process."""
+    if not _cik_cache:
+        try:
+            rows = json.loads(_http_get(_CIK_URL))
+        except (EdgarError, json.JSONDecodeError) as exc:
+            raise EdgarError(f"could not load EDGAR ticker map: {exc}") from exc
+        for row in rows:
+            _cik_cache[str(row["ticker"]).upper()] = str(row["cik_str"]).zfill(10)
+    return _cik_cache
+
+
+def resolve_cik(ticker: str) -> str:
+    """CIK for a ticker (zero-padded, dashless)."""
+    cik = _cik_map().get(ticker.strip().upper())
+    if not cik:
+        raise EdgarError(f"no EDGAR CIK for ticker {ticker}")
+    return cik
+
+
+def _load_json(kind: str, url: str) -> dict:
+    key = url.rsplit("/", 1)[-1].replace(".json", "")
+    body = _cache_read(kind, key)
+    if body is None:
+        body = _http_get(url)
+        _cache_write(kind, key, body)
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise EdgarError(f"EDGAR returned non-JSON for {url}") from exc
+
+
+class Facts:
+    """Point-in-time view over a company's companyfacts payload."""
+
+    def __init__(self, raw: dict):
+        self._facts = raw.get("facts", {})
+        self._us_gaap = self._facts.get("us-gaap", {})
+        self._dei = self._facts.get("dei", {})
+
+    # -- row access ----------------------------------------------------------
+
+    def _rows(self, tags, namespace="us-gaap", unit="USD"):
+        table = self._us_gaap if namespace == "us-gaap" else self._dei
+        if isinstance(tags, str):
+            tags = [tags]
+        for tag in tags:
+            entries = table.get(tag, {}).get("units", {}).get(unit)
+            if entries:
+                return list(entries)
+        return None
+
+    def _as_of_ok(self, row, as_of: str) -> bool:
+        if row.get("filed", "") > as_of:
+            return False
+        end = row.get("end") or row.get("start")
+        return end is None or end <= as_of
+
+    @staticmethod
+    def _quarter_key(row) -> tuple[int, int] | None:
+        frame = row.get("frame") or ""
+        m = _Q_FRAME.match(frame)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        end = row.get("end")
+        if not end or row.get("start") is None:
+            return None
+        try:
+            dt = datetime.strptime(end, "%Y-%m-%d")
+        except ValueError:
+            return None
+        return dt.year, (dt.month - 1) // 3 + 1
+
+    # -- quarterly duration facts -------------------------------------------
+
+    def quarters(self, tags, as_of: str, unit="USD"):
+        """Fiscal-quarter duration rows as of ``as_of`` (future filings
+        excluded), deduped per quarter by latest ``filed``."""
+        rows = self._rows(tags, unit=unit) or []
+        by_key: dict[tuple[int, int], dict] = {}
+        for row in rows:
+            if row.get("start") is None:
+                continue  # duration only
+            key = self._quarter_key(row)
+            if key is None or not self._as_of_ok(row, as_of):
+                continue
+            prev = by_key.get(key)
+            if prev is None or row["filed"] >= prev["filed"]:
+                by_key[key] = row
+        return [by_key[k] for k in sorted(by_key)]
+
+    def ttm(self, tags, as_of: str, unit="USD") -> float | None:
+        """Trailing twelve months: sum of the last 4 fiscal quarters on file
+        (fewer is allowed for young filers); None when no quarters exist."""
+        rows = self.quarters(tags, as_of, unit)
+        if not rows:
+            return None
+        return round(float(sum(r["val"] for r in rows[-4:])), 2)
+
+    # -- instant facts -------------------------------------------------------
+
+    def latest_instant(self, tags, as_of: str, unit="USD",
+                       namespace="us-gaap") -> float | None:
+        rows = self._rows(tags, namespace=namespace, unit=unit) or []
+        best = None
+        for row in rows:
+            if row.get("start") is not None:
+                continue  # instant only
+            if not self._as_of_ok(row, as_of):
+                continue
+            if best is None or (row.get("end") or "") >= (best.get("end") or ""):
+                best = row
+        return None if best is None else float(best["val"])
+
+    def shares_outstanding(self, as_of: str) -> int | None:
+        val = self.latest_instant("EntityCommonStockSharesOutstanding",
+                                  as_of, unit="shares", namespace="dei")
+        return None if val is None else int(val)
+
+
+def load_facts(ticker: str) -> Facts:
+    """Companyfacts for a ticker (disk-cached per CIK)."""
+    cik = resolve_cik(ticker)
+    raw = _load_json("facts", _FACTS_URL.format(cik))
+    return Facts(raw)
+
+
+class Submissions:
+    def __init__(self, raw: dict):
+        self.cik = str(raw.get("cik", "")).zfill(10)
+        self._recent = raw.get("filings", {}).get("recent", {})
+
+    def recent(self, since: str) -> list[dict]:
+        """Filings filed on/after ``since`` (YYYY-MM-DD), newest last."""
+        out = []
+        for i, accn in enumerate(self._recent.get("accessionNumber", [])):
+            filed = self._recent.get("filingDate", [])[i] if i < len(
+                self._recent.get("filingDate", [])) else ""
+            if filed >= since:
+                out.append({
+                    "accession_number": accn,
+                    "form": self._recent.get("form", [])[i] if i < len(
+                        self._recent.get("form", [])) else "",
+                    "filing_date": filed,
+                    "primary_document": self._recent.get("primaryDocument", [])[
+                        i] if i < len(self._recent.get("primaryDocument", [])) else "",
+                })
+        return out
+
+
+def load_submissions(ticker: str) -> Submissions:
+    """Submissions index for a ticker (disk-cached per CIK)."""
+    cik = resolve_cik(ticker)
+    raw = _load_json("subs", _SUBMISSIONS_URL.format(cik))
+    return Submissions(raw)
+
+
+def now_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")

@@ -690,6 +690,163 @@ def _reset_portfolio_context() -> None:
         _portfolio_cache["snap"] = None
 
 
+# --- EDGAR fundamentals (companyfacts as-filed, config-gated) ---------------
+
+_EDGAR_FUNDAMENTALS_PATCHED = False
+_EDGAR_FUNDAMENTALS_ORIGINALS: dict[str, object] = {}
+
+
+def _reset_edgar_fundamentals() -> None:
+    """Restore the four fundamentals tool .funcs (tests; safe anytime)."""
+    global _EDGAR_FUNDAMENTALS_PATCHED
+    if not _EDGAR_FUNDAMENTALS_PATCHED:
+        return
+    import tradingagents.agents.utils.fundamental_data_tools as fdt
+
+    for name, original in _EDGAR_FUNDAMENTALS_ORIGINALS.items():
+        getattr(fdt, name).func = original
+    _EDGAR_FUNDAMENTALS_ORIGINALS.clear()
+    _EDGAR_FUNDAMENTALS_PATCHED = False
+
+
+def _ensure_edgar_fundamentals(cfg: dict) -> None:
+    """Swap the four fundamentals tools to EDGAR companyfacts when
+    ``fundamentals_source: edgar`` (default yfinance = no-op).
+
+    The renderers raise EdgarError on ingest failure; each wrapped func then
+    falls back to the recorded yfinance original so fundamentals never go
+    dark mid-batch.
+    """
+    global _EDGAR_FUNDAMENTALS_PATCHED
+    if _EDGAR_FUNDAMENTALS_PATCHED or cfg.get("fundamentals_source") != "edgar":
+        return
+    import edgar
+    import fundamentals_edgar
+    import tradingagents.agents.utils.fundamental_data_tools as fdt
+
+    _METHOD_TO_TOOL = {
+        "get_fundamentals": ("payload_for", ("ticker", "curr_date")),
+        "get_balance_sheet": ("statements_for", None),
+        "get_cashflow": ("statements_for", None),
+        "get_income_statement": ("statements_for", None),
+    }
+    for name in _METHOD_TO_TOOL:
+        tool = getattr(fdt, name)
+        original = tool.func
+        _EDGAR_FUNDAMENTALS_ORIGINALS[name] = original
+
+        def make_wrapped(tool_name, orig):
+            def wrapped(*args, **kwargs):
+                try:
+                    if tool_name == "get_fundamentals":
+                        ticker = kwargs.get("ticker", args[0] if args else "")
+                        curr_date = kwargs.get("curr_date",
+                                               args[1] if len(args) > 1 else "")
+                        return fundamentals_edgar.payload_for(ticker, curr_date)
+                    freq = kwargs.get("freq", "quarterly")
+                    curr_date = kwargs.get("curr_date")
+                    ticker = kwargs.get("ticker", args[0] if args else "")
+                    return fundamentals_edgar.statements_for(
+                        tool_name, ticker, freq, curr_date)
+                except edgar.EdgarError:
+                    logger.warning("EDGAR fundamentals failed for %s; "
+                                   "falling back to yfinance", tool_name)
+                    return orig(*args, **kwargs)
+            wrapped._wrapped_original = orig
+            return wrapped
+
+        tool.func = make_wrapped(name, original)
+    _EDGAR_FUNDAMENTALS_PATCHED = True
+
+
+# --- market tape + corporate events (context injection) ---------------------
+#
+# Wraps the SAME seam as the portfolio stance (resolve_instrument_context) so
+# every agent sees one dated block: market tape (SPY/VIX/sector — the audit
+# showed debates arguing regime-blind) and corporate events (Form 4s + 8-K —
+# the framework's insider tool was never invoked and its vendor lags days).
+# Chain AFTER _ensure_portfolio_context: each installer preserves the
+# previously installed wrapper as its _wrapped_original.
+
+_TAFE_PATCHED = False
+_TAFE_ORIGINAL = None
+
+_extras_memo: dict[str, str] = {}
+_extras_lock = threading.RLock()
+
+
+def _reset_extras_memo() -> None:
+    with _extras_lock:
+        _extras_memo.clear()
+
+
+def _instrument_extras(ticker: str) -> str:
+    """Composed, memoized context extras ("" on any failure)."""
+    with _extras_lock:
+        if ticker in _extras_memo:
+            return _extras_memo[ticker]
+    parts = []
+    try:
+        import corp_events
+        import earnings_metrics
+        import market_tape
+
+        sector = None
+        try:
+            from tradingagents.agents.utils.agent_utils import resolve_instrument_identity
+            sector = (resolve_instrument_identity(ticker) or {}).get("sector")
+        except Exception:  # noqa: BLE001 - identity is optional context
+            pass
+        events = corp_events.events_block(ticker)
+        tape = market_tape.tape_line(sector=sector)
+        earnings = earnings_metrics.earnings_line(ticker)
+        for block in (events, earnings, tape):
+            if block:
+                parts.append(block)
+    except Exception:  # noqa: BLE001 - extras are decoration
+        pass
+    result = "\n\n".join(parts)
+    with _extras_lock:
+        _extras_memo[ticker] = result
+    return result
+
+
+def _reset_tape_and_events() -> None:
+    """Restore the context seam (tests; safe anytime)."""
+    global _TAFE_PATCHED, _TAFE_ORIGINAL
+    if _TAFE_PATCHED and _TAFE_ORIGINAL is not None:
+        import tradingagents.graph.trading_graph as tg_mod
+
+        tg_mod.TradingAgentsGraph.resolve_instrument_context = _TAFE_ORIGINAL
+    _TAFE_PATCHED = False
+    _TAFE_ORIGINAL = None
+    _reset_extras_memo()
+
+
+def _ensure_tape_and_events() -> None:
+    """Append market-tape and corporate-events blocks to the instrument
+    context every agent receives (idempotent, revertible)."""
+    global _TAFE_PATCHED, _TAFE_ORIGINAL
+    if _TAFE_PATCHED:
+        return
+    import tradingagents.graph.trading_graph as tg_mod
+
+    _TAFE_ORIGINAL = tg_mod.TradingAgentsGraph.resolve_instrument_context
+    original = _TAFE_ORIGINAL
+
+    def resolve_with_extras(self, ticker: str, asset_type: str = "stock") -> str:
+        base = original(self, ticker, asset_type)
+        if asset_type == "stock":
+            extras = _instrument_extras(ticker)
+            if extras:
+                return f"{base}\n\n{extras}".strip()
+        return base
+
+    resolve_with_extras._wrapped_original = original
+    tg_mod.TradingAgentsGraph.resolve_instrument_context = resolve_with_extras
+    _TAFE_PATCHED = True
+
+
 # --- structured-output fallback visibility (F3) ------------------------------
 #
 # When an agent's structured-output invocation fails (schema rejection,
@@ -1121,6 +1278,8 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_analyst_report_recovery()
     _ensure_reasoning_capture()
     _ensure_portfolio_context(cfg)
+    _ensure_edgar_fundamentals(cfg)
+    _ensure_tape_and_events()
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):
