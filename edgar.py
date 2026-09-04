@@ -189,11 +189,29 @@ class Facts:
         table = self._us_gaap if namespace == "us-gaap" else self._dei
         if isinstance(tags, str):
             tags = [tags]
+        # Prefer the candidate with the newest coverage: live PFE class
+        # (2026-09-04 QA) — the company switched revenue tags after 2023, so
+        # 'first tag with any rows' served stale 2022-era numbers while the
+        # current tag sat second in the chain. Ties keep chain order.
+        best_rows: list | None = None
+        best_end = ""
         for tag in tags:
             entries = table.get(tag, {}).get("units", {}).get(unit)
-            if entries:
-                return list(entries)
-        return None
+            if not entries:
+                continue
+            rows = list(entries)
+            if best_rows is None:
+                best_rows, best_end = rows, self._max_row_end(rows)
+                continue
+            end = self._max_row_end(rows)
+            if end > best_end:
+                best_rows, best_end = rows, end
+        return best_rows
+
+    @staticmethod
+    def _max_row_end(rows: list) -> str:
+        ends = [str(r.get("end") or r.get("start") or "") for r in rows]
+        return max(ends) if ends else ""
 
     def _as_of_ok(self, row, as_of: str) -> bool:
         if row.get("filed", "") > as_of:

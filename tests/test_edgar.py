@@ -110,6 +110,26 @@ class TestTagAndComputation:
                      "Revenues"], as_of="2026-08-01")
         assert ttm == pytest.approx((3800 + 3900 + 4000 + 4290) * 1e6)
 
+    def test_tag_chain_prefers_newest_coverage(self, http):
+        """Live PFE class (2026-09-04 QA): the company switched revenue tags
+        after 2023 — the FIRST tag in the chain has rows (stale ones) while
+        the second is current. 'First tag with any rows' served 2022-era
+        numbers; the chain must pick the candidate with the newest coverage."""
+        raw = companyfacts()
+        stale = [{"start": "2023-10-01", "end": "2023-12-31",
+                  "val": 9_000_000_000, "accn": "ACC-OLD", "fy": 2023,
+                  "fp": "Q4", "form": "10-K", "filed": "2024-02-09",
+                  "frame": "CY2023Q4"}]
+        raw["facts"]["us-gaap"][
+            "RevenueFromContractWithCustomerExcludingAssessedTax"] = {
+            "label": "x", "description": "x", "units": {"USD": stale}}
+        routes, _ = http
+        routes["companyfacts/CIK0000872589.json"] = edgar._jb(raw)
+        f = edgar.load_facts("REGN")
+        ttm = f.ttm(["RevenueFromContractWithCustomerExcludingAssessedTax",
+                     "Revenues"], as_of="2026-08-01")
+        assert ttm == pytest.approx((3800 + 3900 + 4000 + 4290) * 1e6)
+
     def test_ttm_missing_tag_returns_none(self, http):
         routes, _ = http
         routes["companyfacts/CIK0000872589.json"] = edgar._jb(companyfacts())

@@ -140,6 +140,15 @@ def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
                                  f"as of {curr_date}); consensus via Yahoo "
                                  f"quote as of {today}"))
 
+    q_rows = facts.quarters(_REVENUE_TAGS, curr_date)
+    if q_rows:
+        # Window-lag visibility (2026-09-04 QA): when the latest quarter is
+        # only in the press release (10-Q unfiled), EDGAR statements end one
+        # quarter earlier — say so instead of letting analysts read a stale
+        # quarter as current.
+        rows.append(("Latest filed quarter-end (statements)",
+                     q_rows[-1]["end"]))
+
     rev = _usd(revenue_ttm(facts, curr_date))
     gp = _usd(_ttm(facts, _GP_TAGS, curr_date))
     oi = _usd(_ttm(facts, _OPINC_TAGS, curr_date))

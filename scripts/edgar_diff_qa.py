@@ -56,7 +56,11 @@ def edgar_metrics(ticker: str, as_of: str) -> dict:
         "assets": facts.latest_instant(fe._ASSETS_TAGS, as_of),
         "shares": facts.shares_outstanding(as_of),
     }
-    return {k: v for k, v in out.items() if v is not None}
+    out = {k: v for k, v in out.items() if v is not None}
+    q_rows = facts.quarters(fe._REVENUE_TAGS, as_of)
+    if q_rows:
+        out["latest_quarter_end"] = q_rows[-1]["end"]
+    return out
 
 
 def yahoo_metrics(ticker: str) -> dict:
@@ -99,14 +103,26 @@ def main(tickers: list[str]) -> int:
             flagged += 1
             continue
         row = [f"{ticker}"]
+        q_end = ed.get("latest_quarter_end")
         for field, tol in TOLERANCE.items():
+            if field == "latest_quarter_end":
+                continue
             a, b = ed.get(field), yh.get(field)
             if a is None and b is None:
                 row.append(f"{field}: both n/a")
                 continue
-            if a is None or b is None:
-                row.append(f"{field}: EDGAR {a} vs YAHOO {b} (missing side)")
-                flagged += 1
+            if a is None and b is not None:
+                # EDGAR lacks the field: flag except GP (biotechs expense R&D
+                # and never report a gross-profit line — by design).
+                if field == "gross_profit_ttm":
+                    row.append(f"{field}: no EDGAR tag (R&D-expensed, likely "
+                               f"by design)")
+                else:
+                    row.append(f"{field}: EDGAR missing, YAHOO {b/1e9:.1f}B")
+                    flagged += 1
+                continue
+            if a is not None and b is None:
+                row.append(f"{field}: yahoo lacks field (skip)")
                 continue
             delta = pct(a, b)
             checked += 1
@@ -114,6 +130,8 @@ def main(tickers: list[str]) -> int:
             if mark == "FLAG":
                 flagged += 1
             row.append(f"{field}: {delta:+.1f}% {mark}")
+        if q_end:
+            row.append(f"latest-filed-quarter {q_end}")
         print(" | ".join(row))
         time.sleep(0.2)
     print(f"\n{len(tickers)} tickers, {checked} comparable fields, "
@@ -123,8 +141,6 @@ def main(tickers: list[str]) -> int:
 
 def default_pool() -> list[str]:
     """Most recent ratings pool (any day) plus the current holdings."""
-    import glob
-    import os
 
 
     tickers = set()
@@ -132,7 +148,8 @@ def default_pool() -> list[str]:
         "~/.tradingagents/logs/ratings_*.json")))
     if files:
         try:
-            d = json.load(open(files[-1]))
+            with open(files[-1]) as fh:
+                d = json.load(fh)
             tickers |= set(d.get("ratings", {}).keys())
         except (OSError, ValueError):
             pass
