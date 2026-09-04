@@ -162,3 +162,57 @@ class TestRender:
         card = _card("2026-09-03", "Overweight")
         del card["executive_summary"]
         assert "2026-09-03" in render_prior_decisions("EL", [card])
+
+
+class TestRenderFullSummaryAndExecution:
+    LONG_SUMMARY = "s" * 300
+    PM_SUMMARY = ("Initiate DASH with a measured starter probe of 1-2% of book "
+                  "near $222; scale additional capital only on stabilization "
+                  "near $205-$210, a reclaim of the 10-EMA with improving "
+                  "momentum, or a breakout above $236.93; cap total exposure at "
+                  "6%; hard stop at $205.50 on the probe; horizon 3-6 months.")
+
+    def test_full_summary_not_truncated(self):
+        card = _card("2026-09-04", "Overweight",
+                     summary=self.PM_SUMMARY)
+        block = render_prior_decisions("DASH", [card])
+        assert "stabilization near $205-$210" in block
+        assert "hard stop at $205.50" in block
+        assert len(self.PM_SUMMARY) > 220  # the old cut would have dropped these
+
+    def test_thesis_not_rendered_in_prompt(self):
+        card = _card("2026-09-04", "Overweight", summary="short plan")
+        card["investment_thesis"] = "a very long re-litigable essay " * 50
+        block = render_prior_decisions("EL", [card])
+        assert "essay" not in block
+
+    def test_execution_orders_render_deterministically(self):
+        card = _card("2026-09-04", "Overweight", summary="plan")
+        card["execution"] = {"orders": [
+            {"kind": "BUY", "value_usd": 200.0, "limit_px": 54.25,
+             "stop_px": 45.7, "cap_value_usd": 500.0}],
+            "future_notes": "add tranche 2 on MACD flip"}
+        block = render_prior_decisions("HPE", [card])
+        assert "BUY $200" in block
+        assert "<= $54.25" in block or "≤ $54.25" in block
+        assert "stop $45.70" in block
+        assert "cap $500" in block
+        assert "add tranche 2 on MACD flip" in block
+
+    def test_partial_sell_orders_render(self):
+        card = _card("2026-09-04", "Underweight", summary="trim")
+        card["execution"] = {"orders": [
+            {"kind": "SELL", "shares": 2, "limit_px": 100.5,
+             "stop_px": 95.6}]}
+        block = render_prior_decisions("EL", [card])
+        assert "SELL 2 shares" in block
+        assert ">= $100.50" in block or "≥ $100.50" in block
+
+    def test_actual_engine_orders_render(self):
+        card = _card("2026-09-04", "Overweight", summary="plan")
+        card["actual"] = {"orders": [
+            {"action": "BUY", "shares": 3, "stop_price": 202.0}],
+            "note": "pre-binding: legacy engine"}
+        block = render_prior_decisions("DASH", [card])
+        assert "actual (legacy engine" in block or "actual" in block
+        assert "BUY 3" in block

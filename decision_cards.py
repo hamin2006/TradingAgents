@@ -109,15 +109,93 @@ def select_cards_for_injection(fresh: list[dict], flip_max: int) -> list[dict]:
     return fresh[-max(1, int(flip_max)):]
 
 
-def _short_summary(card: dict, limit: int = 220) -> str:
-    """One-line projection of the executive summary for prompt injection."""
-    summary = card.get("executive_summary") or card.get("investment_thesis") or ""
-    text = " ".join(str(summary).split())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+def _summary_text(card: dict) -> str:
+    """The PM's executive summary, verbatim (bounded by schema design)."""
+    summary = card.get("executive_summary")
+    return " ".join(str(summary).split()) if summary else ""
+
+
+def _order_line(order: dict) -> str:
+    """Deterministic one-line projection of a PmOrder for the prompt."""
+    kind = order.get("kind", "?")
+    value = order.get("value_usd")
+    shares = order.get("shares")
+    fraction = order.get("fraction_held")
+    if value is not None:
+        size = f"${value:g}"
+    elif shares is not None:
+        size = f"{shares} shares"
+    elif fraction is not None:
+        size = f"{fraction * 100:g}% of held"
+    else:
+        size = "?"
+    parts = [f"{kind} {size}"]
+    limit = order.get("limit_px")
+    if limit is not None:
+        cmp_ = "<=" if kind == "BUY" else ">="
+        parts.append(f"@{cmp_} ${limit:.2f}")
+    stop = order.get("stop_px")
+    if stop is not None:
+        parts.append(f"stop ${stop:.2f}")
+    cap = order.get("cap_value_usd")
+    if cap is not None:
+        parts.append(f"cap ${cap:g}")
+    return ", ".join(parts)
+
+
+def _execution_lines(card: dict) -> list[str]:
+    """Prompt lines from the execution block (orders + advisory fields)."""
+    lines = []
+    execution = card.get("execution")
+    if not isinstance(execution, dict):
+        return lines
+    orders = execution.get("orders") or []
+    for order in orders:
+        if isinstance(order, dict) and order.get("kind"):
+            lines.append(f"orders: {_order_line(order)}")
+    invalidation = execution.get("invalidation_px")
+    if invalidation is not None:
+        lines.append(f"invalid: ${invalidation:g} (advisory, never executed)")
+    future = execution.get("future_notes")
+    if future:
+        lines.append(f"future: {' '.join(str(future).split())}")
+    return lines
+
+
+def _actual_lines(card: dict) -> list[str]:
+    """Prompt lines from the machine-recorded actual execution (engine)."""
+    lines = []
+    actual = card.get("actual")
+    if not isinstance(actual, dict):
+        return lines
+    orders = actual.get("orders") or []
+    if not orders:
+        return lines
+    parts = []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        text = f"{o.get('action', '?')} {o.get('shares', '?')} shares"
+        stop = o.get("stop_price")
+        if isinstance(stop, (int, float)):
+            text += f", stop ${stop:.2f}"
+        parts.append(text)
+    if not parts:
+        return lines
+    note = actual.get("note")
+    label = f"actual (engine, {note})" if note else "actual (engine)"
+    lines.append(f"{label}: {'; '.join(parts)}")
+    return lines
 
 
 def render_prior_decisions(ticker: str, cards: list[dict]) -> str:
-    """Framed, dated card block for the PM prompt (empty when no cards)."""
+    """Framed, dated card block for the PM prompt (empty when no cards).
+
+    Renders the full executive summary (bounded by schema design), the
+    deterministic execution-block projection when present, and the
+    machine-recorded actual execution when present. Prior prose is dated +
+    framed as overridable: the anti-anchor is attribution, not truncation.
+    """
     if not cards:
         return ""
     lines = [
@@ -127,7 +205,11 @@ def render_prior_decisions(ticker: str, cards: list[dict]) -> str:
     ]
     for card in reversed(cards):
         rating = card.get("rating", "?")
-        summary = _short_summary(card)
-        lines.append(f"- [{card.get('date')}] {rating}"
-                     + (f" — {summary}" if summary else ""))
+        summary = _summary_text(card)
+        entry = f"- [{card.get('date')}] {rating}"
+        if summary:
+            entry += f" — {summary}"
+        lines.append(entry)
+        lines.extend("    " + line for line in _execution_lines(card))
+        lines.extend("    " + line for line in _actual_lines(card))
     return "\n".join(lines)
