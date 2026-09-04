@@ -88,6 +88,30 @@ class TestEdgarFundamentalsInstaller:
             fdt.get_fundamentals.func = fdt.get_fundamentals.func._wrapped_original \
                 if hasattr(fdt.get_fundamentals.func, "_wrapped_original") else None
 
+    def test_unexpected_edgar_error_still_falls_back(self, monkeypatch):
+        """The never-dark guarantee covers UNEXPECTED failures too: a latent
+        bug or a freak XBRL shape raising KeyError/TypeError deep in the
+        render path must never leave an agent with a tool error — log loudly
+        and serve the recorded yfinance original."""
+        from tradingagents.agents.utils import fundamental_data_tools as fdt
+
+        daily_run._reset_edgar_fundamentals()
+        fdt.get_fundamentals.func = lambda t, d: "YF-FALLBACK"  # fake original
+
+        def boom(_t, _d):
+            raise KeyError("freak XBRL shape")
+
+        monkeypatch.setattr(fundamentals_edgar, "payload_for", boom)
+        try:
+            daily_run._ensure_edgar_fundamentals(
+                {"fundamentals_source": "edgar"})
+            out = fdt.get_fundamentals.func("REGN", "2026-09-03")
+            assert out == "YF-FALLBACK"
+        finally:
+            daily_run._reset_edgar_fundamentals()
+            fdt.get_fundamentals.func = fdt.get_fundamentals.func._wrapped_original \
+                if hasattr(fdt.get_fundamentals.func, "_wrapped_original") else None
+
 
 class TestTapeAndEventsInstaller:
     def _install_over_fake(self, monkeypatch):

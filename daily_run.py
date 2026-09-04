@@ -752,6 +752,16 @@ def _ensure_edgar_fundamentals(cfg: dict) -> None:
                     logger.warning("EDGAR fundamentals failed for %s; "
                                    "falling back to yfinance", tool_name)
                     return orig(*args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    # The never-dark guarantee covers UNEXPECTED failures too
+                    # (latent bugs, freak XBRL shapes raising KeyError deep in
+                    # the render path) — an agent must never face a tool error
+                    # with no fundamentals. Loud on purpose: the per-day
+                    # fallback count in summary.json surfaces every case.
+                    logger.error("EDGAR fundamentals UNEXPECTED failure for "
+                                 "%s (%s: %s); falling back to yfinance",
+                                 tool_name, type(exc).__name__, exc)
+                    return orig(*args, **kwargs)
             wrapped._wrapped_original = orig
             return wrapped
 
