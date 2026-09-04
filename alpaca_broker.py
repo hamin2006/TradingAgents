@@ -152,6 +152,35 @@ class AlpacaBroker:
                                 "shares": o.shares, "filled": 0, "avg_price": 0.0})
             return reports
 
+        # Batch 1: submit all + concurrent poll + finalize. Orders cancelled
+        # unfilled (filled==0, cancel SUCCEEDED — the order is provably dead)
+        # get exactly ONE resubmission round: re-submitting the same cap
+        # limit is self-guarding (it only fills while the price is inside
+        # the limit), so the retry catches paper-engine latency-cancels and
+        # cap-edge fades without ever chasing a gap beyond the protection.
+        first_reports, retryable = self._place_batch(orders)
+        results = {id(o): r for o, r in zip(orders, first_reports)}
+        if retryable:
+            logger.warning("retrying %d unfilled order(s) once: %s",
+                           len(retryable),
+                           ", ".join(o.ticker for o in retryable))
+            second_reports, _ = self._place_batch(retryable)
+            for o, r in zip(retryable, second_reports):
+                results[id(o)] = r
+        return [results[id(o)] for o in orders]
+
+    def _place_batch(self, orders: list[Order]) -> tuple[list[dict], list[Order]]:
+        """Submit + poll + finalize one batch of orders (no retries).
+
+        Returns (reports in input order, orders to retry once): an order is
+        retryable only when it was cancelled UNFILLED — never on gap-down
+        undos (deliberate), partial sheds (kept what filled), submit
+        failures (hard rejections), or failed cancels (fill status unknown,
+        a resubmit could double the position).
+        """
+        reports = []
+        retryable = []
+
         # Phase 1: submit EVERY order before polling any. Sequential
         # submit+poll per order let each full poll window delay the next
         # order (live 2026-09-04: NOW was submitted 4.5 minutes after EL);
@@ -207,6 +236,7 @@ class AlpacaBroker:
                         self._client.cancel_order_by_id(submitted.id)
                         logger.warning("order for %s not filled in %ds; cancelled",
                                        o.ticker, FILL_TIMEOUT_S)
+                        retryable.append(o)
                     except Exception as cancel_exc:  # noqa: BLE001
                         with contextlib.suppress(Exception):
                             status = self._client.get_order_by_id(submitted.id)
@@ -265,7 +295,7 @@ class AlpacaBroker:
             reports.append({"ticker": o.ticker, "action": o.action,
                             "shares": o.shares, "filled": filled,
                             "avg_price": round(float(avg_price), 4)})
-        return reports
+        return reports, retryable
 
     def _poll_all_concurrently(self, submissions) -> dict[str, object]:
         """Poll every outstanding order together, round-robin, until each
@@ -282,6 +312,8 @@ class AlpacaBroker:
         limits are lower than production (worst case here: <=10 orders /
         5s round ≈ 120 req/min).
         """
+        if not submissions:
+            return {}
         by_id = {s.id: (o, s, s) for o, s in submissions}
         deadline = time.monotonic() + FILL_TIMEOUT_S
 

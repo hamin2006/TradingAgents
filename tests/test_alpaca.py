@@ -95,21 +95,113 @@ def test_place_sell_uses_market_order(broker):
     assert reports[0]["filled"] == 40
 
 
-def test_unfilled_order_cancelled_after_timeout(broker):
+def test_unfilled_order_cancelled_then_retried_once_and_cancelled(broker):
+    """An order cancelled UNFILLED gets exactly one resubmission round (the
+    retry re-submits the same cap limit, which self-guards: it can only fill
+    while the price is inside the limit). Still unfilled on the second round,
+    it is cancelled for good — no infinite retry."""
     b, mock_client, _ = broker
     submitted = MagicMock()
     submitted.id = "order-1"
     submitted.status = "new"
     mock_client.submit_order.return_value = submitted
     mock_client.get_order_by_id.return_value = submitted
-    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0])  # last tick exceeds deadline (100+120)
+    # round 1: deadline 100+120=220 -> 4 polls then exit; round 2 same again
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0,
+                  500.0, 500.0, 500.0, 500.0, 650.0])
     with patch("alpaca_broker.time.sleep"), \
          patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
         reports = b.place_market_orders(
             [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
                    protection_price=102.0)])
-    mock_client.cancel_order_by_id.assert_called_once_with("order-1")
+    assert mock_client.submit_order.call_count == 2   # entry + one retry
+    assert mock_client.cancel_order_by_id.call_count == 2  # once per round
     assert reports[0]["filled"] == 0
+
+def test_retry_fills_on_second_submission_and_attaches_stop(broker):
+    """The retry round exists for the 09:30 cancel class: the paper engine
+    delayed the first submission past the poll window, but a fresh
+    submission minutes later (after the open queue drains) fills quickly.
+    The second fill must attach the GTC stop exactly like a first-round one."""
+    b, mock_client, _ = broker
+    first = MagicMock()
+    first.id = "order-1"
+    first.status = "new"
+    second = MagicMock()
+    second.id = "order-2"
+    second.status = "filled"
+    second.filled_qty = "10"
+    second.filled_avg_price = "101.5"
+    stop = MagicMock()
+    stop.id = "stop-1"
+    stop.status = "new"
+    mock_client.submit_order.side_effect = [first, second, stop]
+    mock_client.get_order_by_id.return_value = first
+    ticks = iter([100.0, 100.0, 100.0, 250.0,   # round 1: deadline 220, 2 polls, exit
+                  500.0])                       # round 2: instant-fill submit
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
+                   protection_price=102.0, stop_price=92.0)])
+    reqs = [c[0][0] for c in mock_client.submit_order.call_args_list]
+    assert len(reqs) == 3                      # entry + retry + stop
+    assert reqs[0].symbol == "AAPL" and reqs[0].limit_price == 102.0
+    assert reqs[1].limit_price == 102.0        # same cap limit, not raised
+    assert reqs[2].type.value == "stop" and reqs[2].qty == 10
+    mock_client.cancel_order_by_id.assert_called_once_with("order-1")  # first round only
+    assert reports[0] == {"ticker": "AAPL", "action": "BUY", "shares": 10,
+                          "filled": 10, "avg_price": 101.5}
+
+def test_gap_down_undo_is_not_retried(broker):
+    """A gap-down entry is undone deliberately (fill at/below the stop =
+    dead on arrival) — the undo is NOT a cancellable-unfilled order, so the
+    retry round must never re-buy into a gapped-through name."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "filled"
+    entry.filled_qty = "10"
+    entry.filled_avg_price = "90.0"   # below stop 92.0: gapped through
+    undo = MagicMock()
+    undo.id = "undo-1"
+    undo.status = "new"
+    mock_client.submit_order.side_effect = [entry, undo]
+    mock_client.get_order_by_id.return_value = entry
+    with patch("alpaca_broker.time.sleep"):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
+                   protection_price=102.0, stop_price=92.0)])
+    reqs = [c[0][0] for c in mock_client.submit_order.call_args_list]
+    assert len(reqs) == 2                      # entry + undo ONLY, no retry buy
+    assert reqs[1].side.value == "sell" and reqs[1].type.value == "market"
+    assert reports[0]["filled"] == 0
+
+def test_retry_applies_to_unfilled_sell(broker):
+    """Market SELLs can also be cancelled unfilled by paper-engine latency
+    (EL 2026-09-04). An unfilled sell gets the same single retry round."""
+    b, mock_client, _ = broker
+    first = MagicMock()
+    first.id = "order-1"
+    first.status = "new"
+    second = MagicMock()
+    second.id = "order-2"
+    second.status = "filled"
+    second.filled_qty = "8"
+    second.filled_avg_price = "103.91"
+    mock_client.submit_order.side_effect = [first, second]
+    mock_client.get_order_by_id.return_value = first
+    ticks = iter([100.0, 100.0, 100.0, 250.0, 500.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=8, reason="rating exit")])
+    reqs = [c[0][0] for c in mock_client.submit_order.call_args_list]
+    assert len(reqs) == 2
+    assert reqs[0].side.value == "sell" and reqs[1].side.value == "sell"
+    mock_client.cancel_order_by_id.assert_called_once_with("order-1")
+    assert reports[0]["filled"] == 8
+    assert reports[0]["avg_price"] == 103.91
 
 
 def test_fill_landing_in_grace_window_is_not_cancelled(broker):
@@ -231,21 +323,23 @@ def test_buy_bracket_attaches_stop_after_fill(broker):
 def test_unfilled_entry_does_not_attach_stop(broker):
     """If the entry never fills (gap beyond the cap / timeout), no stop-loss
     must be submitted — a stop for a position that does not exist would be
-    rejected and logged as noise."""
+    rejected and logged as noise. The single retry round also never fills
+    and is cancelled; still no stop."""
     b, mock_client, _ = broker
     entry = MagicMock()
     entry.id = "order-1"
     entry.status = "new"
     mock_client.submit_order.return_value = entry
     mock_client.get_order_by_id.return_value = entry
-    ticks = iter([100.0, 100.0, 100.0, 250.0])  # last tick exceeds deadline (100+120)
+    ticks = iter([100.0, 100.0, 100.0, 250.0,   # round 1: deadline 220, 2 polls, exit
+                  500.0, 500.0, 500.0, 650.0])  # round 2: same again
     with patch("alpaca_broker.time.sleep"), \
          patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
         reports = b.place_market_orders(
             [Order(ticker="AAPL", action="BUY", shares=10, reason="entry",
                    protection_price=102.0, stop_price=92.0)])
-    assert mock_client.submit_order.call_count == 1  # entry only, no stop
-    mock_client.cancel_order_by_id.assert_called_once_with("order-1")
+    assert mock_client.submit_order.call_count == 2  # entry + one retry, no stop
+    assert mock_client.cancel_order_by_id.call_count == 2
     assert reports[0]["filled"] == 0
 
 
