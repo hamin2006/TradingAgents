@@ -123,6 +123,12 @@ def resolve_cik(ticker: str) -> str:
     return cik
 
 
+def dashless(accession: str) -> str:
+    """Archives S3 keys use dashless accessions (the API serves them with
+    dashes: '0001663758-26-000002' -> '000166375826000002')."""
+    return accession.replace("-", "")
+
+
 def _load_json(kind: str, url: str) -> dict:
     key = url.rsplit("/", 1)[-1].replace(".json", "")
     body = _cache_read(kind, key)

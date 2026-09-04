@@ -89,13 +89,14 @@ def _fetch_release_text(ticker: str, filing: dict) -> str:
     cik = edgar.resolve_cik(ticker)
     cik_num = str(int(cik))
     accn = filing["accession_number"]
+    accn_dl = edgar.dashless(accn)
     index = json.loads(edgar._http_get(
-        f"https://www.sec.gov/Archives/edgar/data/{cik_num}/{accn}/index.json"))
+        f"https://www.sec.gov/Archives/edgar/data/{cik_num}/{accn_dl}/index.json"))
     primary = filing.get("primary_document") or ""
     name = _pick_exhibit(index) or primary
     if not name:
         raise edgar.EdgarError(f"no document found for {ticker} 8-K {accn}")
-    body = edgar._http_get(_filing_url(cik_num, accn, name))
+    body = edgar._http_get(_filing_url(cik_num, accn_dl, name))
     return _strip_html(body.decode(errors="replace"))[:60000]
 
 

@@ -54,7 +54,7 @@ class TestExhibitLocation:
         hit = em.find_latest_earnings_8k("REGN", window_days=60)
         assert hit is not None
         assert hit["filing_date"] == "2026-09-03"
-        assert hit["accession_number"] == "000166375826000002"
+        assert hit["accession_number"] == "0001663758-26-000002"
 
     def test_no_8k_in_window(self, http):
         http["submissions/CIK0000872589.json"] = edgar._jb(

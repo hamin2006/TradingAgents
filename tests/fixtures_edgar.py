@@ -100,8 +100,8 @@ def companyfacts(ticker="REGN", cik="0000872589"):
 def submissions(ticker="REGN", cik="0000872589", extra_forms=None):
     """Recent-filings list with two Form 4s + one 8-K (today)."""
     forms = extra_forms or ["4", "4", "8-K", "10-Q"]
-    accessions = ["000166375826000002", "000199235226000007",
-                  "000166375826000009", "000166375826000010"]
+    accessions = ["0001663758-26-000002", "0001992352-26-000007",
+                  "0001663758-26-000009", "0001663758-26-000010"]
     dates = ["2026-09-03", "2026-09-03", "2026-09-02", "2026-07-24"]
     docs = ["edgardoc.xml", "edgardoc.xml", "regeneron-8k.htm", "regeneron-10q.htm"]
     return {

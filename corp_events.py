@@ -132,7 +132,7 @@ def _render_trades(trades: list[dict]) -> str:
 
 
 def _form4_url(cik_num: str, accn: str) -> str:
-    return _ARCHIVES.format(cik=cik_num, accn=accn)
+    return _ARCHIVES.format(cik=cik_num, accn=edgar.dashless(accn))
 
 
 def events_block(ticker: str, since: str | None = None) -> str:
