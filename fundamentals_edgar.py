@@ -123,33 +123,63 @@ def _last_close(ticker: str) -> float | None:
 
 
 # --------------------------------------------------------------------------
-# renderers
+# renderers + structural quality gate
 # --------------------------------------------------------------------------
 
-def _missing_quarters(ends: list[str]) -> list[str]:
-    """Calendar quarters between the oldest and newest coverage end that have
-    no statement row (e.g. BDX 2025-09-30, MRNA 2025-12-31 — live QA finds).
-    A TTM built over a gap silently undercounts; the payload must say so."""
-    if len(ends) < 4:
-        return []
-    import calendar as _cal
-    missing = []
-    try:
-        first = datetime.strptime(ends[0], "%Y-%m-%d")
-        last = datetime.strptime(ends[-1], "%Y-%m-%d")
-    except ValueError:
-        return []
-    seen = set(ends)
-    y, q = first.year, (first.month - 1) // 3 + 1
-    while (y, q) <= (last.year, (last.month - 1) // 3 + 1):
-        month_end = _cal.monthrange(y, q * 3)[1]
-        end = f"{y}-{q * 3:02d}-{month_end:02d}"
-        if end not in seen:
-            missing.append(end)
-        q += 1
-        if q > 4:
-            q, y = 1, y + 1
-    return missing
+_STALE_STATEMENT_DAYS = 120
+
+
+def _quarter_gaps(rows: list[dict]) -> list[str]:
+    """Consecutive-row continuity check (start of one vs end of the prior).
+
+    Calendar-end comparison would false-positive on 13-week filers (PFE's
+    quarters end 2026-06-28, not 06-30); adjacency never does. A gap > ~3
+    weeks means the filer's rows skip a quarter (BDX 2025-09-30, MRNA
+    2025-12-31 — live QA finds) and any TTM over it silently undercounts.
+    """
+    gaps: list[str] = []
+    for i in range(1, len(rows)):
+        prev_end = rows[i - 1]["end"]
+        cur_start = rows[i]["start"]
+        cur_end = rows[i]["end"]
+        try:
+            gap_days = (datetime.strptime(cur_start, "%Y-%m-%d")
+                        - datetime.strptime(prev_end, "%Y-%m-%d")).days
+        except (ValueError, TypeError):
+            continue
+        if gap_days > 21:
+            n_missing = max(1, round(gap_days / 90))
+            gaps.append(f"{n_missing} missing quarter(s) between "
+                        f"{prev_end} and {cur_end}")
+    return gaps
+
+
+def structural_quality(facts: edgar.Facts, curr_date: str) -> list[str]:
+    """Structural red flags that make an EDGAR payload untrustworthy.
+
+    The PFE/BDX/MRNA/EL classes (2026-09-04 QA) were all *silent*: stale tag
+    tails, quarter gaps, missing shares produced plausible-looking numbers.
+    Any reason returned here makes the caller fall back to the yfinance
+    originals — wrong-but-plausible must never reach a debate.
+    """
+    reasons: list[str] = []
+    rows = facts.quarters(_REVENUE_TAGS, curr_date)
+    if len(rows) < 4:
+        reasons.append(f"only {len(rows)} revenue quarters on file")
+    gaps = _quarter_gaps(rows)
+    reasons.extend(gaps)
+    if rows:
+        latest = rows[-1]["end"]
+        try:
+            age = (datetime.strptime(curr_date, "%Y-%m-%d")
+                   - datetime.strptime(latest, "%Y-%m-%d")).days
+        except ValueError:
+            age = 0
+        if age > _STALE_STATEMENT_DAYS:
+            reasons.append(f"statements end {latest} ({age}d old)")
+    if facts.shares_outstanding(curr_date) is None:
+        reasons.append("no shares count")
+    return reasons
 
 
 def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
@@ -174,11 +204,9 @@ def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
         # quarter as current.
         rows.append(("Latest filed quarter-end (statements)",
                      q_rows[-1]["end"]))
-        missing = _missing_quarters([r["end"] for r in q_rows])
-        if missing:
-            rows.append(("TTM coverage warning",
-                         "non-contiguous quarters: no statement rows for "
-                         + ", ".join(missing)
+        gaps = _quarter_gaps(q_rows)
+        if gaps:
+            rows.append(("TTM coverage warning", "; ".join(gaps)
                          + " — trailing sums may undercount"))
 
     rev = _usd(revenue_ttm(facts, curr_date))
@@ -336,6 +364,14 @@ def render_cashflow(facts: edgar.Facts, ticker: str, curr_date: str,
 
 def payload_for(ticker: str, curr_date: str) -> str:
     facts = edgar.load_facts(ticker)
+    reasons = structural_quality(facts, curr_date)
+    if reasons:
+        # Wrong-but-plausible must never reach a debate: structural red flags
+        # (stale tag tail, quarter gaps, missing shares) raise so the
+        # installer falls back to the recorded yfinance originals.
+        raise edgar.EdgarError(
+            "EDGAR payload failed the structural quality gate: "
+            + "; ".join(reasons))
     identity = _yf_info_min(ticker)
     consensus = {k: v for k, v in _yf_info_min(ticker).items()
                  if k in ("forward_eps", "target_mean_price",

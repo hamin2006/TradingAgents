@@ -70,16 +70,80 @@ class TestFundamentalsPayload:
         assert "Forward EPS consensus" not in out
         assert "Revenue (TTM)" in out  # EDGAR core survives
 
-    def test_missing_quarter_warning(self, facts):
+    def test_quarter_gap_detected(self):
         """BDX/MRNA class (live QA): a fiscal quarter absent from the rows
-        must be called out — a TTM built over the gap silently undercounts."""
-        ends = ["2025-06-30", "2025-12-31", "2026-03-31", "2026-06-30"]
-        missing = fe._missing_quarters(ends)
-        assert missing == ["2025-09-30"]
+        must be caught by start/end adjacency (not calendar ends — PFE's
+        13-week quarters end 06-28, never a calendar month-end)."""
+        rows = [
+            {"start": "2025-04-01", "end": "2025-06-30"},
+            {"start": "2025-10-01", "end": "2025-12-31"},  # Jul-Sep missing
+            {"start": "2026-01-01", "end": "2026-03-31"},
+            {"start": "2026-04-01", "end": "2026-06-30"},
+        ]
+        gaps = fe._quarter_gaps(rows)
+        assert len(gaps) == 1
+        assert "2025-06-30" in gaps[0]
 
-    def test_no_warning_on_contiguous_quarters(self, facts):
-        ends = ["2025-09-30", "2025-12-31", "2026-03-31", "2026-06-30"]
-        assert fe._missing_quarters(ends) == []
+    def test_no_gap_on_contiguous_13week_filer(self):
+        """PFE-class cadence (quarters ending off calendar month-ends) must
+        not false-positive."""
+        rows = [
+            {"start": "2025-10-01", "end": "2025-12-27"},
+            {"start": "2025-12-28", "end": "2026-03-28"},
+            {"start": "2026-03-29", "end": "2026-06-27"},
+            {"start": "2026-06-28", "end": "2026-09-26"},
+        ]
+        assert fe._quarter_gaps(rows) == []
+
+    def test_structural_quality_passes_on_sound_payload(self, facts):
+        assert fe.structural_quality(facts, "2026-08-01") == []
+
+    def test_structural_quality_flags_stale_statements(self, facts):
+        reasons = fe.structural_quality(facts, "2026-11-15")
+        assert any("old" in r for r in reasons)
+
+    def test_structural_quality_flags_few_quarters(self, facts):
+        reasons = fe.structural_quality(facts, "2026-06-15")
+        assert any("quarters on file" in r for r in reasons)
+
+    def test_structural_quality_flags_missing_shares(self, facts):
+        import edgar
+        from tests.fixtures_edgar import companyfacts
+
+        raw = companyfacts()
+        del raw["facts"]["dei"]["EntityCommonStockSharesOutstanding"]
+        stripped = edgar.Facts(raw)
+        reasons = fe.structural_quality(stripped, "2026-08-01")
+        assert any("shares" in r for r in reasons)
+
+    def test_payload_for_raises_on_quality_gate(self, monkeypatch, tmp_path):
+        """payload_for must refuse to serve structurally broken EDGAR data
+        (the installer then falls back to yfinance) — wrong-but-plausible
+        never reaches a debate."""
+        import edgar as edgar_mod
+        from tests.fixtures_edgar import companyfacts
+
+        monkeypatch.setattr(fe, "_yf_info_min", lambda t: {})
+        monkeypatch.setattr(fe, "_last_close", lambda t: 100.0)
+        monkeypatch.setenv("EDGAR_CACHE_DIR", str(tmp_path / "cache"))
+
+        routes = {
+            "company_tickers.json": (
+                b'[{"cik_str":872589,"ticker":"REGN","title":"Regeneron"}]'),
+            "companyfacts/CIK0000872589.json":
+                edgar_mod._jb(companyfacts()),
+        }
+
+        def fake_get(url: str) -> bytes:
+            for key, payload in routes.items():
+                if key in url:
+                    return payload
+            raise edgar_mod.EdgarError(f"no route for {url}")
+
+        monkeypatch.setattr(edgar_mod, "_http_get", fake_get)
+        edgar_mod.clear_cache()
+        with pytest.raises(edgar_mod.EdgarError, match="quality gate"):
+            fe.payload_for("REGN", "2026-11-15")  # statements 138d old
 
 
 class TestStatementRenderers:
