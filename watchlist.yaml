@@ -65,7 +65,7 @@ alpaca:
 # pm_execution = binding phase: valid execution blocks REPLACE the legacy
 #   tier orders for their tickers (sizes, limits, stops, partial sells);
 #   explicit empty block = no order today; invalid/absent = legacy fallback.
-execution_intent: false
+execution_intent: true
 pm_execution: false
 stop_px_band_pct: [3, 25]  # PM stop clamp band (% below reference close)
 min_order_value_usd: 50    # order-size floor after rounding
