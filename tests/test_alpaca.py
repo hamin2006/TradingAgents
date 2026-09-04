@@ -102,7 +102,7 @@ def test_unfilled_order_cancelled_after_timeout(broker):
     submitted.status = "new"
     mock_client.submit_order.return_value = submitted
     mock_client.get_order_by_id.return_value = submitted
-    ticks = iter([100.0, 100.0, 100.0, 161.0])  # last tick exceeds deadline (100+60)
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0])  # last tick exceeds deadline (100+120)
     with patch("alpaca_broker.time.sleep"), \
          patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
         reports = b.place_market_orders(
@@ -110,6 +110,63 @@ def test_unfilled_order_cancelled_after_timeout(broker):
                    protection_price=102.0)])
     mock_client.cancel_order_by_id.assert_called_once_with("order-1")
     assert reports[0]["filled"] == 0
+
+
+def test_fill_landing_in_grace_window_is_not_cancelled(broker):
+    """A fill that lands after the main deadline but inside the grace
+    requeries must NOT be cancelled — the 2026-09-04 class: EL SELL and the
+    DASH/DXCM entries were cancelled at +60s just before their fills landed
+    (paper-engine open-window latency), EL left naked after its exit
+    pre-disarmed the stop."""
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-1"
+    submitted.status = "new"
+    mock_client.submit_order.return_value = submitted
+    statuses = [
+        MagicMock(status="new", filled_qty="", filled_avg_price=""),   # deadline polls
+        MagicMock(status="new", filled_qty="", filled_avg_price=""),
+        MagicMock(status="filled", filled_qty="8", filled_avg_price="103.91"),  # grace
+    ]
+    mock_client.get_order_by_id.side_effect = statuses
+    ticks = iter([100.0, 100.0, 100.0, 250.0])  # exits main window after 3 polls
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=8, reason="rating exit")])
+    mock_client.cancel_order_by_id.assert_not_called()
+    assert reports[0]["filled"] == 8
+    assert reports[0]["avg_price"] == 103.91
+
+
+def test_grace_fill_on_buy_attaches_stop(broker):
+    """A BUY whose fill lands in the grace window still gets its GTC stop
+    attached, sized to the filled qty."""
+    b, mock_client, _ = broker
+    submitted = MagicMock()
+    submitted.id = "order-1"
+    submitted.status = "new"
+    mock_client.submit_order.return_value = submitted
+    statuses = [
+        MagicMock(status="new", filled_qty="", filled_avg_price=""),   # deadline poll
+        MagicMock(status="partially_filled", filled_qty="3", filled_avg_price="141.59"),
+        MagicMock(status="partially_filled", filled_qty="3", filled_avg_price="141.59"),
+        MagicMock(status="partially_filled", filled_qty="3", filled_avg_price="141.59"),
+    ]
+    mock_client.get_order_by_id.side_effect = statuses
+    ticks = iter([100.0, 100.0, 250.0])  # exits main window after 1 poll
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="NOW", action="BUY", shares=5, reason="entry",
+                   protection_price=152.87, stop_price=133.94)])
+    mock_client.cancel_order_by_id.assert_called_once_with("order-1")  # shed 2-share remainder
+    stop_reqs = [c[0][0] for c in mock_client.submit_order.call_args_list
+                 if c[0][0].type.value == "stop"]
+    assert len(stop_reqs) == 1
+    assert stop_reqs[0].qty == 3
+    assert stop_reqs[0].stop_price == 133.94
+    assert reports[0]["filled"] == 3
 
 
 def test_dry_run_touches_nothing(broker):
@@ -181,7 +238,7 @@ def test_unfilled_entry_does_not_attach_stop(broker):
     entry.status = "new"
     mock_client.submit_order.return_value = entry
     mock_client.get_order_by_id.return_value = entry
-    ticks = iter([100.0, 100.0, 100.0, 161.0])  # last tick exceeds deadline
+    ticks = iter([100.0, 100.0, 100.0, 250.0])  # last tick exceeds deadline (100+120)
     with patch("alpaca_broker.time.sleep"), \
          patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
         reports = b.place_market_orders(
@@ -256,7 +313,7 @@ def test_partial_fill_counts_and_stops_filled_qty(broker):
     stop.status = "new"
     mock_client.submit_order.side_effect = [entry, stop]
     mock_client.get_order_by_id.return_value = entry
-    ticks = iter([100.0, 100.0, 100.0, 161.0])  # partial persists to deadline
+    ticks = iter([100.0, 100.0, 100.0, 250.0])  # partial persists to deadline
     with patch("alpaca_broker.time.sleep"), \
          patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
         reports = b.place_market_orders(
@@ -294,7 +351,7 @@ def test_late_fill_caught_by_grace_check(broker):
     mock_client.submit_order.side_effect = [entry, stop]
     mock_client.get_order_by_id.side_effect = [entry, entry, entry, late]
     # deadline computation eats one monotonic tick, so 5 ticks = 3 polls + exit
-    ticks = iter([100.0, 100.0, 100.0, 100.0, 161.0])
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0])
     with patch("alpaca_broker.time.sleep"), \
          patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
         reports = b.place_market_orders(

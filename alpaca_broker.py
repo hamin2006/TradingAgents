@@ -40,8 +40,15 @@ from decisions import Order
 
 logger = logging.getLogger(__name__)
 
-FILL_TIMEOUT_S = 60
+FILL_TIMEOUT_S = 120
 POLL_INTERVAL_S = 5
+# The paper engine queues open-window orders and fills them with 30-70s
+# latency (verified live 2026-09-03 REGN at +59s; 2026-09-04 EL/DASH/DXCM
+# cancelled at +60s just before their fills landed). After the deadline,
+# requery FILL_GRACE_REQUERIES more times, FILL_GRACE_INTERVAL_S apart,
+# before giving up and cancelling — a cancel must never race a fill.
+FILL_GRACE_REQUERIES = 3
+FILL_GRACE_INTERVAL_S = 10
 
 
 def _filled_qty(status) -> int:
@@ -164,23 +171,9 @@ class AlpacaBroker:
             avg_price = 0.0
             try:
                 submitted = self._client.submit_order(request)
-                deadline = time.monotonic() + FILL_TIMEOUT_S
-                while time.monotonic() < deadline:
-                    status = self._client.get_order_by_id(submitted.id)
-                    filled = _filled_qty(status)
-                    avg_price = _filled_avg(status)
-                    if status.status == "filled" or filled >= o.shares:
-                        break
-                    time.sleep(POLL_INTERVAL_S)
-                else:
-                    # Deadline reached with the order not fully filled: one
-                    # final query before any cancel — a fill landing just past
-                    # the last poll must not be cancelled (live 2026-09-03:
-                    # REGN filled at +59s and the cancel lost the race, leaving
-                    # the position without its stop and the log at filled 0).
-                    status = self._client.get_order_by_id(submitted.id)
-                    filled = _filled_qty(status)
-                    avg_price = _filled_avg(status)
+                status = self._poll_until_filled(submitted, o)
+                filled = _filled_qty(status)
+                avg_price = _filled_avg(status)
                 if filled == 0:
                     self._client.cancel_order_by_id(submitted.id)
                     logger.warning("order for %s not filled in %ds; cancelled",
@@ -236,6 +229,31 @@ class AlpacaBroker:
                             "shares": o.shares, "filled": filled,
                             "avg_price": round(float(avg_price), 4)})
         return reports
+
+    def _poll_until_filled(self, submitted, order) -> object:
+        """Poll an order until it fills or the deadline + grace window passes.
+
+        The Alpaca PAPER engine queues open-window orders and fills them with
+        30-70s latency; a single 60s window with one last query cancelled
+        fills mid-race (live: REGN +59s 2026-09-03; EL/DASH/DXCM ~+60s
+        2026-09-04 — three orders cancelled just before their fills landed,
+        EL left naked because its exit had pre-disarmed the stop). Never
+        cancels here: returns the last status object for the caller's
+        filled==0 decision, which now happens only after the grace requeries.
+        """
+        deadline = time.monotonic() + FILL_TIMEOUT_S
+        status = submitted
+        while time.monotonic() < deadline:
+            status = self._client.get_order_by_id(submitted.id)
+            if status.status == "filled" or _filled_qty(status) >= order.shares:
+                break
+            time.sleep(POLL_INTERVAL_S)
+        for _ in range(FILL_GRACE_REQUERIES):
+            if status.status == "filled" or _filled_qty(status) >= order.shares:
+                break
+            time.sleep(FILL_GRACE_INTERVAL_S)
+            status = self._client.get_order_by_id(submitted.id)
+        return status
 
     def cancel_stops_for(self, tickers: list[str]) -> None:
         """Cancel resting GTC stops for symbols being sold (exit guard).
