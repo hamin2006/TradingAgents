@@ -62,18 +62,53 @@ def _disk_store(ticker: str, accn: str, payload: dict) -> None:
 
 def find_latest_earnings_8k(ticker: str, window_days: int = _EARNINGS_WINDOW_DAYS
                             ) -> dict | None:
-    """Newest 8-K filing within the window (best-effort earnings proxy)."""
+    """Newest EARNINGS 8-K filing within the window.
+
+    NOT the naive newest-8-K proxy it used to be: companies file 8-Ks for
+    many reasons (XBRL-only notices, contracts, clinical updates), and the
+    proxy grabbed those — live 2026-09-04 INCY returned an 8/31 XBRL filing
+    whose "extraction" produced junk ("period ended August 31, 2026:
+    revenue not provided") instead of its real Q2 release (filed 07-28).
+    Each candidate's exhibit text is probed for quarterly-results language
+    (newest first); the first match wins.
+    """
     import datetime as _dt
     since = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
         days=window_days)).strftime("%Y-%m-%d")
     for filing in edgar.load_submissions(ticker).recent(since):
-        if filing["form"] == "8-K":
+        if filing["form"] == "8-K" and _is_earnings_release(ticker, filing):
             return filing  # recent() is newest-first
     return None
 
 
+_PERIOD_RE = re.compile(
+    r"\bq[1-4]\b|quarter(ly)?\b|three months|year ended|fiscal", re.IGNORECASE)
+_RESULTS_MARKERS = ("revenue", "net sales", "net income", "net loss",
+                    "diluted", "earnings per", "results of operations",
+                    "financial results")
+
+
+def _is_earnings_release(ticker: str, filing: dict) -> bool:
+    """Cheap content probe: does the exhibit read like an earnings release?
+
+    Earnings PRs open with the period + results ("Incyte Reports Second
+    Quarter 2026 Financial Results … revenue …"). 8-K covers, XBRL notices,
+    and contract exhibits do not. False negatives just fall back to Yahoo;
+    false positives would inject junk into debates — bias toward reject.
+    """
+    try:
+        head = _fetch_release_text(ticker, filing)[:8000].lower()
+    except Exception:  # noqa: BLE001 - a candidate that cannot be read is not an earnings release
+        return False
+    if not head:
+        return False
+    return bool(_PERIOD_RE.search(head)) and any(
+        m in head for m in _RESULTS_MARKERS)
+
+
 _EX99_MARKERS = ("ex991", "ex_991", "ex-991", "exh_991", "exh-991",
-                 "exhibit99", "exhibit_99", "exhibit-99", "ex99", "99.1")
+                 "exhibit99", "exhibit_99", "exhibit-99", "ex99", "99.1",
+                 "99-1", "991", "ex99_1")
 
 
 def _pick_exhibit(index: dict) -> str | None:
@@ -214,7 +249,19 @@ def reported_headline(ticker: str) -> dict | None:
             cached = _disk_load(ticker, accn)
         if not cached:
             return None
-        return {k: cached.get(k, "") for k in
-                ("period", "revenue", "eps", "guidance", "filed")}
+        out = {k: cached.get(k, "") for k in
+               ("period", "revenue", "eps", "guidance", "filed")}
+        # Junk guard: a stored extraction with no usable figures (the
+        # INCY 8/31 non-earnings-8-K era produced "revenue not provided")
+        # must never render as a headline — a nonsense claim reaching a
+        # debate is worse than no headline at all.
+        core = (out.get("period") or "", out.get("revenue") or "",
+                out.get("eps") or "")
+        if not any(core):
+            return None
+        if any("not provided" in str(v).lower() or "n/a" in str(v).lower()
+               for v in core if v):
+            return None
+        return out
     except Exception:  # noqa: BLE001 - routine cold-cache misses are silent
         return None

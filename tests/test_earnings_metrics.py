@@ -49,12 +49,66 @@ guides adjusted EPS to $60.61-$62.00.</p></body></html>"""
 
 class TestExhibitLocation:
     def test_earnings_8k_detected(self, http):
+        http["index.json"] = edgar._jb(INDEX_JSON)
+        http["exh_991.htm"] = RELEASE_HTML.encode()
         http["submissions/CIK0000872589.json"] = edgar._jb(
             submissions(extra_forms=["8-K", "10-Q"]))
         hit = em.find_latest_earnings_8k("REGN", window_days=60)
         assert hit is not None
         assert hit["filing_date"] == "2026-09-03"
         assert hit["accession_number"] == "0001663758-26-000002"
+
+    def test_non_earnings_8k_is_skipped(self, http):
+        """INCY 2026-08-31 class: an 8-K that is not an earnings release
+        (XBRL notice / cover text, no quarterly results) must NOT be treated
+        as one — its extraction would be junk."""
+        http["index.json"] = edgar._jb({
+            "directory": {"item": [
+                {"name": "incy-20260831.htm", "size": 40000},
+                {"name": "R1.htm", "size": 500},
+            ]}})
+        http["incy-20260831.htm"] = (
+            b"<html><body>UNITED STATES SECURITIES AND EXCHANGE COMMISSION "
+            b"FORM 8-K CURRENT REPORT PURSUANT TO SECTION 13 OR 15(d) "
+            b"Item 8.01 Other Events.</body></html>")
+        http["submissions/CIK0000872589.json"] = edgar._jb(
+            submissions(extra_forms=["8-K"]))
+        assert em.find_latest_earnings_8k("REGN", window_days=60) is None
+
+    def test_real_earnings_8k_behind_newer_non_earnings_one_wins(self, http):
+        """INCY 2026-09-04 live shape: newest 8-K (8/31, XBRL) is junk; the
+        real Q2 release sits one filing earlier (7/28, exhibit
+        incy-q22026xexx991.htm). The probe must walk past the junk."""
+        import json as _json
+        junk_index = {"directory": {"item": [
+            {"name": "incy-20260831.htm", "size": 40000},
+            {"name": "R1.htm", "size": 500},
+        ]}}
+        # The submissions fixture's first (newest) 8-K gets the junk index;
+        # the archive URL embeds the dashless accession, so route by it.
+        http["000166375826000058/index.json"] = _json.dumps(junk_index).encode()
+        http["incy-20260831.htm"] = (
+            b"<html>FORM 8-K CURRENT REPORT Item 8.01 Other Events.</html>")
+        # Second (older) 8-K = the earnings release with a 991-variant exhibit.
+        http["000166375826000053/index.json"] = edgar._jb(INDEX_JSON)
+        http["exh_991.htm"] = (
+            b"<html><body>Incyte Reports Second Quarter 2026 Financial "
+            b"Results: total revenue $1,000M, GAAP net income $1.50 per "
+            b"diluted share.</body></html>")
+        forms = ["8-K", "8-K"]
+        accessions = ["0001663758-26-000058", "0001663758-26-000053"]
+        dates = ["2026-08-31", "2026-07-28"]
+        docs = ["incy-20260831.htm", "incy-20260728.htm"]
+        subs = {
+            "cik": "872589", "name": "INCYTE CORP", "tickers": ["REGN"],
+            "filings": {"recent": {"accessionNumber": accessions,
+                                   "form": forms, "filingDate": dates,
+                                   "primaryDocument": docs}},
+        }
+        http["submissions/CIK0000872589.json"] = edgar._jb(subs)
+        hit = em.find_latest_earnings_8k("REGN", window_days=180)
+        assert hit is not None
+        assert hit["filing_date"] == "2026-07-28"  # the REAL earnings 8-K
 
     def test_no_8k_in_window(self, http):
         http["submissions/CIK0000872589.json"] = edgar._jb(
@@ -180,4 +234,19 @@ class TestReportedHeadline:
     def test_no_8k_returns_none(self, http):
         http["submissions/CIK0000872589.json"] = edgar._jb(
             submissions(extra_forms=["10-Q"]))
+        assert em.reported_headline("REGN") is None
+
+    def test_junk_cached_metrics_return_none(self, http, monkeypatch):
+        """A stored extraction with no usable figures (INCY 8/31 era junk:
+        "revenue not provided") must not render as a headline."""
+        http["index.json"] = edgar._jb(INDEX_JSON)
+        http["exh_991.htm"] = RELEASE_HTML.encode()
+        http["submissions/CIK0000872589.json"] = edgar._jb(
+            submissions(extra_forms=["8-K"]))
+        em.reset_cache()
+        with em._lock:
+            em._cache[("REGN", "0001663758-26-000002")] = {
+                "period": "period ended August 31, 2026",
+                "revenue": "not provided", "eps": "not provided",
+                "guidance": "not provided", "filed": "2026-08-31"}
         assert em.reported_headline("REGN") is None
