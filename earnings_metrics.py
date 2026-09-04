@@ -33,8 +33,31 @@ _lock = threading.Lock()
 
 
 def reset_cache() -> None:
+    """Drop the in-memory cache (tests; the disk cache survives)."""
     with _lock:
         _cache.clear()
+
+
+def _disk_key(ticker: str, accn: str) -> str:
+    return f"{ticker.strip().upper()}-{edgar.dashless(accn)}"
+
+
+def _disk_load(ticker: str, accn: str) -> dict | None:
+    """Per-filing extraction from disk (immutable once filed — no TTL)."""
+    try:
+        body = edgar._cache_read("earnings-metrics", _disk_key(ticker, accn),
+                                 ttl=None)
+        return json.loads(body) if body is not None else None
+    except (OSError, ValueError):
+        return None
+
+
+def _disk_store(ticker: str, accn: str, payload: dict) -> None:
+    try:
+        edgar._cache_write("earnings-metrics", _disk_key(ticker, accn),
+                           json.dumps(payload).encode())
+    except OSError:
+        pass  # cache is best-effort
 
 
 def find_latest_earnings_8k(ticker: str, window_days: int = _EARNINGS_WINDOW_DAYS
@@ -146,9 +169,12 @@ def earnings_line(ticker: str) -> str:
         with _lock:
             cached = _cache.get((ticker, accn), "missing")
         if cached == "missing":
+            cached = _disk_load(ticker, accn)
+        if cached is None:
             text = _fetch_release_text(ticker, filing)
             metrics = _call_extract_llm(text, filing["filing_date"])
             cached = {**metrics, "filed": filing["filing_date"]}
+            _disk_store(ticker, accn, cached)
             with _lock:
                 _cache[(ticker, accn)] = cached
         if not cached:

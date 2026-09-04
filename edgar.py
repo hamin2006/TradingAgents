@@ -108,10 +108,10 @@ def _reset_pacing() -> None:
         _last_request_at = 0.0
 
 
-def _cache_read(kind: str, key: str) -> bytes | None:
+def _cache_read(kind: str, key: str, ttl: float | None = _CACHE_TTL_S) -> bytes | None:
     path = _cache_dir() / f"{kind}-{key}.json"
     try:
-        if path.stat().st_mtime < time.time() - _CACHE_TTL_S:
+        if ttl is not None and path.stat().st_mtime < time.time() - ttl:
             return None
         return path.read_bytes()
     except FileNotFoundError:

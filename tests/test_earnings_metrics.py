@@ -107,6 +107,30 @@ class TestExtraction:
         em.reset_cache()
         assert em.earnings_line("REGN") == ""
 
+    def test_extraction_persisted_across_processes(self, http, tmp_path,
+                                                   monkeypatch):
+        """The spec promise: cache per filing on disk so a ticker analyzed
+        daily reuses the extraction all quarter (no LLM re-burn)."""
+        calls = {"n": 0}
+
+        def fake_extract(text, filing_date):
+            calls["n"] += 1
+            return {"period": "Q2 2026", "revenue": "$4.29B", "eps": "$15.50",
+                    "guidance": ""}
+
+        monkeypatch.setattr(em, "_call_extract_llm", fake_extract)
+        http["index.json"] = edgar._jb(INDEX_JSON)
+        http["exh_991.htm"] = RELEASE_HTML.encode()
+        http["submissions/CIK0000872589.json"] = edgar._jb(
+            submissions(extra_forms=["8-K"]))
+        em.reset_cache()
+        assert em.earnings_line("REGN") != ""
+        assert calls["n"] == 1
+        em.reset_cache()  # simulates a fresh process next morning
+        line2 = em.earnings_line("REGN")
+        assert calls["n"] == 1  # served from disk, no new extraction
+        assert line2 != ""
+
     def test_html_stripped_before_extraction(self):
         text = em._strip_html("<p>Q2 <b>revenue</b> up</p>")
         assert "revenue" in text and "<" not in text
