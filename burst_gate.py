@@ -99,6 +99,8 @@ def forward_alphas(panel: pd.DataFrame, events: pd.DataFrame,
     same window) — the same-day universe baseline.
     """
     out = events.copy()
+    if out.empty:
+        return out  # zero-fire rule families: summarize() reports n=0
     for h in horizons:
         f = panel.shift(-h) / panel - 1
         baseline = f.mean(axis=1)  # cross-sectional, per session
