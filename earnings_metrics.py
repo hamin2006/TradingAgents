@@ -81,20 +81,24 @@ def find_latest_earnings_8k(ticker: str, window_days: int = _EARNINGS_WINDOW_DAY
     return None
 
 
-_PERIOD_RE = re.compile(
-    r"\bq[1-4]\b|quarter(ly)?\b|three months|year ended|fiscal", re.IGNORECASE)
+_EARNINGS_NARRATIVE_RE = re.compile(
+    r"\b(reports?|announc\w*|releases?)\b[^.]{0,80}?"
+    r"\b(q[1-4]|quarter(ly)?|three months|fiscal)\b", re.IGNORECASE)
 _RESULTS_MARKERS = ("revenue", "net sales", "net income", "net loss",
                     "diluted", "earnings per", "results of operations",
                     "financial results")
 
 
 def _is_earnings_release(ticker: str, filing: dict) -> bool:
-    """Cheap content probe: does the exhibit read like an earnings release?
+    """Cheap content probe: does the exhibit read like an earnings PRESS
+    RELEASE?
 
-    Earnings PRs open with the period + results ("Incyte Reports Second
-    Quarter 2026 Financial Results … revenue …"). 8-K covers, XBRL notices,
-    and contract exhibits do not. False negatives just fall back to Yahoo;
-    false positives would inject junk into debates — bias toward reject.
+    Earnings PRs open with the narrative verb + period ("Incyte Reports
+    Second Quarter 2026 Financial Results … revenue …"). 8-K covers, XBRL
+    renders, contract exhibits, and other press releases (acquisitions —
+    live 2026-09-04: the Vega acquisition PR matched a loose period+results
+    probe) do not. False negatives just fall back to Yahoo; false positives
+    would inject junk into debates — bias toward reject.
     """
     try:
         head = _fetch_release_text(ticker, filing)[:8000].lower()
@@ -102,7 +106,7 @@ def _is_earnings_release(ticker: str, filing: dict) -> bool:
         return False
     if not head:
         return False
-    return bool(_PERIOD_RE.search(head)) and any(
+    return bool(_EARNINGS_NARRATIVE_RE.search(head)) and any(
         m in head for m in _RESULTS_MARKERS)
 
 
@@ -112,17 +116,23 @@ _EX99_MARKERS = ("ex991", "ex_991", "ex-991", "exh_991", "exh-991",
 
 
 def _pick_exhibit(index: dict) -> str | None:
-    """Prefer an exhibit-99-ish file; fall back to the biggest .htm."""
+    """Prefer an exhibit-99-ish HTML doc; fall back to the biggest .htm.
+
+    Only .htm/.html documents are candidates: real 8-K indexes also list
+    exhibit IMAGES whose names carry 99 markers (live 2026-09-04 INCY
+    picked 'incy-20220802xex99d1001.jpg' over the actual press-release
+    exhibit — binary junk for the extractor).
+    """
     items = index.get("directory", {}).get("item", [])
     names = [i.get("name", "") for i in items]
-    for name in names:
+    docs = [n for n in names if n.lower().endswith((".htm", ".html"))
+            and "-index" not in n.lower()]
+    for name in docs:
         lowered = name.lower()
         if any(marker in lowered for marker in _EX99_MARKERS):
             return name
-    htm = [n for n in names if n.lower().endswith((".htm", ".html"))
-           and not n.lower().endswith("-index.htm")]
-    if htm:
-        return max(htm, key=lambda n: _size_of(n, items))
+    if docs:
+        return max(docs, key=lambda n: _size_of(n, items))
     return None
 
 

@@ -121,6 +121,35 @@ class TestExhibitLocation:
             {"name": "regeneron-8k.htm"}, {"name": "exh_991.htm"}]}})
         assert name == "exh_991.htm"
 
+    def test_exhibit_locator_skips_image_assets(self):
+        """Real 8-K indexes list exhibit IMAGES whose names carry 99 markers
+        (INCY 2026-09-04: 'incy-20220802xex99d1001.jpg' was picked over the
+        actual press-release htm — binary junk). Only HTML docs qualify."""
+        idx = {"directory": {"item": [
+            {"name": "incy-20220802xex99d1001.jpg", "size": 90000},
+            {"name": "incy-q22026xexx991.htm", "size": 40000},
+            {"name": "R1.htm", "size": 500},
+        ]}}
+        assert em._pick_exhibit(idx) == "incy-q22026xexx991.htm"
+
+    def test_acquisition_press_release_is_not_an_earnings_8k(self, http):
+        """Live 2026-09-04 INCY class: an 8-K whose exhibit is an
+        acquisition PR ('Incyte Completes Acquisition of Vega...') must not
+        pass the earnings probe — no narrative earnings verb + period."""
+        http["index.json"] = edgar._jb({
+            "directory": {"item": [
+                {"name": "ax2026skylineclosingxex99.htm", "size": 40000},
+            ]}})
+        http["ax2026skylineclosingxex99.htm"] = (
+            b"<html><body>EX-99.1 FOR IMMEDIATE RELEASE Incyte Completes "
+            b"Acquisition of Vega Therapeutics, Expanding its Hematology "
+            b"Portfolio. The acquisition adds VGA039, a novel investigational "
+            b"monoclonal antibody in Phase 1. Revenue synergies are expected "
+            b"in the third quarter of 2027.</body></html>")
+        http["submissions/CIK0000872589.json"] = edgar._jb(
+            submissions(extra_forms=["8-K"]))
+        assert em.find_latest_earnings_8k("REGN", window_days=180) is None
+
 
 class TestExtraction:
     def test_cached_per_filing(self, http, tmp_path, monkeypatch):
