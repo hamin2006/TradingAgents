@@ -65,6 +65,59 @@ class TestAsOfSemantics:
               if r["end"] == "2025-12-31"][0]
         assert q4["val"] == pytest.approx(3_900_000_000)
 
+    def test_q4_derived_from_annual_when_absent(self, http):
+        """REGN class (live, verified 2026-09-04): many calendar-aligned
+        filers report Q4 only inside the 10-K annual row — no standalone
+        Oct-Dec duration exists in companyfacts. Q4 = FY - Q1 - Q2 - Q3 must
+        be derived or every TTM silently misses the December quarter."""
+        from tests.fixtures_edgar import fact_row, fact_tag
+
+        us_gaap = {
+            "Revenues": fact_tag([
+                fact_row("2025-01-01", "2025-03-31", 3_000_000_000,
+                         "2025-04-25", "10-Q", 2025, "Q1", "CY2025Q1"),
+                fact_row("2025-04-01", "2025-06-30", 3_100_000_000,
+                         "2025-07-25", "10-Q", 2025, "Q2", "CY2025Q2"),
+                fact_row("2025-07-01", "2025-09-30", 3_200_000_000,
+                         "2025-10-27", "10-Q", 2025, "Q3", "CY2025Q3"),
+                fact_row("2025-01-01", "2025-12-31", 12_800_000_000,
+                         "2026-02-10", "10-K", 2025, "FY", "CY2025"),
+                fact_row("2026-01-01", "2026-03-31", 3_300_000_000,
+                         "2026-04-27", "10-Q", 2026, "Q1", "CY2026Q1"),
+                fact_row("2026-04-01", "2026-06-30", 3_400_000_000,
+                         "2026-07-27", "10-Q", 2026, "Q2", "CY2026Q2"),
+            ]),
+        }
+        routes, _ = http
+        raw = {"cik": "872589", "entityName": "X",
+               "facts": {"us-gaap": us_gaap, "dei": {}}}
+        routes["companyfacts/CIK0000872589.json"] = edgar._jb(raw)
+        f = edgar.load_facts("REGN")
+        ttm = f.ttm("Revenues", as_of="2026-08-01")
+        # Q3'25 3.2 + derived Q4'25 (12.8-9.3=3.5) + Q1'26 3.3 + Q2'26 3.4
+        assert ttm == pytest.approx(13_400_000_000)
+
+    def test_no_q4_derivation_when_quarters_incomplete(self, http):
+        """Without Q1..Q3 (or a negative remainder) no Q4 is fabricated —
+        the quality gate then falls back instead of serving a bad TTM."""
+        from tests.fixtures_edgar import fact_row, fact_tag
+
+        us_gaap = {
+            "Revenues": fact_tag([
+                fact_row("2025-01-01", "2025-12-31", 12_800_000_000,
+                         "2026-02-10", "10-K", 2025, "FY", "CY2025"),
+                fact_row("2026-01-01", "2026-03-31", 3_300_000_000,
+                         "2026-04-27", "10-Q", 2026, "Q1", "CY2026Q1"),
+            ]),
+        }
+        routes, _ = http
+        raw = {"cik": "872589", "entityName": "X",
+               "facts": {"us-gaap": us_gaap, "dei": {}}}
+        routes["companyfacts/CIK0000872589.json"] = edgar._jb(raw)
+        f = edgar.load_facts("REGN")
+        ends = [r["end"] for r in f.quarters("Revenues", as_of="2026-08-01")]
+        assert "2025-12-31" not in ends  # annual row never masquerades
+
     def test_latest_quarter_excludes_future_filings(self, http):
         """Point-in-time: a 10-Q filed after the as-of date must not leak."""
         routes, _ = http

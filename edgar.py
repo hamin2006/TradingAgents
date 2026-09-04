@@ -21,7 +21,7 @@ import re
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 UA = "TradingAgents research contact@example.com"
@@ -246,7 +246,14 @@ class Facts:
 
     def quarters(self, tags, as_of: str, unit="USD"):
         """Fiscal-quarter duration rows as of ``as_of`` (future filings
-        excluded), deduped per quarter by latest ``filed``."""
+        excluded), deduped per quarter by latest ``filed``.
+
+        Calendar-aligned filers (REGN/INCY/PFE/... — verified live 2026-09-04)
+        report Q4 only inside the 10-K annual row; companyfacts has no
+        standalone Oct-Dec duration. When Q1..Q3 rows and the calendar-year
+        annual row all exist, Q4 is derived by subtraction so TTM windows are
+        not silently undercounted.
+        """
         rows = self._rows(tags, unit=unit) or []
         by_key: dict[tuple[int, int], dict] = {}
         for row in rows:
@@ -258,7 +265,43 @@ class Facts:
             prev = by_key.get(key)
             if prev is None or row["filed"] >= prev["filed"]:
                 by_key[key] = row
+        self._synthesize_q4(by_key, rows, as_of)
         return [by_key[k] for k in sorted(by_key)]
+
+    def _synthesize_q4(self, by_key: dict, rows: list, as_of: str) -> None:
+        """Derive a calendar Q4 row when it only exists inside the 10-K."""
+        annuals: dict[int, dict] = {}
+        for row in rows:
+            end = row.get("end") or ""
+            start = row.get("start") or ""
+            try:
+                end_dt = datetime.strptime(end, "%Y-%m-%d")
+                start_dt = datetime.strptime(start, "%Y-%m-%d")
+            except ValueError:
+                continue
+            if (end_dt.month == 12 and end_dt.day == 31
+                    and (end_dt - start_dt).days > 300
+                    and row.get("filed", "") <= as_of):
+                prev = annuals.get(end_dt.year)
+                if prev is None or row["filed"] >= prev["filed"]:
+                    annuals[end_dt.year] = row
+        for year, annual in annuals.items():
+            if (year, 4) in by_key:
+                continue
+            q1q3 = [by_key.get((year, q)) for q in (1, 2, 3)]
+            if any(q is None for q in q1q3):
+                continue
+            derived = float(annual["val"]) - sum(float(q["val"]) for q in q1q3)
+            if derived <= 0:
+                continue  # restatement skew; leave the gap for the quality gate
+            q4 = dict(annual)
+            q4["start"] = (datetime.strptime(q1q3[2]["end"], "%Y-%m-%d")
+                           + timedelta(days=1)).strftime("%Y-%m-%d")
+            q4["end"] = f"{year}-12-31"
+            q4["val"] = derived
+            q4["frame"] = None
+            q4["synthetic"] = True
+            by_key[(year, 4)] = q4
 
     def ttm(self, tags, as_of: str, unit="USD") -> float | None:
         """Trailing twelve months: sum of the last 4 fiscal quarters on file
