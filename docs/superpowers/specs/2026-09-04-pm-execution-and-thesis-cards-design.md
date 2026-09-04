@@ -11,6 +11,19 @@ no broker dependency). Prose IS fed back — dated and framed as overridable, so
 overturn must cite what changed (`rating_flip` events measure it). No PM tool loop
 (the PM is single-shot structured by design). See §8.
 
+**BUILT 2026-09-04 + BINDING ENABLED for the 2026-09-05 batch** — all code landed
+(observe installers, card store/injection, binding engine `orders_from_execution`,
+broker SELL-floor limits + partial-sell remainder re-anchor, `cancel_stops_for`
+returning cancelled stops, ratings v2, replay + probe tools), 1122 hermetic tests.
+Pre-flip evidence: `pm_schema_probe` replayed the real 09-04 HPE/EL prompts against
+the live model with the extended schema bound — **both VALID** (HPE: BUY 4 @ $54.25
+refining the injected prior card; EL: SELL 2 @ ≥$100.50 — the exact 09-04 trim the
+old schema couldn't express). Known field-discipline gap: protective stops still
+land in `future_notes` prose rather than `order.stop_px` (default −8% applies; EL
+remainder covered by the original-stop fallback) — measure via compliance events.
+Morning checkpoint: post-analyze binding dry-run preview (execute re-reads config at
+09:00; a bad preview flips `pm_execution` off in the window; kill switch as backstop).
+
 ## 1. Problem
 
 The portfolio manager is the last decision-maker in the per-ticker pipeline, but its
