@@ -138,6 +138,9 @@ def _quarter_gaps(rows: list[dict]) -> list[str]:
     2025-12-31 — live QA finds) and any TTM over it silently undercounts.
     """
     gaps: list[str] = []
+    # Historical gaps (e.g. PFE's 2023 restatement-year hole) do not affect
+    # today's TTM — only scan the trailing TTM window.
+    rows = rows[-5:]
     for i in range(1, len(rows)):
         prev_end = rows[i - 1]["end"]
         cur_start = rows[i]["start"]

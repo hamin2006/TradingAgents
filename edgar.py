@@ -269,8 +269,16 @@ class Facts:
         return [by_key[k] for k in sorted(by_key)]
 
     def _synthesize_q4(self, by_key: dict, rows: list, as_of: str) -> None:
-        """Derive a calendar Q4 row when it only exists inside the 10-K."""
-        annuals: dict[int, dict] = {}
+        """Derive a missing terminal fiscal quarter from the 10-K annual row.
+
+        Verified live 2026-09-04: calendar filers (REGN/INCY/PFE) report the
+        December quarter only inside the 10-K; September-fiscal (BDX) and
+        June-fiscal (EL) filers do the same for their own year-end quarter —
+        companyfacts has no standalone duration for it. When the fiscal
+        year's other quarters are on file, the terminal quarter is derived
+        by subtraction so TTM windows never silently undercount.
+        """
+        annuals: list[dict] = []
         for row in rows:
             end = row.get("end") or ""
             start = row.get("start") or ""
@@ -279,29 +287,42 @@ class Facts:
                 start_dt = datetime.strptime(start, "%Y-%m-%d")
             except ValueError:
                 continue
-            if (end_dt.month == 12 and end_dt.day == 31
-                    and (end_dt - start_dt).days > 300
-                    and row.get("filed", "") <= as_of):
-                prev = annuals.get(end_dt.year)
-                if prev is None or row["filed"] >= prev["filed"]:
-                    annuals[end_dt.year] = row
-        for year, annual in annuals.items():
-            if (year, 4) in by_key:
+            if ((end_dt - start_dt).days > 300
+                    and row.get("filed", "") <= as_of
+                    and str(row.get("form", "")).startswith("10-K")):
+                annuals.append(row)
+        # Dedupe annuals per period-end by latest filed.
+        annuals.sort(key=lambda r: (r["end"], r["filed"]))
+        latest: dict[str, dict] = {}
+        for row in annuals:
+            latest[row["end"]] = row
+        for end, annual in latest.items():
+            annual_end = end
+            annual_start = annual["start"]
+            members = [row for row in by_key.values()
+                       if annual_start <= (row.get("start") or "") < annual_end
+                       and (row.get("end") or "") <= annual_end
+                       and not row.get("synthetic")]
+            if len(members) not in (1, 2, 3):
                 continue
-            q1q3 = [by_key.get((year, q)) for q in (1, 2, 3)]
-            if any(q is None for q in q1q3):
-                continue
-            derived = float(annual["val"]) - sum(float(q["val"]) for q in q1q3)
+            # Calendar key of the terminal period (from the annual END date —
+            # the full-year span itself fails the quarter duration check).
+            end_dt = datetime.strptime(annual_end, "%Y-%m-%d")
+            end_key = (end_dt.year, (end_dt.month - 1) // 3 + 1)
+            if end_key in by_key:
+                continue  # the terminal quarter is already reported
+            derived = float(annual["val"]) - sum(float(r["val"]) for r in members)
             if derived <= 0:
-                continue  # restatement skew; leave the gap for the quality gate
-            q4 = dict(annual)
-            q4["start"] = (datetime.strptime(q1q3[2]["end"], "%Y-%m-%d")
-                           + timedelta(days=1)).strftime("%Y-%m-%d")
-            q4["end"] = f"{year}-12-31"
-            q4["val"] = derived
-            q4["frame"] = None
-            q4["synthetic"] = True
-            by_key[(year, 4)] = q4
+                continue  # restatement skew; leave the gap to the quality gate
+            last_end = max(r["end"] for r in members)
+            terminal = dict(annual)
+            terminal["start"] = (datetime.strptime(last_end, "%Y-%m-%d")
+                                 + timedelta(days=1)).strftime("%Y-%m-%d")
+            terminal["end"] = annual_end
+            terminal["val"] = derived
+            terminal["frame"] = None
+            terminal["synthetic"] = True
+            by_key[end_key] = terminal
 
     def ttm(self, tags, as_of: str, unit="USD") -> float | None:
         """Trailing twelve months: sum of the last 4 fiscal quarters on file

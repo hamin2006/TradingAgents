@@ -97,6 +97,37 @@ class TestAsOfSemantics:
         # Q3'25 3.2 + derived Q4'25 (12.8-9.3=3.5) + Q1'26 3.3 + Q2'26 3.4
         assert ttm == pytest.approx(13_400_000_000)
 
+    def test_q4_derivation_generalizes_to_september_fiscal(self, http):
+        """BDX class: fiscal year ends Sep 30 — the terminal quarter (Jul-Sep)
+        lives only inside the 10-K; derivation must key it by the annual END
+        month, not assume a December year-end."""
+        from tests.fixtures_edgar import fact_row, fact_tag
+
+        us_gaap = {
+            "Revenues": fact_tag([
+                fact_row("2024-10-01", "2024-12-31", 1_000_000_000,
+                         "2025-01-30", "10-Q", 2025, "Q1", "CY2024Q4"),
+                fact_row("2025-01-01", "2025-03-31", 1_100_000_000,
+                         "2025-04-30", "10-Q", 2025, "Q2", "CY2025Q1"),
+                fact_row("2025-04-01", "2025-06-30", 1_200_000_000,
+                         "2025-07-30", "10-Q", 2025, "Q3", "CY2025Q2"),
+                fact_row("2024-10-01", "2025-09-30", 4_500_000_000,
+                         "2025-11-13", "10-K", 2025, "FY", None),
+            ]),
+        }
+        routes, _ = http
+        raw = {"cik": "872589", "entityName": "X",
+               "facts": {"us-gaap": us_gaap, "dei": {}}}
+        routes["companyfacts/CIK0000872589.json"] = edgar._jb(raw)
+        f = edgar.load_facts("REGN")
+        rows = f.quarters("Revenues", as_of="2025-12-01")
+        ends = [r["end"] for r in rows]
+        assert "2025-09-30" in ends  # terminal fiscal quarter derived
+        derived = [r for r in rows if r["end"] == "2025-09-30"][0]
+        # 4.5 - (1.0 + 1.1 + 1.2) = 1.2
+        assert derived["val"] == pytest.approx(1_200_000_000)
+        assert derived.get("synthetic") is True
+
     def test_no_q4_derivation_when_quarters_incomplete(self, http):
         """Without Q1..Q3 (or a negative remainder) no Q4 is fabricated —
         the quality gate then falls back instead of serving a bad TTM."""
