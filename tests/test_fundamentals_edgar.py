@@ -30,6 +30,16 @@ def _consensus():
             "dividend_rate": 0.0, "dividend_yield": 0.0}
 
 
+class _FakeEarnings:
+    """Stand-in for the earnings_metrics module attribute (headline only)."""
+
+    def __init__(self, headline):
+        self._headline = headline
+
+    def reported_headline(self, ticker):
+        return self._headline
+
+
 class TestFundamentalsPayload:
     def test_edgar_metrics_and_quarters_note(self, facts):
         out = fe.render_fundamentals(facts, "REGN", "2026-08-01",
@@ -160,3 +170,83 @@ class TestStatementRenderers:
     def test_cashflow_buybacks(self, facts):
         out = fe.render_cashflow(facts, "REGN", "2026-08-01", "quarterly")
         assert "Buybacks" in out or "repurchase" in out.lower()
+
+
+def _fake_edgar(monkeypatch, tmp_path, raw=None):
+    """Wire the companyfacts route + price/consensus seams; returns routes."""
+    import edgar as edgar_mod
+    from tests.fixtures_edgar import companyfacts
+
+    monkeypatch.setattr(fe, "_yf_info_min", lambda t: {})
+    monkeypatch.setattr(fe, "_last_close", lambda t: 100.0)
+    monkeypatch.setenv("EDGAR_CACHE_DIR", str(tmp_path / "cache"))
+    routes = {
+        "company_tickers.json": (
+            b'[{"cik_str":872589,"ticker":"REGN","title":"Regeneron"}]'),
+        "companyfacts/CIK0000872589.json":
+            edgar_mod._jb(raw if raw is not None else companyfacts()),
+    }
+
+    def fake_get(url: str) -> bytes:
+        for key, payload in routes.items():
+            if key in url:
+                return payload
+        raise edgar_mod.EdgarError(f"no route for {url}")
+
+    monkeypatch.setattr(edgar_mod, "_http_get", fake_get)
+    edgar_mod.clear_cache()
+    return routes
+
+
+class TestFreshnessLayer:
+    def test_stale_with_headline_renders_instead_of_raising(
+            self, monkeypatch, tmp_path):
+        """INCY class: statements 120d+ old but the 8-K headline is cached —
+        serve EDGAR statements + the announced quarter instead of raising."""
+        _fake_edgar(monkeypatch, tmp_path)
+        monkeypatch.setattr(fe, "earnings_metrics",
+                            _FakeEarnings({"period": "Q2 2026",
+                                           "revenue": "$4,291M",
+                                           "eps": "$12.23",
+                                           "filed": "2026-07-30",
+                                           "guidance": ""}))
+        out = fe.payload_for("REGN", "2026-11-15")  # statements 138d old
+        assert "Latest reported quarter (Q2 2026, 8-K filed 2026-07-30" in out
+        assert "Announced quarter (8-K, 10-Q pending)" in out
+        assert "Revenue (TTM)" in out  # EDGAR statements still served
+        assert "Latest filed quarter-end (statements)" in out
+
+    def test_stale_without_headline_raises(self, monkeypatch, tmp_path):
+        """Staleness-only with NO cached headline (cold cache / no 8-K):
+        no fresh source exists anywhere — the Yahoo fallback is correct."""
+        _fake_edgar(monkeypatch, tmp_path)
+        monkeypatch.setattr(fe, "earnings_metrics", _FakeEarnings(None))
+        with pytest.raises(edgar.EdgarError, match="quality gate"):
+            fe.payload_for("REGN", "2026-11-15")
+
+    def test_fatal_gap_still_raises_even_with_headline(
+            self, monkeypatch, tmp_path):
+        """Fatal structural problems (quarter gaps after derivation, no
+        shares) are never papered over by a headline — Yahoo fallback stays
+        correct."""
+        from tests.fixtures_edgar import companyfacts
+
+        raw = companyfacts()
+        rows = raw["facts"]["us-gaap"]["Revenues"]["units"]["USD"]
+        raw["facts"]["us-gaap"]["Revenues"]["units"]["USD"] = [
+            r for r in rows if r["end"] not in ("2025-09-30", "2025-12-31",
+                                                "2026-03-31", "2026-06-30")]
+        del raw["facts"]["dei"]["EntityCommonStockSharesOutstanding"]
+        _fake_edgar(monkeypatch, tmp_path, raw=raw)
+        monkeypatch.setattr(fe, "earnings_metrics",
+                            _FakeEarnings({"period": "Q2 2026",
+                                           "filed": "2026-07-30"}))
+        with pytest.raises(edgar.EdgarError):
+            fe.payload_for("REGN", "2026-08-01")
+
+    def test_render_fundamentals_headline_row_off_by_default(self, facts):
+        """headline defaults to None: existing renderers unchanged."""
+        out = fe.render_fundamentals(facts, "REGN", "2026-08-01",
+                                     price=852.03, identity=_identity(),
+                                     consensus=_consensus())
+        assert "Announced quarter (8-K, 10-Q pending)" not in out

@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 import yfinance as yf
 
+import earnings_metrics
 import edgar
 
 _USD_M = "USD M"
@@ -129,6 +130,24 @@ def _last_close(ticker: str) -> float | None:
 _STALE_STATEMENT_DAYS = 120
 
 
+def _headline_row(headline: dict | None) -> str | None:
+    """One source-dated row for the announced-but-unfiled quarter."""
+    if not headline or not headline.get("period"):
+        return None
+    parts = [f"Latest reported quarter ({headline['period']}, 8-K filed "
+             f"{headline.get('filed') or '?'}, official filing pending)"]
+    bits = []
+    if headline.get("revenue"):
+        bits.append(f"revenue {headline['revenue']}")
+    if headline.get("eps"):
+        bits.append(f"EPS {headline['eps']}")
+    if bits:
+        parts.append(": " + "; ".join(bits))
+    if headline.get("guidance"):
+        parts.append(f"; Guidance: {headline['guidance']}")
+    return "".join(parts)
+
+
 def _quarter_gaps(rows: list[dict]) -> list[str]:
     """Consecutive-row continuity check (start of one vs end of the prior).
 
@@ -187,8 +206,14 @@ def structural_quality(facts: edgar.Facts, curr_date: str) -> list[str]:
 
 def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
                         price: float | None, identity: dict,
-                        consensus: dict, today: str | None = None) -> str:
-    """The comprehensive fundamentals payload (mirrors get_fundamentals)."""
+                        consensus: dict, today: str | None = None,
+                        headline: dict | None = None) -> str:
+    """The comprehensive fundamentals payload (mirrors get_fundamentals).
+
+    ``headline`` carries the 8-K announced quarter (period/revenue/eps/
+    guidance/filed from ``earnings_metrics.reported_headline``) shown when
+    the 10-Q lags the press release — source-dated, never invented.
+    """
     today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     rows: list[tuple[str, str]] = []
     name = identity.get("company_name") or ticker
@@ -211,6 +236,10 @@ def render_fundamentals(facts: edgar.Facts, ticker: str, curr_date: str,
         if gaps:
             rows.append(("TTM coverage warning", "; ".join(gaps)
                          + " — trailing sums may undercount"))
+    if headline:
+        row = _headline_row(headline)
+        if row:
+            rows.append(("Announced quarter (8-K, 10-Q pending)", row))
 
     rev = _usd(revenue_ttm(facts, curr_date))
     gp = _usd(_ttm(facts, _GP_TAGS, curr_date))
@@ -368,20 +397,33 @@ def render_cashflow(facts: edgar.Facts, ticker: str, curr_date: str,
 def payload_for(ticker: str, curr_date: str) -> str:
     facts = edgar.load_facts(ticker)
     reasons = structural_quality(facts, curr_date)
+    headline = None
     if reasons:
-        # Wrong-but-plausible must never reach a debate: structural red flags
-        # (stale tag tail, quarter gaps, missing shares) raise so the
-        # installer falls back to the recorded yfinance originals.
-        raise edgar.EdgarError(
-            "EDGAR payload failed the structural quality gate: "
-            + "; ".join(reasons))
+        # Wrong-but-plausible must never reach a debate. Fatal structural
+        # red flags (quarter gaps, missing shares, few quarters) raise so
+        # the installer falls back to the recorded yfinance originals.
+        # STALENESS-only is different: when the latest quarter exists only
+        # in the press release (10-Q unfiled — the INCY class), serve the
+        # as-filed statements PLUS the announced-quarter headline from our
+        # own 8-K extraction (never Yahoo's numbers).
+        fatal = [r for r in reasons if not r.startswith("statements end ")]
+        if fatal or len(reasons) > 1:
+            raise edgar.EdgarError(
+                "EDGAR payload failed the structural quality gate: "
+                + "; ".join(reasons))
+        headline = earnings_metrics.reported_headline(ticker)
+        if not headline:
+            raise edgar.EdgarError(
+                "EDGAR payload failed the structural quality gate (statements "
+                "stale and no 8-K headline cached): " + "; ".join(reasons))
     identity = _yf_info_min(ticker)
     consensus = {k: v for k, v in _yf_info_min(ticker).items()
                  if k in ("forward_eps", "target_mean_price",
                           "dividend_rate", "dividend_yield")}
     return render_fundamentals(facts, ticker, curr_date,
                                price=_last_close(ticker),
-                               identity=identity, consensus=consensus)
+                               identity=identity, consensus=consensus,
+                               headline=headline)
 
 
 def statements_for(method: str, ticker: str, freq: str,
