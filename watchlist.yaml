@@ -22,8 +22,11 @@ capital: 10000            # paper capital (matches real paper-account cash)
 max_positions: 10          # position-count cap AND equal-weight denominator
 max_order_value_cap: 15000 # per-day total buy cap
 stop_loss_pct: 8.0         # broker-side GTC stop on every buy (0 disables)
-fundamentals_source: yfinance  # "edgar" = SEC companyfacts as-filed statements
-                               # (consensus stays Yahoo); yfinance = upstream
+fundamentals_source: edgar  # "edgar" = SEC companyfacts as-filed statements
+                            # + 8-K announced-quarter freshness layer (live
+                            # 2026-09-04); yfinance fallback stays automatic
+                            # per ticker (structural quality gate); consensus/
+                            # dividends/sector remain Yahoo-labeled
 conviction_weights:        # slice multiplier per rating (base = capital / max_positions)
   Buy: 1.5
   Overweight: 1.0

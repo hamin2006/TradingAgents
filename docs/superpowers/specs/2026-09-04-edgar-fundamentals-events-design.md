@@ -1,11 +1,9 @@
 # EDGAR Fundamentals, Corporate Events & Market Tape (2026-09-04)
 
-Status: **Implemented 2026-09-04** — corporate events + market tape + earnings
-metrics LIVE (first full batch 2026-09-04 04:30 ET); EDGAR client with the
-structural quality gate, terminal-quarter derivation, and newest-coverage tag
-chains shipped and QA-validated (`scripts/edgar_diff_qa.py` green on the 9/4
-pool). The `fundamentals_source: edgar` flip is DEFERRED pending the 8-K
-freshness layer — see `docs/superpowers/plans/2026-09-04-edgar-freshness-layer-and-flip.md`.
+Status: **Fundamentals hybrid LIVE (2026-09-04)** — `fundamentals_source:
+edgar` flipped with the 8-K freshness layer; corporate events + market tape
+live; yfinance remains the automatic per-ticker fallback and the
+consensus/dividend/sector source. See the freshness-layer plan.
 
 ## Problem
 
