@@ -300,3 +300,71 @@ class TestClient:
         s = edgar.load_submissions("REGN")
         forms = [x["form"] for x in s.recent("2026-08-25")]
         assert forms == ["4", "4", "8-K"]
+
+
+class TestFrameVsDuration:
+    def _hpe_payload(self, rows, ticker="HPE", cik="0001645590"):
+        return {
+            "cik": cik,
+            "entityName": "Hewlett Packard Enterprise",
+            "facts": {"dei": {}, "us-gaap": {
+                "Revenues": {"label": "x", "description": "x",
+                             "units": {"USD": rows}}}},
+        }
+
+    def test_mislabeled_refiled_frames_do_not_corrupt_quarters(self, http):
+        """Live HPE class (2026-09-04, October fiscal year-end): each XBRL
+        refiling relabels prior quarters with CALENDAR frames that
+        contradict the row's own dates (Feb-Apr'25 filed 2026-06-02 tagged
+        CY2025Q1; May-Jul'25 filed 2026-09-03 tagged CY2025Q2; Nov'25-Jan'26
+        tagged CY2025Q4). Frame-first keying split one quarter across two
+        slots, killed the Q4-FY25 derivation, and tripped the quality gate.
+        Start/end dates are authoritative — a frame that contradicts them
+        must be ignored."""
+        from tests.fixtures_edgar import fact_row, fact_tag
+
+        rows = [
+            fact_row("2024-11-01", "2025-01-31", 8_000_000_000, "2025-03-05",
+                     "10-Q", 2025, "Q1", None, "ACC-Q1"),
+            # Q2 (Feb-Apr'25) filed twice: original frameless, refile mislabeled
+            fact_row("2025-02-01", "2025-04-30", 7_630_000_000, "2025-06-04",
+                     "10-Q", 2025, "Q2", None, "ACC-Q2"),
+            fact_row("2025-02-01", "2025-04-30", 7_630_000_000, "2026-06-02",
+                     "10-Q", 2025, "Q2", "CY2025Q1", "ACC-Q2-REFILE"),
+            # Q3 (May-Jul'25): original frameless, refile mislabeled
+            fact_row("2025-05-01", "2025-07-31", 9_140_000_000, "2025-09-04",
+                     "10-Q", 2025, "Q3", None, "ACC-Q3"),
+            fact_row("2025-05-01", "2025-07-31", 9_140_000_000, "2026-09-03",
+                     "10-Q", 2025, "Q3", "CY2025Q2", "ACC-Q3-REFILE"),
+            # FY25 annual (Nov'24-Oct'25): Q4 lives only inside it
+            fact_row("2024-11-01", "2025-10-31", 34_300_000_000, "2025-12-18",
+                     "10-K", 2025, "FY", "CY2025", "ACC-FY25"),
+            # FY26 quarters (Nov-start): Q1 mislabeled CY2025Q4
+            fact_row("2025-11-01", "2026-01-31", 9_300_000_000, "2026-03-10",
+                     "10-Q", 2026, "Q1", "CY2025Q4", "ACC-FY26Q1"),
+            fact_row("2026-02-01", "2026-04-30", 10_680_000_000, "2026-06-02",
+                     "10-Q", 2026, "Q2", "CY2026Q1", "ACC-FY26Q2"),
+            fact_row("2026-05-01", "2026-07-31", 12_210_000_000, "2026-09-03",
+                     "10-Q", 2026, "Q3", "CY2026Q2", "ACC-FY26Q3"),
+        ]
+        raw = {"cik": "001645590", "entityName": "HPE",
+               "facts": {"dei": {}, "us-gaap": {
+                   "Revenues": fact_tag(rows)}}}
+        routes, _ = http
+        routes["company_tickers.json"] = edgar._jb(
+            [{"cik_str": 1645590, "ticker": "HPE"}])
+        routes["companyfacts/CIK0001645590.json"] = edgar._jb(raw)
+        f = edgar.load_facts("HPE")
+        qs = f.quarters("Revenues", as_of="2026-09-04")
+        ends = [r["end"] for r in qs]
+        # The mislabeled refiles dedupe into their REAL periods; the derived
+        # Q4'FY25 (Oct'25) must appear between Jul'25 and Jan'26.
+        assert ends == ["2025-01-31", "2025-04-30", "2025-07-31",
+                        "2025-10-31", "2026-01-31", "2026-04-30", "2026-07-31"]
+        derived = qs[3]
+        assert derived.get("synthetic")
+        assert derived["val"] == pytest.approx(
+            (34_300 - 8000 - 7630 - 9140) * 1e6)
+        # TTM = derived Q4'FY25 (9530) + the three FY26 quarters on file
+        ttm = f.ttm("Revenues", as_of="2026-09-04")
+        assert ttm == pytest.approx((9530 + 9300 + 10680 + 12210) * 1e6)

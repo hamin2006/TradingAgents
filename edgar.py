@@ -221,26 +221,39 @@ class Facts:
 
     @staticmethod
     def _quarter_key(row) -> tuple[int, int] | None:
+        """Fiscal-quarter identity of a duration row.
+
+        The row's own start/end dates are authoritative. XBRL ``frame``
+        labels are trusted only when the row is not a true quarter-length
+        duration — live HPE class (2026-09-04, October fiscal year-end):
+        the company's XBRL refilings relabel prior quarters with CALENDAR
+        frames that contradict the row's dates (Feb-Apr'25 tagged
+        CY2025Q1, May-Jul'25 tagged CY2025Q2, Nov'25-Jan'26 tagged
+        CY2025Q4). Frame-first keying split one quarter across two slots,
+        killed the terminal-quarter derivation, and tripped the quality
+        gate. A frame that contradicts the dates is ignored.
+        """
         frame = row.get("frame") or ""
         m = _Q_FRAME.match(frame)
-        if m:
-            return int(m.group(1)), int(m.group(2))
+        frame_key = (int(m.group(1)), int(m.group(2))) if m else None
         end = row.get("end")
         start = row.get("start")
         if not end or start is None:
-            return None
+            return frame_key
         try:
             start_dt = datetime.strptime(start, "%Y-%m-%d")
             end_dt = datetime.strptime(end, "%Y-%m-%d")
         except ValueError:
-            return None
-        # Frame-less rows: only true quarter-length durations qualify — a 10-K
-        # full-year row ending Dec-31 must NOT masquerade as a Q4 quarter
-        # (real REGN companyfacts carry both; the annual row is ~4x bigger).
+            return frame_key
         days = (end_dt - start_dt).days
         if days > 120:
-            return None
-        return end_dt.year, (end_dt.month - 1) // 3 + 1
+            # Annual/YTD rows are never quarters (the 10-K full-year row
+            # shares the tag with real quarters — real REGN companyfacts).
+            return frame_key
+        dur_key = (end_dt.year, (end_dt.month - 1) // 3 + 1)
+        if frame_key is not None and frame_key != dur_key:
+            return dur_key  # frame contradicts the dates: dates win
+        return dur_key
 
     # -- quarterly duration facts -------------------------------------------
 
