@@ -172,8 +172,14 @@ def render_report(panel: pd.DataFrame, table: list[dict], verdict_text: str,
 
 
 def run_gate(path: str | Path, one_day_pct: float = PROD_ONE_DAY,
-             two_day_pct: float = PROD_TWO_DAY) -> tuple:
-    """Load, detect, summarize all rule families; return (panel, table, verdict)."""
+             two_day_pct: float = PROD_TWO_DAY,
+             split_date: str | None = None) -> tuple:
+    """Load, detect, summarize all rule families; return (panel, table, verdict).
+
+    split_date (YYYY-MM-DD): additionally summarize the production union on
+    each side of the cut — the overlapping-window robustness check (handoff
+    conventions §7.3: a signal living in only one half-period is suspect).
+    """
     panel = load_close_panel(path)
     table: list[dict] = []
     for th in ONE_DAY_THS:
@@ -188,8 +194,13 @@ def run_gate(path: str | Path, one_day_pct: float = PROD_ONE_DAY,
             table.append(summarize(forward_alphas(panel, ev),
                                    f"union {th1:g}/{th2:g}"))
     ev = detect(panel, one_day_pct, two_day_pct)
-    table.append(summarize(forward_alphas(panel, ev),
-                           f"union {one_day_pct:g}/{two_day_pct:g}"))
+    fa = forward_alphas(panel, ev)
+    table.append(summarize(fa, f"union {one_day_pct:g}/{two_day_pct:g}"))
+    if split_date:
+        cut = pd.Timestamp(split_date)
+        pre = summarize(fa[fa["session"] < cut], f"union {one_day_pct:g}/{two_day_pct:g} (pre {split_date})")
+        post = summarize(fa[fa["session"] >= cut], f"union {one_day_pct:g}/{two_day_pct:g} (post {split_date})")
+        table.extend([pre, post])
     v = verdict(one_day_pct, two_day_pct, table)
     return panel, table, v
 
@@ -198,8 +209,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv", help="backtest_prices CSV cache (wide yf layout)")
     ap.add_argument("--out", help="report path (default: <csv>.burst_gate.md)")
+    ap.add_argument("--split", default="2023-01-01",
+                    help="YYYY-MM-DD half-period robustness cut (default 2023-01-01)")
     args = ap.parse_args()
-    panel, table, v = run_gate(args.csv)
+    panel, table, v = run_gate(args.csv, split_date=args.split)
     out = Path(args.out) if args.out else Path(args.csv).with_suffix(".burst_gate.md")
     out.write_text(render_report(panel, table, v, args.csv), encoding="utf-8")
     print(f"verdict: {v}")

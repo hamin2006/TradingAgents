@@ -129,3 +129,19 @@ def test_no_fire_when_quiet_market():
     panel = _load(csv)
     assert detect(panel, one_day_pct=4.0, two_day_pct=None).empty
     assert detect(panel, one_day_pct=None, two_day_pct=6.0).empty
+
+
+def test_run_gate_split_rows_report_both_halves(tmp_path):
+    dates = pd.bdate_range("2024-01-01", periods=120)
+    closes = {"AAA": [100.0] * 120, "BBB": [100.0] * 120}
+    closes["AAA"][40] = 105.0    # burst before the cut (r1 = +5%)
+    closes["AAA"][100] = 105.0   # burst after the cut
+    csv = _wide_csv(closes, [d.strftime("%Y-%m-%d") for d in dates])
+    f = tmp_path / "panel.csv"
+    f.write_text(csv)
+    from burst_gate import run_gate
+    _, table, v = run_gate(f, split_date=dates[60].strftime("%Y-%m-%d"))
+    pre = next(r for r in table if "(pre" in r["rule"])
+    post = next(r for r in table if "(post" in r["rule"])
+    assert pre["n"] == 1 and post["n"] == 1
+    assert "ADOPT" in v or "INCONCLUSIVE" in v
