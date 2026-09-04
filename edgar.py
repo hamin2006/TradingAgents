@@ -26,7 +26,8 @@ from pathlib import Path
 
 UA = "TradingAgents research contact@example.com"
 DATA_BASE = "https://data.sec.gov"
-_CIK_URL = DATA_BASE + "/files/company_tickers.json"
+# The ticker map is served from www.sec.gov/files (data.sec.gov 404s it).
+_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
 _FACTS_URL = DATA_BASE + "/api/xbrl/companyfacts/CIK{}.json"
 _SUBMISSIONS_URL = DATA_BASE + "/submissions/CIK{}.json"
 _CACHE_ENV = "EDGAR_CACHE_DIR"
