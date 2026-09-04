@@ -13,7 +13,9 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
     ["seed_watchlist", "capital", "max_positions", "max_order_value_cap",
      "screener", "ibkr", "alpaca", "broker", "trading_enabled",
      "analyze_max_workers", "stop_loss_pct", "conviction_weights",
-     "tripwire_gap_pct",
+     "tripwire_gap_pct", "pm_execution", "execution_intent",
+     "stop_px_band_pct", "min_order_value_usd", "card_max_age_days",
+     "card_flip_inject_max",
      "openrouter_provider_pins", "fundamentals_source"]
 )
 
@@ -32,6 +34,25 @@ APP_DEFAULTS = {
     # close that pauses a BUY; 0 disables). Catches material events between
     # the analysis cutoff and the 09:30 open via the pre-market quote.
     "tripwire_gap_pct": 5.0,
+    # PM execution-intent design (spec 2026-09-04): the PM's structured
+    # PortfolioDecision gains an executable `execution` block (today's
+    # open-window orders only — day-expiry) plus long-term intent that is
+    # recorded on per-ticker dated decision cards and injected into future
+    # PM prompts (confirm-or-refute).
+    # execution_intent: phase-1 observe switch — schema swap + extractor +
+    # decision cards + injection + events run, engine stays legacy.
+    # pm_execution: phase-2 binding switch — orders_from_execution takes
+    # over per-ticker execution when a valid block is present.
+    "execution_intent": False,
+    "pm_execution": False,
+    # Guardrail clamp band for PM stop_px (% from reference close); asks
+    # outside the band are clamped with a loud log.
+    "stop_px_band_pct": [3, 25],
+    "min_order_value_usd": 50,
+    # Decision-card freshness gate (days): only fresher cards inject.
+    "card_max_age_days": 21,
+    # Fresh cards injected when the latest two card ratings differ (flip).
+    "card_flip_inject_max": 3,
     # Conviction-scaled sizing: slice multiplier per rating (base = capital /
     # max_positions). A Buy gets 1.5x an Overweight's exposure.
     "conviction_weights": {"Buy": 1.5, "Overweight": 1.0},

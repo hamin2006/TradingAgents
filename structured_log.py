@@ -180,6 +180,34 @@ def emit_structured_fallback(*, agent: str, error: str,
     run_log.emit_structured_fallback(agent=agent, error=error, mode=mode)
 
 
+def emit_execution_intent(*, status: str, n_orders: int = 0,
+                          reason: str | None = None) -> None:
+    """Emit an execution_intent event (PM block compliance stream)."""
+    run_log = get_active_logger()
+    if run_log is None:
+        return
+    run_log.emit_execution_intent(status=status, n_orders=n_orders,
+                                  reason=reason)
+
+
+def emit_decision_card(*, mode: str, n_cards: int = 0) -> None:
+    """Emit a decision_card event (injected / absent / expired)."""
+    run_log = get_active_logger()
+    if run_log is None:
+        return
+    run_log.emit_decision_card(mode=mode, n_cards=n_cards)
+
+
+def emit_rating_flip(*, card_date: str, old_rating: str,
+                     new_rating: str) -> None:
+    """Emit a rating_flip event (card vs new rating)."""
+    run_log = get_active_logger()
+    if run_log is None:
+        return
+    run_log.emit_rating_flip(card_date=card_date, old_rating=old_rating,
+                             new_rating=new_rating)
+
+
 class StructuredRunLogger(BaseCallbackHandler):
     """LangChain callback handler writing one JSONL event per pipeline action."""
 
@@ -215,6 +243,19 @@ class StructuredRunLogger(BaseCallbackHandler):
                                  mode: str = "retry") -> None:
         self._emit({"type": "structured_fallback", "agent": agent,
                     "error": error, "mode": mode})
+
+    def emit_execution_intent(self, *, status: str, n_orders: int = 0,
+                              reason: str | None = None) -> None:
+        self._emit({"type": "execution_intent", "status": status,
+                    "n_orders": n_orders, "reason": reason})
+
+    def emit_decision_card(self, *, mode: str, n_cards: int = 0) -> None:
+        self._emit({"type": "decision_card", "mode": mode, "n_cards": n_cards})
+
+    def emit_rating_flip(self, *, card_date: str, old_rating: str,
+                         new_rating: str) -> None:
+        self._emit({"type": "rating_flip", "card_date": card_date,
+                    "old": old_rating, "new": new_rating})
 
     def _agent_for(self, parent_run_id: UUID | None,
                    metadata: dict | None = None) -> str:

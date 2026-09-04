@@ -324,3 +324,61 @@ def _fake_llm_result(usage=None, reasoning=None, text="OK"):
         **kwargs,
     )
     return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+class TestPmExecutionEvents:
+    """PM execution-intent / decision-card / rating-flip event emitters."""
+
+    def test_execution_intent_event(self, logger_fx):
+        logger_fx.emit_execution_intent(status="present_valid", n_orders=2)
+        logger_fx.emit_execution_intent(status="present_invalid", reason="boom")
+        events = logger_fx._read_all()
+        assert events[-2]["type"] == "execution_intent"
+        assert events[-2]["status"] == "present_valid"
+        assert events[-2]["n_orders"] == 2
+        assert events[-1]["status"] == "present_invalid"
+        assert events[-1]["reason"] == "boom"
+
+    def test_decision_card_event(self, logger_fx):
+        logger_fx.emit_decision_card(mode="injected", n_cards=3)
+        logger_fx.emit_decision_card(mode="absent")
+        events = logger_fx._read_all()
+        assert events[-2]["type"] == "decision_card"
+        assert events[-2]["mode"] == "injected"
+        assert events[-2]["n_cards"] == 3
+        assert events[-1]["mode"] == "absent"
+
+    def test_rating_flip_event(self, logger_fx):
+        logger_fx.emit_rating_flip(card_date="2026-09-03",
+                                   old_rating="Overweight",
+                                   new_rating="Underweight")
+        event = logger_fx._read_all()[-1]
+        assert event["type"] == "rating_flip"
+        assert event["card_date"] == "2026-09-03"
+        assert event["old"] == "Overweight"
+        assert event["new"] == "Underweight"
+
+
+class TestModuleLevelEmittersNoop:
+    """Module-level emitters no-op outside an analyze run (no active logger)."""
+
+    def test_noop_without_active_logger(self):
+        structured_log.clear_active_logger()
+        assert structured_log.emit_execution_intent(status="present_valid") is None
+        assert structured_log.emit_decision_card(mode="absent") is None
+        assert structured_log.emit_rating_flip(card_date="d", old_rating="a",
+                                               new_rating="b") is None
+
+    def test_route_through_active_logger(self, tmp_path):
+        log = structured_log.StructuredRunLogger(ticker="AAPL",
+                                                 out_dir=str(tmp_path))
+        structured_log.set_active_logger(log)
+        try:
+            structured_log.emit_rating_flip(card_date="2026-09-03",
+                                            old_rating="Buy",
+                                            new_rating="Hold")
+        finally:
+            structured_log.clear_active_logger()
+        events = log._read_all()
+        assert events[-1]["ticker"] == "AAPL"
+        assert events[-1]["old"] == "Buy"

@@ -86,3 +86,32 @@ def test_shipped_watchlist_yaml_loads():
     assert cfg["max_tokens"] == 15000  # bounds deepseek-v4-flash runaway output (#1204)
     assert cfg["screener"]["min_watchlist_size"] == 5
     assert cfg["screener"]["pool_size"] == 50
+
+
+class TestPmExecutionDefaults:
+    """PM-execution + decision-card keys must exist with safe defaults and be
+    accepted as watchlist keys (unknown-key strictness applies)."""
+
+    def test_defaults_present_and_off(self, tmp_path):
+        cfg = load_watchlist_config(tmp_path / "nope.yaml")
+        assert cfg["pm_execution"] is False
+        assert cfg["execution_intent"] is False
+        assert cfg["stop_px_band_pct"] == [3, 25]
+        assert cfg["min_order_value_usd"] == 50
+        assert cfg["card_max_age_days"] == 21
+        assert cfg["card_flip_inject_max"] == 3
+
+    def test_yaml_keys_accepted(self, tmp_path):
+        yaml_path = tmp_path / "watchlist.yaml"
+        yaml_path.write_text(
+            "pm_execution: true\n"
+            "execution_intent: true\n"
+            "stop_px_band_pct: [5, 30]\n"
+            "card_max_age_days: 14\n"
+            "card_flip_inject_max: 2\n"
+        )
+        cfg = load_watchlist_config(yaml_path)
+        assert cfg["pm_execution"] is True
+        assert cfg["stop_px_band_pct"] == [5, 30]
+        assert cfg["card_max_age_days"] == 14
+        assert cfg["card_flip_inject_max"] == 2

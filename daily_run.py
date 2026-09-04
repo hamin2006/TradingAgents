@@ -1164,6 +1164,245 @@ def _ensure_reddit_oauth() -> bool:
     return active
 
 
+# --- PM execution intent + dated decision cards (spec 2026-09-04) ---------
+# The PM's structured PortfolioDecision gains an `execution` block (today's
+# open-window orders; long-term intent rides the dated decision cards). The
+# schema swap repoints the framework's PortfolioDecision global (schemas AND
+# the portfolio_manager import binding) before any graph build so the bound
+# structured-output schema carries `execution`. The capture wrapper stashes
+# the parsed PM decision per worker thread; the analyze runner writes the
+# per-ticker card + execution events from it. Injection appends dated cards
+# to the PM-only past_context.
+
+_PM_SCHEMA_PATCHED = False
+_PM_ORIGINAL_DECISION: type | None = None  # framework class captured pre-swap
+_PM_CAPTURE = threading.local()
+_PM_CARDS_ENABLED = False  # mirrors cfg execution_intent (decision cards + events)
+_CARDS_MAX_AGE_DAYS = 21
+_CARDS_FLIP_MAX = 3
+_CARD_INJECTION_PATCHED = False
+_CARD_INJECTION_ROOT: Path | None = None
+_EXECUTION_MAP: dict = {}  # ticker -> ratings-v2 execution block (worker-filled)
+
+
+def _stash_pm_capture(decision: dict | None) -> None:
+    _PM_CAPTURE.decision = decision
+
+
+def _pop_pm_capture() -> dict | None:
+    decision = getattr(_PM_CAPTURE, "decision", None)
+    _PM_CAPTURE.decision = None
+    return decision
+
+
+def _clear_pm_capture() -> None:
+    _PM_CAPTURE.decision = None
+
+
+def _ensure_pm_execution_schema(cfg: dict) -> None:
+    """Repoint the framework's PortfolioDecision to our execution-bearing
+    subclass (both import sites) and wrap the structured invocation so the
+    parsed PM decision is captured. Only when ``execution_intent`` is on;
+    off = today's behavior byte-identical. Idempotent; ``_reset_*`` restores.
+    """
+    global _PM_SCHEMA_PATCHED, _PM_CARDS_ENABLED, _PM_ORIGINAL_DECISION
+    _PM_CARDS_ENABLED = bool(cfg.get("execution_intent", False))
+    _CARDS_MAX_AGE_DAYS = int(cfg.get("card_max_age_days", 21))
+    _CARDS_FLIP_MAX = int(cfg.get("card_flip_inject_max", 3))
+    if _PM_SCHEMA_PATCHED:
+        return
+    _PM_SCHEMA_PATCHED = True
+    if not _PM_CARDS_ENABLED:
+        return
+    import tradingagents.agents.managers.portfolio_manager as pm_agents_mod
+    import tradingagents.agents.schemas as schemas_mod
+    import tradingagents.agents.utils.structured as structured_mod
+    from pm_execution import ExecutionPortfolioDecision
+
+    _PM_ORIGINAL_DECISION = schemas_mod.PortfolioDecision
+    # Both import sites: the schema module's own global and the binding the
+    # portfolio manager factory captured at module import time.
+    schemas_mod.PortfolioDecision = ExecutionPortfolioDecision
+    pm_agents_mod.PortfolioDecision = ExecutionPortfolioDecision
+
+    original = structured_mod.invoke_structured_or_freetext
+
+    def with_capture(structured_llm, plain_llm, prompt, render, agent_name,
+                     _orig=original):
+        if agent_name != "Portfolio Manager" or structured_llm is None:
+            return _orig(structured_llm, plain_llm, prompt, render, agent_name)
+        try:
+            result = structured_llm.invoke(prompt)
+        except Exception:  # noqa: BLE001 — original owns the free-text retry
+            return _orig(structured_llm, plain_llm, prompt, render, agent_name)
+        if result is None:
+            return _orig(structured_llm, plain_llm, prompt, render, agent_name)
+        try:
+            _stash_pm_capture(result.model_dump(mode="json"))
+        except Exception:  # noqa: BLE001 — capture must never break the PM
+            _stash_pm_capture(None)
+        return render(result)
+
+    with_capture._wrapped_original = original  # type: ignore[attr-defined]
+    structured_mod.invoke_structured_or_freetext = with_capture
+
+
+def _reset_pm_execution_schema() -> None:
+    """Restore the original class + invocation for tests / later processes."""
+    global _PM_SCHEMA_PATCHED, _PM_CARDS_ENABLED, _PM_ORIGINAL_DECISION
+    import tradingagents.agents.managers.portfolio_manager as pm_agents_mod
+    import tradingagents.agents.schemas as schemas_mod
+    import tradingagents.agents.utils.structured as structured_mod
+
+    current = getattr(structured_mod.invoke_structured_or_freetext,
+                      "_wrapped_original", None)
+    if current is not None:
+        structured_mod.invoke_structured_or_freetext = current
+    original = _PM_ORIGINAL_DECISION
+    if original is not None:
+        schemas_mod.PortfolioDecision = original
+        pm_agents_mod.PortfolioDecision = original
+    _PM_SCHEMA_PATCHED = False
+    _PM_CARDS_ENABLED = False
+    _clear_pm_capture()
+    _EXECUTION_MAP.clear()
+
+
+def _write_decision_card(ticker: str, today_str: str, cfg: dict,
+                         rating: str) -> dict | None:
+    """Persist the ticker's dated decision card + emit execution events.
+
+    Reads the thread-local captured PM decision (pop). With no structured
+    decision (free-text fallback) no card is written — the memory log keeps
+    the prose — but an ``execution_intent: absent`` event still fires so the
+    compliance stream is complete. Failure-safe: artifacts never break the
+    analysis pass.
+    """
+    if not cfg.get("execution_intent", False):
+        return None
+    import decision_cards
+    import structured_log
+
+    decision = _pop_pm_capture()
+    if decision is None:
+        structured_log.emit_execution_intent(status="absent")
+        structured_log.emit_decision_card(mode="absent")
+        return None
+    try:
+        old = decision_cards.latest_card(cfg["results_dir"], ticker)
+    except Exception:  # noqa: BLE001
+        old = None
+    if old and old.get("date") == today_str:
+        # Already recorded today (analyze retry re-ran a successful pass):
+        # never double-append, never re-emit flip events.
+        return old
+    status = "present_valid"
+    execution = decision.get("execution")
+    n_orders = 0
+    if execution is not None:
+        from pm_execution import EXECUTION_VALID, extract_execution
+        status, intent, reason = extract_execution(decision)
+        n_orders = len(intent.orders) if status == EXECUTION_VALID else 0
+    structured_log.emit_execution_intent(status=status, n_orders=n_orders)
+    if execution is not None:
+        _EXECUTION_MAP[ticker] = {"status": status, "block": execution}
+    try:
+        old = decision_cards.latest_card(cfg["results_dir"], ticker)
+        if old and old.get("rating") != rating:
+            structured_log.emit_rating_flip(
+                card_date=old.get("date", ""), old_rating=old.get("rating", ""),
+                new_rating=rating)
+        card = {
+            "date": today_str,
+            "ticker": ticker,
+            "rating": rating,
+            "ref_close": _card_reference_close(ticker, cfg),
+            "schema_version": decision_cards.CARD_SCHEMA_VERSION,
+            "executive_summary": decision.get("executive_summary"),
+            "investment_thesis": decision.get("investment_thesis"),
+            "execution": execution,
+        }
+        decision_cards.append_card(cfg["results_dir"], card)
+        structured_log.emit_decision_card(mode="injected")
+        return card
+    except Exception:  # noqa: BLE001 — a bad card must never fail analysis
+        logger.warning("decision-card write failed for %s: %s", ticker,
+                       "card failure", exc_info=True)
+        return None
+
+
+_CARD_CLOSE_CACHE: dict = {}
+
+
+def _card_reference_close(ticker: str, cfg: dict) -> float | None:
+    """Memoized prior-session close for the card (best-effort, never fatal)."""
+    if ticker in _CARD_CLOSE_CACHE:
+        return _CARD_CLOSE_CACHE[ticker]
+    close = _last_close(ticker)
+    _CARD_CLOSE_CACHE[ticker] = close
+    return close
+
+
+def _ensure_decision_card_injection(cfg: dict) -> None:
+    """Append fresh dated cards to the PM-only past_context.
+
+    ``get_past_context`` feeds only the Portfolio Manager prompt, so cards
+    reach exactly the agent that must confirm-or-refute. Stable ratings ->
+    latest card; a flip between the two latest fresh cards -> the last
+    ``card_flip_inject_max`` cards. Historical runs (as_of set) anchor
+    freshness at ``as_of`` so a backtest can't see future cards.
+    """
+    global _CARD_INJECTION_PATCHED, _CARD_INJECTION_ROOT
+    if _CARD_INJECTION_PATCHED:
+        return
+    if not cfg.get("execution_intent", False):
+        return  # never install while off
+    _CARD_INJECTION_PATCHED = True
+    _CARD_INJECTION_ROOT = Path(cfg["results_dir"])
+    import tradingagents.agents.utils.memory as memory_mod
+
+    original = memory_mod.TradingMemoryLog.get_past_context
+
+    def with_cards(self, ticker, n_same=5, n_cross=3, as_of=None,
+                   _orig=original):
+        ctx = _orig(self, ticker, n_same=n_same, n_cross=n_cross, as_of=as_of)
+        root = _CARD_INJECTION_ROOT
+        if root is None:
+            return ctx
+        import decision_cards
+        try:
+            fresh = decision_cards.fresh_cards(
+                root, ticker, _CARDS_MAX_AGE_DAYS, as_of=as_of)
+            picked = decision_cards.select_cards_for_injection(
+                fresh, _CARDS_FLIP_MAX)
+            block = decision_cards.render_prior_decisions(ticker, picked)
+        except Exception:  # noqa: BLE001 — cards must never break the prompt
+            return ctx
+        if not block:
+            import structured_log
+            structured_log.emit_decision_card(mode="absent")
+            return ctx
+        import structured_log
+        structured_log.emit_decision_card(mode="injected", n_cards=len(picked))
+        return f"{ctx}\n\n{block}" if ctx else block
+
+    with_cards._wrapped_original = original  # type: ignore[attr-defined]
+    memory_mod.TradingMemoryLog.get_past_context = with_cards
+
+
+def _reset_decision_card_injection() -> None:
+    """Restore the original get_past_context for tests."""
+    global _CARD_INJECTION_PATCHED, _CARD_INJECTION_ROOT
+    import tradingagents.agents.utils.memory as memory_mod
+
+    current = getattr(memory_mod.TradingMemoryLog.get_past_context,
+                      "_wrapped_original", None)
+    if current is not None:
+        memory_mod.TradingMemoryLog.get_past_context = current
+    _CARD_INJECTION_PATCHED = False
+    _CARD_INJECTION_ROOT = None
+
+
 def _analyze_one(ticker: str, today_str: str, cfg: dict):
     """Run the full framework pipeline for one ticker with one retry.
 
@@ -1171,16 +1410,20 @@ def _analyze_one(ticker: str, today_str: str, cfg: dict):
     never raise: all failures are reported through the error slot.
     """
     import structured_log
+    _clear_pm_capture()  # threads are pooled: never leak a prior ticker's PM
     run_log = structured_log.StructuredRunLogger(ticker=ticker, today=today_str)
     try:
         rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
+        _write_decision_card(ticker, today_str, cfg, rating)
         run_log.finish(rating=rating)
         return ticker, rating, None
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis failed for %s: %s", ticker, exc)
         try:
+            _clear_pm_capture()
             run_log.finish(rating=None)
             rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
+            _write_decision_card(ticker, today_str, cfg, rating)
             run_log.finish(rating=rating)
             return ticker, rating, None
         except Exception as exc2:  # noqa: BLE001
@@ -1290,6 +1533,10 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_portfolio_context(cfg)
     _ensure_edgar_fundamentals(cfg)
     _ensure_tape_and_events()
+    if cfg.get("execution_intent", False):
+        _EXECUTION_MAP.clear()
+        _ensure_pm_execution_schema(cfg)
+        _ensure_decision_card_injection(cfg)
     max_workers = max(1, int(cfg.get("analyze_max_workers", 4)))
 
     def record(result):
@@ -1344,6 +1591,12 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     payload = {"date": _today_str(),
                "ratings": dict(sorted(ratings.items())),
                "failures": sorted(failures)}
+    if _EXECUTION_MAP:
+        payload["execution"] = {t: v["block"] for t, v in
+                                sorted(_EXECUTION_MAP.items())
+                                if v.get("status") == "present_valid"
+                                and v.get("block") is not None}
+        payload["schema_version"] = 2
     path = _ratings_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
