@@ -1632,6 +1632,31 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
     # are computed so exits can disarm their resting stops pre-open.
 
     payload = json.loads(ratings_path.read_text(encoding="utf-8"))
+
+    # PM execution binding is fail-closed: it requires BOTH the config switch
+    # AND the automated morning gate (binding_gate.py, runs post-analyze) —
+    # verdict PASS for today. No gate artifact or any failure = the known-
+    # good legacy path. No human reviews the morning batch, so binding must
+    # never run ungated.
+    binding_active = bool(cfg.get("pm_execution", False))
+    if binding_active:
+        try:
+            from binding_gate import GATE_PASS, gate_path
+            gate = json.loads(gate_path(cfg["results_dir"],
+                                        _today_str()).read_text(
+                                            encoding="utf-8"))
+            binding_active = gate.get("verdict") == GATE_PASS
+        except (OSError, json.JSONDecodeError):
+            logger.warning("no binding gate artifact for today; PM execution "
+                           "binding NOT active (legacy path)")
+            binding_active = False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("binding gate read failed (%s); PM execution "
+                           "binding NOT active (legacy path)", exc)
+            binding_active = False
+    if binding_active:
+        logger.info("binding gate PASS — PM execution binding active today")
+
     broker = create_broker(cfg)
     try:
         broker.connect()
@@ -1667,7 +1692,7 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         # explicit empty -> NO order today (overrides legacy, including a
         # rating exit); invalid / absent / block the engine cannot honor ->
         # the legacy compute_orders path for that ticker only.
-        if cfg.get("pm_execution", False) and isinstance(
+        if binding_active and isinstance(
                 payload.get("execution"), dict):
             from decisions import orders_from_execution as orders_from_block
             from pm_execution import EXECUTION_VALID, extract_execution
@@ -1703,7 +1728,7 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         # more than the account can cover clamps to the cash-based share
         # count (the broker would otherwise reject or the paper margin fill
         # an unintended oversize).
-        if cfg.get("pm_execution", False):
+        if binding_active:
             from dataclasses import replace as replace_order
             for i, o in enumerate(orders):
                 if (o.reason == "pm-execution" and o.action == "BUY"

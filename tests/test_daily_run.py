@@ -1506,9 +1506,22 @@ def _run_exec(cfg, broker, day="2026-09-04"):
         return run_execute(cfg)
 
 
+
+
+def _write_gate(cfg, verdict="PASS", day="2026-09-04"):
+    """Binding tests need the automated morning gate artifact (fail-closed)."""
+    import pathlib
+    path = pathlib.Path(cfg["results_dir"]) / f"binding_gate_{day}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"date": day, "verdict": verdict,
+                                "reasons": [], "counts": {},
+                                "preview": []}), encoding="utf-8")
+
+
 class TestPmExecutionBinding:
     def test_block_replaces_legacy_partial_sell(self, cfg):
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5,
                         "stop_px": 95.6}]}})
@@ -1524,6 +1537,7 @@ class TestPmExecutionBinding:
 
     def test_explicit_empty_block_overrides_legacy_exit(self, cfg):
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {"orders": []}})
         broker = _exec_broker()
         broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
@@ -1533,6 +1547,7 @@ class TestPmExecutionBinding:
 
     def test_invalid_block_falls_back_to_legacy(self, cfg):
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2, "fraction_held": 0.5}]}})
         broker = _exec_broker()
@@ -1544,6 +1559,7 @@ class TestPmExecutionBinding:
 
     def test_pm_buy_sizes_from_block_not_legacy(self, cfg):
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         cfg["capital"] = 100_000
         _ratings_v2_file(cfg, {"NOW": "Overweight"}, {"NOW": {
             "orders": [{"kind": "BUY", "value_usd": 500.0,
@@ -1558,6 +1574,7 @@ class TestPmExecutionBinding:
 
     def test_partial_sell_without_pm_stop_reuses_original(self, cfg):
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5}]}})
         broker = _exec_broker()
@@ -1570,6 +1587,7 @@ class TestPmExecutionBinding:
 
     def test_mixed_blocks_and_legacy_tickers(self, cfg):
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         cfg["capital"] = 100_000
         _ratings_v2_file(cfg, {"EL": "Underweight", "AAPL": "Buy"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2}]}})
@@ -1597,6 +1615,7 @@ class TestPmExecutionBinding:
         original stop must never leave the remainder naked — re-anchor at the
         standard -8% stop instead."""
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2}]}})
         broker = _exec_broker()
@@ -1611,6 +1630,7 @@ class TestPmExecutionBinding:
         math — but the account cash still caps them: a block asking for more
         than the account can cover must clamp, never oversize."""
         cfg["pm_execution"] = True
+        _write_gate(cfg)
         cfg["capital"] = 100_000
         _ratings_v2_file(cfg, {"NOW": "Overweight"}, {"NOW": {
             "orders": [{"kind": "BUY", "value_usd": 50_000.0}]}})
@@ -1620,3 +1640,40 @@ class TestPmExecutionBinding:
         assert len(orders) == 1
         assert orders[0].action == "BUY"
         assert orders[0].shares * 100.0 <= 6_000.0  # <= cash at $100 close
+
+
+class TestBindingGateHonoring:
+    def test_no_gate_artifact_falls_back_to_legacy(self, cfg):
+        """Fail-closed: pm_execution config alone must never bind — no gate
+        artifact (gate cron missed/crashed) = the known-good legacy path."""
+        cfg["pm_execution"] = True
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert len(orders) == 1
+        assert (orders[0].action, orders[0].shares) == ("SELL", 8)  # legacy
+
+    def test_gate_fail_falls_back_to_legacy(self, cfg):
+        cfg["pm_execution"] = True
+        _write_gate(cfg, verdict="FAIL")
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert (orders[0].action, orders[0].shares) == ("SELL", 8)  # legacy
+
+    def test_gate_pass_allows_binding(self, cfg):
+        cfg["pm_execution"] = True
+        _write_gate(cfg, verdict="PASS")
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [{"kind": "SELL", "shares": 2}]}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert (orders[0].action, orders[0].shares) == ("SELL", 2)  # binds
