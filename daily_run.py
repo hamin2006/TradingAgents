@@ -1185,6 +1185,11 @@ _CARD_INJECTION_ROOT: Path | None = None
 _EXECUTION_MAP: dict = {}  # ticker -> ratings-v2 execution block (worker-filled)
 
 
+def _import_module(name: str):
+    import importlib
+    return importlib.import_module(name)
+
+
 def _stash_pm_capture(decision: dict | None) -> None:
     _PM_CAPTURE.decision = decision
 
@@ -1245,6 +1250,16 @@ def _ensure_pm_execution_schema(cfg: dict) -> None:
 
     with_capture._wrapped_original = original  # type: ignore[attr-defined]
     structured_mod.invoke_structured_or_freetext = with_capture
+    # The framework agents import the function at module load, so each
+    # consumer binds its own copy; repoint every binding or the wrapper
+    # never fires (the E2E replay caught this: the schema carried
+    # `execution` but no capture happened through the PM's own import).
+    for mod in (pm_agents_mod,
+                _import_module("tradingagents.agents.managers.research_manager"),
+                _import_module("tradingagents.agents.trader.trader"),
+                _import_module("tradingagents.agents.analysts.sentiment_analyst")):
+        if getattr(mod, "invoke_structured_or_freetext", None) is original:
+            mod.invoke_structured_or_freetext = with_capture
 
 
 def _reset_pm_execution_schema() -> None:
@@ -1257,7 +1272,11 @@ def _reset_pm_execution_schema() -> None:
     current = getattr(structured_mod.invoke_structured_or_freetext,
                       "_wrapped_original", None)
     if current is not None:
-        structured_mod.invoke_structured_or_freetext = current
+        for mod in (structured_mod, pm_agents_mod,
+                    _import_module("tradingagents.agents.managers.research_manager"),
+                    _import_module("tradingagents.agents.trader.trader"),
+                    _import_module("tradingagents.agents.analysts.sentiment_analyst")):
+            mod.invoke_structured_or_freetext = current
     original = _PM_ORIGINAL_DECISION
     if original is not None:
         schemas_mod.PortfolioDecision = original
@@ -1269,7 +1288,7 @@ def _reset_pm_execution_schema() -> None:
 
 
 def _write_decision_card(ticker: str, today_str: str, cfg: dict,
-                         rating: str) -> dict | None:
+                         rating: str, run_log=None) -> dict | None:
     """Persist the ticker's dated decision card + emit execution events.
 
     Reads the thread-local captured PM decision (pop). With no structured
@@ -1277,16 +1296,26 @@ def _write_decision_card(ticker: str, today_str: str, cfg: dict,
     the prose — but an ``execution_intent: absent`` event still fires so the
     compliance stream is complete. Failure-safe: artifacts never break the
     analysis pass.
+
+    ``run_log`` (the per-ticker StructuredRunLogger) is passed explicitly
+    because this runs AFTER propagate cleared the thread-local logger —
+    module-level emitters would silently no-op (E2E 09-05 finding).
     """
     if not cfg.get("execution_intent", False):
         return None
     import decision_cards
     import structured_log
 
+    def emit(name: str, **kw) -> None:
+        if run_log is not None:
+            getattr(run_log, name)(**kw)
+        else:
+            getattr(structured_log, name)(**kw)
+
     decision = _pop_pm_capture()
     if decision is None:
-        structured_log.emit_execution_intent(status="absent")
-        structured_log.emit_decision_card(mode="absent")
+        emit("emit_execution_intent", status="absent")
+        emit("emit_decision_card", mode="absent")
         return None
     try:
         old = decision_cards.latest_card(cfg["results_dir"], ticker)
@@ -1303,15 +1332,14 @@ def _write_decision_card(ticker: str, today_str: str, cfg: dict,
         from pm_execution import EXECUTION_VALID, extract_execution
         status, intent, reason = extract_execution(decision)
         n_orders = len(intent.orders) if status == EXECUTION_VALID else 0
-    structured_log.emit_execution_intent(status=status, n_orders=n_orders)
+    emit("emit_execution_intent", status=status, n_orders=n_orders)
     if execution is not None:
         _EXECUTION_MAP[ticker] = {"status": status, "block": execution}
     try:
         old = decision_cards.latest_card(cfg["results_dir"], ticker)
         if old and old.get("rating") != rating:
-            structured_log.emit_rating_flip(
-                card_date=old.get("date", ""), old_rating=old.get("rating", ""),
-                new_rating=rating)
+            emit("emit_rating_flip", card_date=old.get("date", ""),
+                 old_rating=old.get("rating", ""), new_rating=rating)
         card = {
             "date": today_str,
             "ticker": ticker,
@@ -1323,7 +1351,7 @@ def _write_decision_card(ticker: str, today_str: str, cfg: dict,
             "execution": execution,
         }
         decision_cards.append_card(cfg["results_dir"], card)
-        structured_log.emit_decision_card(mode="injected")
+        emit("emit_decision_card", mode="injected")
         return card
     except Exception:  # noqa: BLE001 — a bad card must never fail analysis
         logger.warning("decision-card write failed for %s: %s", ticker,
@@ -1414,7 +1442,7 @@ def _analyze_one(ticker: str, today_str: str, cfg: dict):
     run_log = structured_log.StructuredRunLogger(ticker=ticker, today=today_str)
     try:
         rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
-        _write_decision_card(ticker, today_str, cfg, rating)
+        _write_decision_card(ticker, today_str, cfg, rating, run_log=run_log)
         run_log.finish(rating=rating)
         return ticker, rating, None
     except Exception as exc:  # noqa: BLE001
@@ -1423,7 +1451,7 @@ def _analyze_one(ticker: str, today_str: str, cfg: dict):
             _clear_pm_capture()
             run_log.finish(rating=None)
             rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
-            _write_decision_card(ticker, today_str, cfg, rating)
+            _write_decision_card(ticker, today_str, cfg, rating, run_log=run_log)
             run_log.finish(rating=rating)
             return ticker, rating, None
         except Exception as exc2:  # noqa: BLE001

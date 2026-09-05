@@ -380,3 +380,75 @@ class TestRunAnalyzeEndToEnd:
         assert "execution" not in payload
         assert "schema_version" not in payload
         assert not (daily_run.Path(cfg["results_dir"]) / "decision_cards").exists()
+
+
+class TestCaptureThroughPmModuleBinding:
+    """E2E regression: the portfolio manager calls invoke_structured_or_
+    freetext through ITS OWN module-level import, not structured_mod's.
+    The installer must repoint every consumer binding or capture never
+    fires in the real pipeline (caught by the 09-05 E2E replay: schema
+    carried `execution`, but no card/events were produced)."""
+
+    def test_pm_module_binding_is_wrapped_and_captures(self, pm_cfg):
+        import tradingagents.agents.managers.portfolio_manager as pm_mod
+
+        daily_run._PM_SCHEMA_PATCHED = False
+        daily_run._ensure_pm_execution_schema(pm_cfg)
+        try:
+            fake = type("FakeLLM", (), {"invoke": lambda self, p: _pm_decision({
+                "rating": "Sell",
+                "execution": {"orders": [
+                    {"kind": "SELL", "shares": 2, "limit_px": 100.5}]}})})()
+            daily_run._clear_pm_capture()
+            text = pm_mod.invoke_structured_or_freetext(
+                fake, None, "p", lambda d: f"RENDERED {d.rating}",
+                "Portfolio Manager")
+            assert text.startswith("RENDERED")
+            captured = daily_run._pop_pm_capture()
+            assert captured is not None
+            assert captured["execution"]["orders"][0]["limit_px"] == 100.5
+        finally:
+            daily_run._reset_pm_execution_schema()
+
+    def test_reset_restores_pm_module_binding(self, pm_cfg):
+        import tradingagents.agents.managers.portfolio_manager as pm_mod
+        import tradingagents.agents.utils.structured as structured_mod
+
+        original = pm_mod.invoke_structured_or_freetext
+        daily_run._PM_SCHEMA_PATCHED = False
+        daily_run._ensure_pm_execution_schema(pm_cfg)
+        assert pm_mod.invoke_structured_or_freetext is not original
+        assert (pm_mod.invoke_structured_or_freetext
+                is structured_mod.invoke_structured_or_freetext)
+        daily_run._reset_pm_execution_schema()
+        assert pm_mod.invoke_structured_or_freetext is original
+
+
+class TestCardEventsWithClearedThreadLocal:
+    """Production shape: _write_decision_card runs AFTER propagate cleared
+    the thread-local logger; events must land via the explicit run_log."""
+
+    def test_events_land_via_explicit_run_log(self, pm_cfg, tmp_path):
+        import decision_cards
+        decision_cards.append_card(pm_cfg["results_dir"], {
+            "date": "2026-09-04", "ticker": "EL", "rating": "Overweight",
+            "executive_summary": "buy", "schema_version": 1})
+        run_log = structured_log.StructuredRunLogger(
+            ticker="EL", today="2026-09-05",
+            out_dir=str(tmp_path / "structured"))
+        structured_log.clear_active_logger()  # the production state
+        daily_run._clear_pm_capture()
+        daily_run._stash_pm_capture(_pm_decision({
+            "rating": "Underweight",
+            "execution": {"orders": [{"kind": "SELL", "shares": 2}]}
+        }).model_dump(mode="json"))
+        daily_run._write_decision_card("EL", "2026-09-05", pm_cfg,
+                                       "Underweight", run_log=run_log)
+        events = [json.loads(line) for line in
+                  run_log.path.read_text().splitlines()]
+        types = [e["type"] for e in events]
+        assert "execution_intent" in types
+        assert "rating_flip" in types
+        assert "decision_card" in types
+        flip = [e for e in events if e["type"] == "rating_flip"][0]
+        assert flip["old"] == "Overweight" and flip["new"] == "Underweight"
