@@ -117,3 +117,14 @@ class TestPath:
     def test_gate_path_lives_in_results_dir(self, gate_cfg):
         assert gate_path(gate_cfg["results_dir"], "2026-09-05").name == \
             "binding_gate_2026-09-05.json"
+
+    def test_empty_block_on_ow_held_is_maintain_not_failure(self, gate_cfg):
+        """E2E finding (09-05 sandbox): a held ticker rated Overweight with
+        explicit orders:[] is a deliberate maintain (13 HPE shares, no add
+        at the current price) — NOT the silent-inaction failure class. Only
+        empty blocks on NON-held buy-rated tickers fail the gate."""
+        _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": {"orders": [],
+                       "future_notes": "maintain; add only above 52.95"}})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={"HPE": 13}, last_close={"HPE": 52.0})
+        assert result["verdict"] == GATE_PASS

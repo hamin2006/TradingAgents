@@ -94,13 +94,16 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
                 "orders": [(o.action, o.shares) for o in orders],
                 "clamps": clamps,
             })
-            if not orders and rating in ("Buy", "Overweight"):
-                # Explicit empty on a buy-rated name = the model ignored the
-                # field (silent inaction) — never bind a day that would
-                # quietly skip intended buys.
+            if not orders and rating in ("Buy", "Overweight") \
+                    and ticker not in holdings:
+                # Explicit empty on a buy-rated name we DON'T hold = the
+                # model ignored the field (silent inaction) — never bind a
+                # day that would quietly skip intended buys. Empty on a
+                # HELD buy-rated name is a legitimate maintain (E2E 09-05:
+                # HPE OW with 13 shares, "no additions at $52.00").
                 counts["empty_on_buy"] += 1
                 reasons.append(f"{ticker}: empty execution orders on a "
-                               f"{rating} rating")
+                               f"{rating} rating with no position held")
             elif not orders and ticker in holdings:
                 counts["valid"] += 0  # explicit no-order on held = deliberate
 
