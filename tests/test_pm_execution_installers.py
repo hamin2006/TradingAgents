@@ -101,82 +101,83 @@ class TestSchemaSwapInstaller:
         daily_run._ensure_pm_execution_schema(pm_cfg)
 
     def test_contract_disclosure_injected_into_pm_prompt(self, pm_cfg):
-        """The PM factory wrapper must inject the execution contract text
-        into the prompt so the model knows the empty-block rules."""
+        """The capture wrapper must append the execution contract to the PM
+        prompt (append-at-seam: the framework node is never copied)."""
         daily_run._PM_SCHEMA_PATCHED = False
         daily_run._ensure_pm_execution_schema(pm_cfg)
 
-        # Call the wrapped factory and verify it creates a node
-        # that constructs prompts with the contract
-        factory = pm_mod.create_portfolio_manager
-        assert hasattr(factory, "_wrapped_original")
+        captured = []
 
-        # Create a fake LLM and node
-        fake_llm = object()
-        node = factory(fake_llm)
+        from types import SimpleNamespace
+        fake_decision = SimpleNamespace(
+            model_dump=lambda mode="json": {"rating": "Hold"})
+        captured = []
 
-        # Build a minimal state to trigger prompt construction
-        state = {
-            "risk_debate_state": {
-                "history": "test history",
-                "aggressive_history": "",
-                "conservative_history": "",
-                "neutral_history": "",
-                "current_aggressive_response": "",
-                "current_conservative_response": "",
-                "current_neutral_response": "",
-                "count": 0,
-            },
-            "investment_plan": "test plan",
-            "trader_investment_plan": "test trader plan",
-            "past_context": "",
-            "ticker": "AAPL",
-            "company_name": "Apple Inc.",
-            "date": "2026-09-08",
-        }
+        class FakeStructured:
+            def invoke(self, prompt):
+                captured.append(prompt)
+                return fake_decision
 
-        # Patch invoke_structured_or_freetext to capture the prompt
-        captured_prompt = []
-        def capture_invoke(structured_llm, plain_llm, prompt, render, agent_name):
-            captured_prompt.append(prompt)
-            return "Mock decision text"
+        def fake_render(_decision):
+            return "rendered"
 
-        original_invoke = structured_mod.invoke_structured_or_freetext
-        structured_mod.invoke_structured_or_freetext = capture_invoke
-        try:
-            node(state)
-        finally:
-            structured_mod.invoke_structured_or_freetext = original_invoke
-
-        assert len(captured_prompt) == 1
-        prompt = captured_prompt[0]
-
-        # Verify contract disclosure is present
+        out = structured_mod.invoke_structured_or_freetext(
+            FakeStructured(), object(), "PM body prompt", fake_render,
+            "Portfolio Manager")
+        assert out == "rendered"
+        assert len(captured) == 1
+        prompt = captured[0]
+        assert prompt.startswith("PM body prompt")  # body intact, appended
         assert "Execution Contract" in prompt
         assert "orders: []" in prompt
         assert "DON'T hold but rate Buy/Overweight is an ENGINE FAILURE" in prompt
-        assert "limit_px on SELL is a floor" in prompt
+        assert "`limit_px` on a SELL is a floor" in prompt
         assert "day-expiry" in prompt
 
+    def test_contract_disclosure_pm_only(self, pm_cfg):
+        """Other agents' prompts pass through untouched."""
+        daily_run._PM_SCHEMA_PATCHED = False
+        daily_run._ensure_pm_execution_schema(pm_cfg)
+
+        captured = []
+
+        from types import SimpleNamespace
+        fake_decision = SimpleNamespace(
+            model_dump=lambda mode="json": {"rating": "Hold"})
+
+        class FakeStructured:
+            def invoke(self, prompt):
+                captured.append(prompt)
+                return fake_decision
+
+        structured_mod.invoke_structured_or_freetext(
+            FakeStructured(), object(), "trader prompt", lambda d: "x",
+            "Trader")
+        assert len(captured) == 1
+        assert "Execution Contract" not in captured[0]
+
     def test_contract_disclosure_is_idempotent(self, pm_cfg):
-        """Multiple installer calls must not duplicate the contract."""
+        """Re-install must not stack wrappers (prompt gets one disclosure)."""
         daily_run._PM_SCHEMA_PATCHED = False
         daily_run._ensure_pm_execution_schema(pm_cfg)
-        daily_run._PM_SCHEMA_PATCHED = False  # Force re-install
+        daily_run._PM_SCHEMA_PATCHED = False  # force re-install
         daily_run._ensure_pm_execution_schema(pm_cfg)
 
-        factory = pm_mod.create_portfolio_manager
-        # Should still be wrapped once
-        assert hasattr(factory, "_wrapped_original")
-        daily_run._PM_SCHEMA_PATCHED = False
-        daily_run._ensure_pm_execution_schema(pm_cfg)
-        first = pm_mod.PortfolioDecision
-        daily_run._ensure_pm_execution_schema(pm_cfg)
-        assert pm_mod.PortfolioDecision is first
+        captured = []
 
+        from types import SimpleNamespace
+        fake_decision = SimpleNamespace(
+            model_dump=lambda mode="json": {"rating": "Hold"})
 
-# --- structured-output capture --------------------------------------------
+        class FakeStructured:
+            def invoke(self, prompt):
+                captured.append(prompt)
+                return fake_decision
 
+        structured_mod.invoke_structured_or_freetext(
+            FakeStructured(), object(), "PM body", lambda d: "x",
+            "Portfolio Manager")
+        assert captured[0].count("Execution Contract") == 1
 
 class TestPmDecisionCapture:
     def test_captures_pm_structured_decision(self, pm_cfg):

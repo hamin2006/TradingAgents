@@ -171,84 +171,6 @@ class AlpacaBroker:
             for o, r in zip(retryable, second_reports, strict=False):
                 results[id(o)] = r
 
-        # Sell-resume completion: AFTER all retries resolve, a SELL whose
-        # filled < intended gets ONE bounded resume — completing an exit is
-        # the system's own invariant ("exits are never paused"). Re-query
-        # the real position before resuming (guards: position must still be
-        # >= remaining; skip when fill_unknown or when a stop was just
-        # attached). Buys get NO resume (missed entry = recoverable next
-        # morning, chasing fills risks overpaying through a gap).
-        for o in orders:
-            r = results[id(o)]
-            if o.action == "SELL" and r["filled"] < o.shares:
-                remaining = o.shares - r["filled"]
-                # Re-query position to verify shares are still there
-                real_qty = self._position_qty(o.ticker)
-                if real_qty is None or real_qty < remaining:
-                    logger.warning(
-                        "SELL resume for %s skipped: position %s < remaining %d",
-                        o.ticker, real_qty, remaining)
-                    continue
-                # Resume only if no stop was just attached (stop means the
-                # partial shed already re-anchored protection)
-                if o.stop_price is not None:
-                    # The re-anchor happened; let it work
-                    logger.info(
-                        "SELL resume for %s (%d shares) deferred to the "
-                        "re-anchored GTC stop", o.ticker, remaining)
-                    continue
-                # Submit the resume as a market order
-                try:
-                    resume_req = MarketOrderRequest(
-                        symbol=o.ticker, qty=remaining, side=OrderSide.SELL,
-                        type=OrderType.MARKET,
-                        time_in_force=TimeInForce.DAY, extended_hours=False,
-                    )
-                    logger.info("resuming SELL for %s: %d shares remaining",
-                                o.ticker, remaining)
-                    submitted = self._client.submit_order(resume_req)
-                    # Poll for fill (same concurrent logic, but solo)
-                    final_status = self._poll_all_concurrently([(o, submitted)])
-                    resume_filled = _filled_qty(final_status[submitted.id])
-                    resume_avg = _filled_avg(final_status[submitted.id])
-                    if resume_filled > 0:
-                        # Update the report with cumulative fill
-                        r["filled"] += resume_filled
-                        # Weighted average price
-                        if r["filled"] > 0:
-                            orig_qty = r["filled"] - resume_filled
-                            orig_price = r["avg_price"]
-                            r["avg_price"] = round(
-                                (orig_qty * orig_price + resume_filled * resume_avg) / r["filled"],
-                                4)
-                        logger.info(
-                            "SELL resume filled %d/%d for %s @ %.2f",
-                            resume_filled, remaining, o.ticker, resume_avg)
-                    else:
-                        logger.warning(
-                            "SELL resume for %s not filled; %d shares remain",
-                            o.ticker, remaining)
-                    # After resume, re-anchor the final remainder if any
-                    if o.stop_price is not None and r["filled"] < o.shares:
-                        final_remain = self._position_qty(o.ticker)
-                        if final_remain and final_remain > 0:
-                            self._cancel_open_stops(o.ticker)
-                            stop_req = StopOrderRequest(
-                                symbol=o.ticker, qty=final_remain,
-                                side=OrderSide.SELL,
-                                type=OrderType.STOP,
-                                stop_price=o.stop_price,
-                                time_in_force=TimeInForce.GTC,
-                                extended_hours=False,
-                            )
-                            self._client.submit_order(stop_req)
-                            logger.info(
-                                "re-anchored GTC stop %s for %s post-resume "
-                                "remainder (%d shares)",
-                                o.stop_price, o.ticker, final_remain)
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("SELL resume failed for %s: %s", o.ticker, exc)
-
         return [results[id(o)] for o in orders]
 
     def _place_batch(self, orders: list[Order],
@@ -402,6 +324,67 @@ class AlpacaBroker:
                         self._client.submit_order(stop_request)
                         logger.info("attached GTC stop %s for %s (%d shares)",
                                     o.stop_price, o.ticker, filled)
+
+                # Sell-resume completion: one bounded resume of the
+                # remainder so the PM's stated quantity is actually
+                # completed (exits are never paused). Gated to orders that
+                # are DEFINITIVELY settled: never after a fill_unknown
+                # cancel (the original may still fill — resuming would
+                # double-sell), first-round partials here, final-round
+                # deaths after their retry resolved. Floor-limit sells are
+                # never resumed as market (the PM's price intent governs;
+                # the re-anchor below protects the remainder). The real
+                # position query clamps the resume size (never shorts).
+                if (o.action == "SELL" and o.protection_price is None
+                        and not fill_unknown and filled < o.shares
+                        and (filled > 0 or final_round)):
+                    real_qty = self._position_qty(o.ticker)
+                    resume_qty = min(o.shares - filled, real_qty)
+                    if resume_qty < 1:
+                        logger.info(
+                            "sell resume for %s skipped: position %d does "
+                            "not cover the remaining %d", o.ticker,
+                            real_qty, o.shares - filled)
+                    else:
+                        try:
+                            resume_order = Order(ticker=o.ticker,
+                                                 action="SELL",
+                                                 shares=resume_qty,
+                                                 reason="sell-resume")
+                            submitted_resume = self._client.submit_order(
+                                MarketOrderRequest(
+                                    symbol=o.ticker, qty=resume_qty,
+                                    side=OrderSide.SELL,
+                                    type=OrderType.MARKET,
+                                    time_in_force=TimeInForce.DAY,
+                                    extended_hours=False,
+                                ))
+                            resume_status = self._poll_all_concurrently(
+                                [(resume_order, submitted_resume)])
+                            resume_filled = _filled_qty(
+                                resume_status[submitted_resume.id])
+                            resume_avg = _filled_avg(
+                                resume_status[submitted_resume.id])
+                            if resume_filled > 0:
+                                orig_qty = filled
+                                filled += resume_filled
+                                avg_price = (
+                                    float(resume_avg) if orig_qty == 0
+                                    else round((orig_qty * avg_price
+                                                + resume_filled * resume_avg)
+                                               / filled, 4))
+                                logger.info(
+                                    "sell resume filled %d for %s @ %.2f "
+                                    "(total %d/%d)", resume_filled,
+                                    o.ticker, resume_avg, filled, o.shares)
+                            else:
+                                logger.warning(
+                                    "sell resume for %s not filled; %d of "
+                                    "%d still held", o.ticker,
+                                    o.shares - filled, o.shares)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error("sell resume failed for %s: %s",
+                                         o.ticker, exc)
 
                 # Sell protection: a partial-sell remainder (or a sell that
                 # never filled and is now definitively dead) must be

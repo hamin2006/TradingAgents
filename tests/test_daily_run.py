@@ -709,11 +709,13 @@ def test_run_analyze_includes_holdings(cfg):
          patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
          patch("daily_run.TradingMemoryLog") as mock_log, \
          patch("daily_run.create_broker", return_value=broker), \
-         patch("daily_run.load_pool", return_value=pool):
+         patch("daily_run.load_pool", return_value=pool), \
+         patch("daily_run._last_close", return_value=100.0):
         mock_log.return_value.load_entries.return_value = []
         payload = run_analyze(cfg)
     assert set(payload["ratings"]) == {"TSLA", "NVDA", "AAPL"}
-    broker.connect.assert_called_once()
+    # connect fires for the analyze run AND the stop sweep (shared mock)
+    broker.connect.assert_called()
 
 
 def test_run_analyze_failure_is_isolated(cfg):
@@ -1509,20 +1511,26 @@ def _run_exec(cfg, broker, day="2026-09-04"):
 
 
 
-def _write_gate(cfg, verdict="PASS", day="2026-09-04"):
-    """Binding tests need the automated morning gate artifact (fail-closed)."""
+def _write_gate(cfg, verdict="PASS", day="2026-09-04", bind=()):
+    """Binding tests need the automated morning gate artifact (fail-closed).
+    ``bind`` lists tickers the artifact marks bind-worthy (per-ticker
+    gating: absent/legacy tickers fall back to the legacy path)."""
     import pathlib
     path = pathlib.Path(cfg["results_dir"]) / f"binding_gate_{day}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"date": day, "verdict": verdict,
                                 "reasons": [], "counts": {},
-                                "preview": []}), encoding="utf-8")
+                                "preview": [],
+                                "per_ticker": {t: {"status": "bind",
+                                                   "reason": None}
+                                               for t in bind}}),
+                    encoding="utf-8")
 
 
 class TestPmExecutionBinding:
     def test_block_replaces_legacy_partial_sell(self, cfg):
         cfg["pm_execution"] = True
-        _write_gate(cfg)
+        _write_gate(cfg, bind=["EL"])
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5,
                         "stop_px": 95.6}]}})
@@ -1538,7 +1546,7 @@ class TestPmExecutionBinding:
 
     def test_explicit_empty_block_overrides_legacy_exit(self, cfg):
         cfg["pm_execution"] = True
-        _write_gate(cfg)
+        _write_gate(cfg, bind=["EL"])
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {"orders": []}})
         broker = _exec_broker()
         broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
@@ -1560,7 +1568,7 @@ class TestPmExecutionBinding:
 
     def test_pm_buy_sizes_from_block_not_legacy(self, cfg):
         cfg["pm_execution"] = True
-        _write_gate(cfg)
+        _write_gate(cfg, bind=["NOW"])
         cfg["capital"] = 100_000
         _ratings_v2_file(cfg, {"NOW": "Overweight"}, {"NOW": {
             "orders": [{"kind": "BUY", "value_usd": 500.0,
@@ -1575,7 +1583,7 @@ class TestPmExecutionBinding:
 
     def test_partial_sell_without_pm_stop_reuses_original(self, cfg):
         cfg["pm_execution"] = True
-        _write_gate(cfg)
+        _write_gate(cfg, bind=["EL"])
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5}]}})
         broker = _exec_broker()
@@ -1588,7 +1596,7 @@ class TestPmExecutionBinding:
 
     def test_mixed_blocks_and_legacy_tickers(self, cfg):
         cfg["pm_execution"] = True
-        _write_gate(cfg)
+        _write_gate(cfg, bind=["EL", "AAPL"])
         cfg["capital"] = 100_000
         _ratings_v2_file(cfg, {"EL": "Underweight", "AAPL": "Buy"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2}]}})
@@ -1616,7 +1624,7 @@ class TestPmExecutionBinding:
         original stop must never leave the remainder naked — re-anchor at the
         standard -8% stop instead."""
         cfg["pm_execution"] = True
-        _write_gate(cfg)
+        _write_gate(cfg, bind=["EL"])
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2}]}})
         broker = _exec_broker()
@@ -1631,7 +1639,7 @@ class TestPmExecutionBinding:
         math — but the account cash still caps them: a block asking for more
         than the account can cover must clamp, never oversize."""
         cfg["pm_execution"] = True
-        _write_gate(cfg)
+        _write_gate(cfg, bind=["NOW"])
         cfg["capital"] = 100_000
         _ratings_v2_file(cfg, {"NOW": "Overweight"}, {"NOW": {
             "orders": [{"kind": "BUY", "value_usd": 50_000.0}]}})
@@ -1670,7 +1678,7 @@ class TestBindingGateHonoring:
 
     def test_gate_pass_allows_binding(self, cfg):
         cfg["pm_execution"] = True
-        _write_gate(cfg, verdict="PASS")
+        _write_gate(cfg, verdict="PASS", bind=["EL"])
         _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
             "orders": [{"kind": "SELL", "shares": 2}]}})
         broker = _exec_broker()
@@ -1756,7 +1764,7 @@ def test_execution_outcomes_reconcile_legacy_day():
                         "no position held"]}
     out = _execution_outcomes(payload, orders, reports,
                               {"HPE": 13, "DXCM": 9}, gate,
-                              binding_active=False)
+                              bound_tickers=set())
     hpe = out["HPE"]
     assert hpe["binding_active"] is False
     assert hpe["gate_verdict"] == "FAIL"
@@ -1785,7 +1793,7 @@ def test_execution_outcomes_binding_maintain_and_buy():
                 "avg_price": 522.78}]
     gate = {"verdict": "PASS", "reasons": []}
     out = _execution_outcomes(payload, orders, reports, {"MSFT": 1}, gate,
-                              binding_active=True)
+                              bound_tickers={"DELL", "MSFT"})
     dell = out["DELL"]
     assert dell["binding_active"] is True
     assert dell["gate_verdict"] == "PASS"
@@ -1841,69 +1849,75 @@ def test_run_execute_dry_run_writes_no_outcomes(cfg):
 
 
 
-def test_run_execute_per_ticker_gate_binds_selectively():
+def test_run_execute_per_ticker_gate_binds_selectively(cfg):
     """Per-ticker gate allows good blocks to bind while bad blocks fall
-    back to legacy, without poisoning the whole day."""
-    import json
+    back to legacy — even when the day verdict is FAIL (2026-09-08 class:
+    one empty-on-unheld block must not discard the day's good ones)."""
+    import json as _json
     from pathlib import Path
 
-    from daily_run import load_watchlist_config, run_execute
-
-    cfg = load_watchlist_config()
     cfg["pm_execution"] = True
+    day = "2026-09-05"
+    execution = {
+        "HPE": {"orders": [{"kind": "SELL", "shares": 2, "stop_px": 52.0}]},
+        "DELL": {"orders": []},  # empty on unheld Buy -> legacy
+        "EL": {"orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5}]},
+    }
+    payload = {"date": day, "schema_version": 2,
+               "ratings": {"HPE": "Overweight", "DELL": "Buy",
+                           "EL": "Underweight"},
+               "execution": execution, "failures": []}
     results_dir = Path(cfg["results_dir"])
     results_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create ratings with mixed good/bad blocks
-    ratings = {"HPE": "Overweight", "DELL": "Buy", "EL": "Underweight"}
-    execution = {
-        "HPE": {"orders": [{"kind": "BUY", "value_usd": 200.0}]},  # good
-        "DELL": {"orders": []},  # empty on unheld Buy -> legacy
-        "EL": {"orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5}]}  # good
-    }
-    _ratings_file(cfg, ratings, execution)
-
-    # Create gate artifact with per_ticker status
-    gate = {
-        "date": "2026-09-05",
-        "verdict": "FAIL",  # day verdict fails (has DELL reason)
-        "reasons": ["DELL: empty execution orders on a Buy rating with no position held"],
-        "counts": {"valid": 2, "invalid": 0, "empty_on_buy": 1, "engine_fallback": 0},
+    (results_dir / f"ratings_{day}.json").write_text(
+        _json.dumps(payload), encoding="utf-8")
+    (results_dir / f"binding_gate_{day}.json").write_text(_json.dumps({
+        "date": day, "verdict": "FAIL",
+        "reasons": ["DELL: empty execution orders on a Buy rating with no "
+                    "position held"],
+        "counts": {"valid": 2, "invalid": 0, "empty_on_buy": 1,
+                   "engine_fallback": 0},
         "preview": [],
         "per_ticker": {
             "HPE": {"status": "bind", "reason": None},
-            "DELL": {"status": "legacy", "reason": "empty execution orders on a Buy rating with no position held"},
-            "EL": {"status": "bind", "reason": None}
-        }
-    }
-    gate_path = results_dir / "binding_gate_2026-09-05.json"
-    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            "DELL": {"status": "legacy",
+                     "reason": "empty execution orders on a Buy rating "
+                               "with no position held"},
+            "EL": {"status": "bind", "reason": None},
+        }}), encoding="utf-8")
 
     broker = _exec_broker()
-    broker.get_positions_and_cash.return_value = ({"EL": 8}, 10000.0)
+    broker.get_positions_and_cash.return_value = ({"EL": 8, "HPE": 13},
+                                                   10_000.0)
     broker.place_market_orders.return_value = [
-        {"ticker": "HPE", "action": "BUY", "shares": 3, "filled": 3, "avg_price": 54.25},
-        {"ticker": "DELL", "action": "BUY", "shares": 1, "filled": 1, "avg_price": 120.0},
-        {"ticker": "EL", "action": "SELL", "shares": 2, "filled": 2, "avg_price": 101.15}
-    ]
+        {"ticker": "HPE", "action": "SELL", "shares": 2, "filled": 2,
+         "avg_price": 54.25},
+        {"ticker": "DELL", "action": "SELL", "shares": 1, "filled": 1,
+         "avg_price": 120.0},
+        {"ticker": "EL", "action": "SELL", "shares": 2, "filled": 2,
+         "avg_price": 101.15}]
 
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
          patch("daily_run.create_broker", return_value=broker), \
-         patch("daily_run._last_close", side_effect=lambda t: {"HPE": 54.25, "DELL": 120.0, "EL": 101.15}.get(t)), \
-         patch("daily_run._seconds_until_open", return_value=0.0):
+         patch("daily_run._last_close",
+               side_effect=lambda t: {"HPE": 54.25, "DELL": 120.0,
+                                      "EL": 101.15}.get(t)), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today:
+        mock_today.return_value = __import__("datetime").date(2026, 9, 5)
         rc = run_execute(cfg)
 
     assert rc == 0
-    # HPE and EL should have PM orders executed (bind status)
-    # DELL should have legacy tier orders executed (legacy status)
     orders_placed = broker.place_market_orders.call_args[0][0]
-    # HPE bound, EL bound, DELL legacy fallback
-    assert any(o.ticker == "HPE" and o.reason == "pm-execution" for o in orders_placed)
-    assert any(o.ticker == "EL" and o.reason == "pm-execution" for o in orders_placed)
-    # DELL goes legacy (tier-based reason, not pm-execution)
+    # Bound tickers carry pm-execution orders from their blocks
+    assert any(o.ticker == "HPE" and o.reason == "pm-execution"
+               for o in orders_placed)
+    assert any(o.ticker == "EL" and o.reason == "pm-execution"
+               for o in orders_placed)
+    # DELL fell back to the legacy tier path (unheld Buy -> entry order)
     dell_orders = [o for o in orders_placed if o.ticker == "DELL"]
-    assert all(o.reason != "pm-execution" for o in dell_orders)
-
+    assert dell_orders and all(o.reason != "pm-execution"
+                               for o in dell_orders)
 
 
 def test_stop_sweep_attaches_missing_stops():

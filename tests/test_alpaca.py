@@ -749,6 +749,13 @@ def test_failed_sell_submission_with_no_position_attaches_nothing(broker):
 
 
 
+def _mono_instant():
+    """monotonic that starts past any deadline: every poll window expires
+    immediately (tests stay hermetic — no 120s busy-loops)."""
+    import itertools
+    return itertools.count(start=10_000, step=10_000)
+
+
 def test_sell_resume_completes_partial_fill(broker):
     """A SELL that partially fills gets ONE bounded resume — the remainder
     is submitted as a market order to complete the PM's stated quantity."""
@@ -761,89 +768,108 @@ def test_sell_resume_completes_partial_fill(broker):
     resume = MagicMock()
     resume.id = "resume-1"
     resume.status = "filled"
-    resume.filled_qty = "2"  # resume fills 2 more
+    resume.filled_qty = "3"
     resume.filled_avg_price = "100.5"
     mock_client.submit_order.side_effect = [partial, resume]
-    mock_client.get_order_by_id.return_value = partial
-    # Mock position query for resume guard
-    mock_client.get_all_positions.return_value = [
-        MagicMock(symbol="AAPL", qty="3")  # 3 shares remain (5 filled + 3 left = 8)
-    ]
-    with patch("alpaca_broker.time.sleep"):
-        reports = b.place_market_orders(
-            [Order(ticker="AAPL", action="SELL", shares=8, reason="rating exit")])
 
-    # First submit is the original sell, second is the resume
+    def by_id(oid):
+        return partial if oid == "order-1" else resume
+
+    mock_client.get_order_by_id.side_effect = by_id
+    pos_queries = [[MagicMock(symbol="AAPL", qty="3")],   # resume guard
+                   [MagicMock(symbol="AAPL", qty="0")]]   # re-anchor check
+    mock_client.get_all_positions.side_effect = pos_queries
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=_mono_instant()):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="SELL", shares=8,
+                   reason="rating exit")])
+
     assert mock_client.submit_order.call_count == 2
     resume_req = mock_client.submit_order.call_args_list[1][0][0]
     assert resume_req.symbol == "AAPL"
-    assert resume_req.qty == 3  # resume the 3 remaining (8 - 5)
+    assert resume_req.qty == 3  # the remainder (8 - 5), position-clamped
     assert resume_req.side.value == "sell"
     assert resume_req.type.value == "market"
-
-    # Report should show cumulative fill (5 + 2 = 7) with weighted avg price
-    assert reports[0]["ticker"] == "AAPL"
-    assert reports[0]["action"] == "SELL"
-    assert reports[0]["shares"] == 8
-    assert reports[0]["filled"] == 7  # 5 + 2
-    # Weighted avg: (5 * 101.0 + 2 * 100.5) / 7 = 706.0 / 7 = 100.857...
-    assert 100.85 < reports[0]["avg_price"] < 100.87
+    assert reports[0]["filled"] == 8  # 5 + 3: quantity completed
+    # Weighted avg: (5 * 101.0 + 3 * 100.5) / 8
+    assert abs(reports[0]["avg_price"] - (5 * 101.0 + 3 * 100.5) / 8) < 1e-3
 
 
-def test_sell_resume_skipped_when_stop_attached(broker):
-    """A partial SELL with stop_price set already got its stop re-anchored
-    — no resume; let the stop work."""
+def test_sell_resume_completes_exit_despite_stop_anchor(broker):
+    """A stop-anchored partial exit still resumes: the PM's stated quantity
+    completes first, then the re-anchor covers whatever remains (HPE
+    2026-09-08: 1/13 filled, remainder must not wait on a stop)."""
     b, mock_client, _ = broker
     partial = MagicMock()
     partial.id = "order-1"
     partial.status = "partially_filled"
-    partial.filled_qty = "2"
-    partial.filled_avg_price = "100.5"
-    stop = MagicMock()
-    stop.id = "stop-1"
-    mock_client.submit_order.side_effect = [partial, stop]
-    mock_client.get_order_by_id.return_value = partial
-    mock_client.get_all_positions.return_value = [
-        MagicMock(symbol="AAPL", qty="6")
-    ]
-    with patch("alpaca_broker.time.sleep"):
+    partial.filled_qty = "1"
+    partial.filled_avg_price = "52.75"
+    resume = MagicMock()
+    resume.id = "resume-1"
+    resume.status = "filled"
+    resume.filled_qty = "12"
+    resume.filled_avg_price = "52.70"
+    mock_client.submit_order.side_effect = [partial, resume]
+
+    def by_id(oid):
+        return partial if oid == "order-1" else resume
+
+    mock_client.get_order_by_id.side_effect = by_id
+    pos_queries = [[MagicMock(symbol="HPE", qty="12")],   # resume guard
+                   [MagicMock(symbol="HPE", qty="0")]]    # re-anchor check
+    mock_client.get_all_positions.side_effect = pos_queries
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=_mono_instant()):
         reports = b.place_market_orders(
-            [Order(ticker="AAPL", action="SELL", shares=8, reason="pm-execution",
-                   stop_price=95.0)])
+            [Order(ticker="HPE", action="SELL", shares=13,
+                   reason="rating exit", stop_price=50.08)])
 
-    # First submit is the original sell, second is stop re-anchor (not resume)
-    assert mock_client.submit_order.call_count == 2
-    stop_req = mock_client.submit_order.call_args_list[1][0][0]
-    assert stop_req.type.value == "stop"
-    assert reports[0]["filled"] == 2  # no resume, just the partial
+    assert mock_client.submit_order.call_count == 2  # sell + resume, no stop
+    assert reports[0]["filled"] == 13  # exit completed
+    assert not any(c[0][0].type.value == "stop"
+                   for c in mock_client.submit_order.call_args_list)
 
 
-def test_sell_resume_skipped_when_position_gone(broker):
-    """Resume guard: if the position query shows fewer shares than the
-    resume needs, skip the resume (position was closed elsewhere)."""
+def test_sell_resume_position_clamped(broker):
+    """Resume size is clamped by the REAL position query: if shares left
+    the account elsewhere, the resume never shorts."""
     b, mock_client, _ = broker
     partial = MagicMock()
     partial.id = "order-1"
     partial.status = "partially_filled"
     partial.filled_qty = "3"
     partial.filled_avg_price = "101.0"
-    mock_client.submit_order.return_value = partial
-    mock_client.get_order_by_id.return_value = partial
-    # Position query shows only 1 share left (< the 5 remaining)
-    mock_client.get_all_positions.return_value = [
-        MagicMock(symbol="AAPL", qty="1")
-    ]
-    with patch("alpaca_broker.time.sleep"):
-        reports = b.place_market_orders(
-            [Order(ticker="AAPL", action="SELL", shares=8, reason="rating exit")])
+    resume = MagicMock()
+    resume.id = "resume-1"
+    resume.status = "filled"
+    resume.filled_qty = "1"
+    resume.filled_avg_price = "100.0"
+    mock_client.submit_order.side_effect = [partial, resume]
 
-    # Only one submit (the original), no resume
-    assert mock_client.submit_order.call_count == 1
-    assert reports[0]["filled"] == 3  # partial only, no resume
+    def by_id(oid):
+        return partial if oid == "order-1" else resume
+
+    mock_client.get_order_by_id.side_effect = by_id
+    # only 1 share actually remains (4 closed elsewhere, e.g. stop fire)
+    pos_queries = [[MagicMock(symbol="AAPL", qty="1")],
+                   [MagicMock(symbol="AAPL", qty="0")]]
+    mock_client.get_all_positions.side_effect = pos_queries
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=_mono_instant()):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="SELL", shares=8,
+                   reason="rating exit")])
+
+    resume_req = mock_client.submit_order.call_args_list[1][0][0]
+    assert resume_req.qty == 1  # min(5 remaining, 1 held)
+    assert reports[0]["filled"] == 4  # 3 + 1
 
 
 def test_sell_resume_reanchors_stop_after_completion(broker):
-    """After a resume fills, any remaining shares get a re-anchored stop."""
+    """A resume that itself partially fills leaves the remainder
+    re-anchored at the original stop level (never naked between runs)."""
     b, mock_client, _ = broker
     partial = MagicMock()
     partial.id = "order-1"
@@ -853,25 +879,91 @@ def test_sell_resume_reanchors_stop_after_completion(broker):
     resume = MagicMock()
     resume.id = "resume-1"
     resume.status = "partially_filled"  # resume also partially fills
-    resume.filled_qty = "2"  # resume fills 2 of the 4 remaining
+    resume.filled_qty = "2"  # 2 of the 4 remaining
     resume.filled_avg_price = "100.5"
-    final_stop = MagicMock()
-    final_stop.id = "stop-2"
-    mock_client.submit_order.side_effect = [partial, resume, final_stop]
-    mock_client.get_order_by_id.return_value = partial
-    # Position after resume: 8 - 4 - 2 = 2 shares left
-    position_queries = [[MagicMock(symbol="AAPL", qty="4")],  # before resume
-                        [MagicMock(symbol="AAPL", qty="2")]]  # after resume
-    mock_client.get_all_positions.side_effect = position_queries
-    with patch("alpaca_broker.time.sleep"):
+    mock_client.submit_order.side_effect = [partial, resume]
+
+    def by_id(oid):
+        return partial if oid == "order-1" else resume
+
+    mock_client.get_order_by_id.side_effect = by_id
+    pos_queries = [[MagicMock(symbol="AAPL", qty="4")],   # resume guard
+                   [MagicMock(symbol="AAPL", qty="2")]]   # re-anchor check
+    mock_client.get_all_positions.side_effect = pos_queries
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=_mono_instant()):
         reports = b.place_market_orders(
-            [Order(ticker="AAPL", action="SELL", shares=8, reason="pm-execution",
+            [Order(ticker="AAPL", action="SELL", shares=8,
+                   reason="pm-execution", stop_price=95.0)])
+
+    assert mock_client.submit_order.call_count == 3  # sell, resume, stop
+    stop_req = mock_client.submit_order.call_args_list[2][0][0]
+    assert stop_req.type.value == "stop"
+    assert stop_req.qty == 2
+    assert stop_req.stop_price == 95.0
+    assert reports[0]["filled"] == 6  # 4 + 2
+
+
+def test_sell_resume_skipped_on_fill_unknown(broker):
+    """A cancel that raced a late fill leaves the fill status UNKNOWN —
+    resuming then could double-sell when the original lands. Never resume
+    on fill_unknown; the re-anchor also stays off (same guard)."""
+    b, mock_client, _ = broker
+    dead = MagicMock()
+    dead.id = "order-1"
+    dead.status = "new"
+    dead.filled_qty = "0"
+    dead.filled_avg_price = "0"
+    mock_client.submit_order.side_effect = [dead]
+    mock_client.get_order_by_id.return_value = dead
+    mock_client.cancel_order_by_id.side_effect = Exception("cancel raced")
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="AAPL", qty="8")]
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="AAPL", action="SELL", shares=8,
+                   reason="rating exit", stop_price=95.0)])
+
+    assert mock_client.submit_order.call_count == 1  # no resume submitted
+    assert reports[0]["filled"] == 0
+
+
+def test_sell_resume_skipped_for_floor_limit(broker):
+    """A floor-limit sell carries the PM's price intent — never resumed as
+    market. The re-anchor still protects the whole position on death."""
+    b, mock_client, _ = broker
+    dead = MagicMock()
+    dead.id = "order-1"
+    dead.status = "new"
+    dead.filled_qty = "0"
+    dead.filled_avg_price = "0"
+    stop = MagicMock()
+    stop.id = "stop-1"
+    mock_client.submit_order.side_effect = [dead, dead, stop]
+
+    def by_id(oid):
+        return dead
+
+    mock_client.get_order_by_id.side_effect = by_id
+    mock_client.get_orders.return_value = []  # no leftover stops
+    pos_queries = [[MagicMock(symbol="EL", qty="8")]]
+    mock_client.get_all_positions.side_effect = pos_queries
+    ticks = iter([100.0, 100.0, 100.0, 100.0, 250.0,
+                  500.0, 500.0, 500.0, 500.0, 650.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        reports = b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=8,
+                   reason="pm-execution", protection_price=100.5,
                    stop_price=95.0)])
 
-    # Three submits: original, resume, final stop re-anchor
+    # original + retry, both limit sells; third submit is the stop
     assert mock_client.submit_order.call_count == 3
-    final_stop_req = mock_client.submit_order.call_args_list[2][0][0]
-    assert final_stop_req.type.value == "stop"
-    assert final_stop_req.qty == 2  # the final remainder
-    assert final_stop_req.stop_price == 95.0
-    assert reports[0]["filled"] == 6  # 4 + 2
+    second = mock_client.submit_order.call_args_list[1][0][0]
+    assert second.type.value == "limit"  # retry keeps the floor
+    stop_req = mock_client.submit_order.call_args_list[2][0][0]
+    assert stop_req.type.value == "stop"
+    assert stop_req.qty == 8
+    assert reports[0]["filled"] == 0

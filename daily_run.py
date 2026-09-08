@@ -13,7 +13,6 @@ from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
-from binding_gate import GATE_PASS
 from broker import create_broker
 from config import load_watchlist_config
 from decisions import BUY_RATINGS, compute_orders
@@ -1269,6 +1268,7 @@ def _ensure_reddit_oauth() -> bool:
 # to the PM-only past_context.
 
 _PM_SCHEMA_PATCHED = False
+_PM_CONTRACT_DISCLOSURE = ""
 _PM_ORIGINAL_DECISION: type | None = None  # framework class captured pre-swap
 _PM_CAPTURE = threading.local()
 _PM_CARDS_ENABLED = False  # mirrors cfg execution_intent (decision cards + events)
@@ -1326,110 +1326,23 @@ def _ensure_pm_execution_schema(cfg: dict) -> None:
     schemas_mod.PortfolioDecision = ExecutionPortfolioDecision
     pm_agents_mod.PortfolioDecision = ExecutionPortfolioDecision
 
-    # Wrap the PM node factory to inject the execution contract into its prompt
-    original_factory = pm_agents_mod.create_portfolio_manager
-    def create_portfolio_manager_with_contract(llm):
-        node = original_factory(llm)
-        # Wrap the node to inject contract disclosure
-        def node_with_contract(state):
-            # Call original node but intercept the structured call to prepend contract
-            return node(state)
-        # Patch the PM prompt inside the factory's closure by wrapping the node
-        # Actually, we need to patch it differently - let's wrap at the prompt level
-        return node
+    # Execution contract disclosure: appended to the PM prompt by the
+    # capture wrapper below (append-at-seam — the node itself is never
+    # copied, so upstream prompt changes cannot drift out of sync).
+    global _PM_CONTRACT_DISCLOSURE
+    _PM_CONTRACT_DISCLOSURE = """
 
-    # Better approach: patch the create function to inject contract into prompt template
-    def pm_factory_with_contract(llm):
-        from tradingagents.agents.utils.instrument_context import get_instrument_context_from_state
-        from tradingagents.constants import NO_EXTERNAL_TOOLS
-        from tradingagents.localization import get_language_instruction
-
-        from tradingagents.agents.utils.structured import bind_structured
-
-        structured_llm = bind_structured(llm, ExecutionPortfolioDecision, "Portfolio Manager")
-
-        # Execution contract disclosure text
-        CONTRACT_DISCLOSURE = """
 ---
-**Execution Contract** (binding when execution blocks are enabled):
+
+**Execution Contract** (your `execution` block binds when enabled):
 - You hold positions per the "Portfolio context (ground truth)" block above.
 - Every ticker you rate MUST carry an `execution` block with an `orders` list.
-- `orders: []` on a ticker you HOLD is valid (deliberate maintain).
-- `orders: []` on a ticker you DON'T hold but rate Buy/Overweight is an ENGINE FAILURE: either size an entry (shares OR value_usd) or reconsider the rating. The gate halts binding for the day on such blocks.
-- Full exit: `shares` equal to held quantity. Partial trim: fewer shares (or `fraction_held`); set `stop_px` for the remainder.
-- `limit_px` on SELL is a floor (day-expiry if never reached); buys get +2% protection ceiling automatically.
-- Orders are day-expiry, fill at/after 09:30 ET; `stop_px` becomes a broker-side GTC stop for remainder/fill protection.
+- `orders: []` on a ticker you HOLD is valid (a deliberate maintain decision).
+- `orders: []` on a ticker you DON'T hold but rate Buy/Overweight is an ENGINE FAILURE: either size an entry (shares OR value_usd) or reconsider the rating. The gate marks such blocks legacy (that ticker will not bind today).
+- Full exit: `shares` equal to the held quantity. Partial trim: fewer shares (or `fraction_held`); set `stop_px` for the remainder.
+- `limit_px` on a SELL is a floor (day-expiry if never reached); buys get a +2% protection ceiling automatically.
+- Orders are day-expiry and fill at/after the 09:30 ET open; `stop_px` becomes a broker-side GTC stop protecting fills and remainders.
 """
-
-        def portfolio_manager_node(state) -> dict:
-            instrument_context = get_instrument_context_from_state(state)
-            history = state["risk_debate_state"]["history"]
-            risk_debate_state = state["risk_debate_state"]
-            research_plan = state["investment_plan"]
-            trader_plan = state["trader_investment_plan"]
-            past_context = state.get("past_context", "")
-            lessons_line = (
-                f"- Lessons from prior decisions and outcomes:\n{past_context}\n"
-                if past_context
-                else ""
-            )
-
-            prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
-
-{instrument_context}
-
----
-
-**Rating Scale** (use exactly one):
-- **Buy**: Strong conviction to enter or add to position
-- **Overweight**: Favorable outlook, gradually increase exposure
-- **Hold**: Maintain current position, no action needed
-- **Underweight**: Reduce exposure, take partial profits
-- **Sell**: Exit position or avoid entry
-
-**Context:**
-- Research Manager's investment plan: **{research_plan}**
-- Trader's transaction proposal: **{trader_plan}**
-{lessons_line}
-**Risk Analysts Debate History:**
-{history}
-
----
-
-Be decisive and ground every conclusion in specific evidence from the analysts.
-{CONTRACT_DISCLOSURE}
-{NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
-
-            final_trade_decision = structured_mod.invoke_structured_or_freetext(
-                structured_llm,
-                llm,
-                prompt,
-                _render_pm_decision,
-                "Portfolio Manager",
-            )
-
-            new_risk_debate_state = {
-                "judge_decision": final_trade_decision,
-                "history": risk_debate_state["history"],
-                "aggressive_history": risk_debate_state["aggressive_history"],
-                "conservative_history": risk_debate_state["conservative_history"],
-                "neutral_history": risk_debate_state["neutral_history"],
-                "latest_speaker": "Judge",
-                "current_aggressive_response": risk_debate_state["current_aggressive_response"],
-                "current_conservative_response": risk_debate_state["current_conservative_response"],
-                "current_neutral_response": risk_debate_state["current_neutral_response"],
-                "count": risk_debate_state["count"],
-            }
-
-            return {
-                "risk_debate_state": new_risk_debate_state,
-                "final_trade_decision": final_trade_decision,
-            }
-
-        return portfolio_manager_node
-
-    pm_factory_with_contract._wrapped_original = original_factory
-    pm_agents_mod.create_portfolio_manager = pm_factory_with_contract
 
     original = structured_mod.invoke_structured_or_freetext
 
@@ -1437,6 +1350,9 @@ Be decisive and ground every conclusion in specific evidence from the analysts.
                      _orig=original):
         if agent_name != "Portfolio Manager" or structured_llm is None:
             return _orig(structured_llm, plain_llm, prompt, render, agent_name)
+        # Execution contract disclosure: appended once per PM call, never
+        # accumulated (the prompt arrives fresh from the framework node).
+        prompt = prompt + _PM_CONTRACT_DISCLOSURE
         try:
             result = structured_llm.invoke(prompt)
         except Exception:  # noqa: BLE001 — original owns the free-text retry
@@ -1457,37 +1373,25 @@ Be decisive and ground every conclusion in specific evidence from the analysts.
     # `execution` but no capture happened through the PM's own import).
     for mod in (pm_agents_mod,
                 _import_module("tradingagents.agents.managers.research_manager"),
-                _import_module("tradingagents.agents.traders.trader"),
+                _import_module("tradingagents.agents.trader.trader"),
                 _import_module("tradingagents.agents.analysts.sentiment_analyst")):
         if getattr(mod, "invoke_structured_or_freetext", None) is original:
             mod.invoke_structured_or_freetext = with_capture
 
 
-def _render_pm_decision(decision):
-    """Render helper for the wrapped PM factory."""
-    from tradingagents.agents.managers.portfolio_manager import render_pm_decision
-    return render_pm_decision(decision)
-
-
 def _reset_pm_execution_schema() -> None:
-    """Restore the original class + invocation + factory for tests / later processes."""
+    """Restore the original class + invocation for tests / later processes."""
     global _PM_SCHEMA_PATCHED, _PM_CARDS_ENABLED, _PM_ORIGINAL_DECISION
     import tradingagents.agents.managers.portfolio_manager as pm_agents_mod
     import tradingagents.agents.schemas as schemas_mod
     import tradingagents.agents.utils.structured as structured_mod
-
-    # Restore factory
-    wrapped_factory = getattr(pm_agents_mod.create_portfolio_manager,
-                               "_wrapped_original", None)
-    if wrapped_factory is not None:
-        pm_agents_mod.create_portfolio_manager = wrapped_factory
 
     current = getattr(structured_mod.invoke_structured_or_freetext,
                       "_wrapped_original", None)
     if current is not None:
         for mod in (structured_mod, pm_agents_mod,
                     _import_module("tradingagents.agents.managers.research_manager"),
-                    _import_module("tradingagents.agents.traders.trader"),
+                    _import_module("tradingagents.agents.trader.trader"),
                     _import_module("tradingagents.agents.analysts.sentiment_analyst")):
             mod.invoke_structured_or_freetext = current
     original = _PM_ORIGINAL_DECISION
@@ -1912,7 +1816,7 @@ def _read_gate_artifact(cfg: dict) -> dict | None:
 
 def _execution_outcomes(payload: dict, orders: list, reports: list,
                         holdings: dict, gate: dict | None,
-                        binding_active: bool) -> dict[str, dict]:
+                        bound_tickers: set[str]) -> dict[str, dict]:
     """Reconcile intent vs reality, per analyzed ticker.
 
     For every ticker in the ratings payload (each has a decision card),
@@ -1952,7 +1856,7 @@ def _execution_outcomes(payload: dict, orders: list, reports: list,
             "date": _today_str(),
             "ticker": ticker,
             "rating": rating,
-            "binding_active": bool(binding_active),
+            "binding_active": ticker in bound_tickers,
             "gate_verdict": (gate or {}).get("verdict"),
             "gate_reasons": (gate or {}).get("reasons") or [],
             "pm_orders": pm_orders,
@@ -1984,23 +1888,27 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
     payload = json.loads(ratings_path.read_text(encoding="utf-8"))
 
     gate_info = _read_gate_artifact(cfg)
-    # PM execution binding is fail-closed: it requires BOTH the config switch
-    # AND the automated morning gate (binding_gate.py, runs post-analyze) —
-    # verdict PASS for today. No gate artifact or any failure = the known-
-    # good legacy path. No human reviews the morning batch, so binding must
-    # never run ungated.
-    binding_active = bool(cfg.get("pm_execution", False))
-    if binding_active:
-        if gate_info is None:
-            logger.warning("no binding gate artifact for today; PM execution "
-                           "binding NOT active (legacy path)")
-            binding_active = False
-        elif gate_info.get("verdict") == GATE_PASS:
-            logger.info("binding gate PASS — PM execution binding active today")
+    # PM execution binding is fail-closed PER TICKER: it requires the config
+    # switch AND the automated morning gate artifact (binding_gate.py, runs
+    # post-analyze). The artifact's per_ticker map decides which tickers
+    # bind ("bind") and which fall back to the legacy tier path ("legacy" or
+    # absent) — one bad block must not discard the day's good ones. No gate
+    # artifact at all = nothing binds (no human reviews the morning batch,
+    # so binding must never run ungated). The day-level verdict stays in the
+    # artifact for observability only.
+    binding_enabled = bool(cfg.get("pm_execution", False))
+    if binding_enabled and gate_info is None:
+        logger.warning("no binding gate artifact for today; PM execution "
+                       "binding NOT active (legacy path)")
+        binding_enabled = False
+    elif binding_enabled:
+        failures = (gate_info or {}).get("reasons") or []
+        if failures:
+            logger.warning("binding gate day verdict %s with %d ticker "
+                           "reason(s); per-ticker statuses govern",
+                           gate_info.get("verdict"), len(failures))
         else:
-            logger.warning("binding gate %s; PM execution binding NOT "
-                           "active (legacy path)", gate_info.get("verdict"))
-            binding_active = False
+            logger.info("binding gate PASS — PM execution binding active today")
 
     broker = create_broker(cfg)
     try:
@@ -2037,13 +1945,14 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         # bind: gate says "bind" + valid block -> binding orders; gate says
         # "legacy" OR invalid/absent block -> legacy compute_orders path.
         per_ticker_gate = (gate_info or {}).get("per_ticker", {})
-        if binding_active and isinstance(
+        bound_tickers: set[str] = set()
+        if binding_enabled and isinstance(
                 payload.get("execution"), dict):
             from decisions import orders_from_execution as orders_from_block
             from pm_execution import EXECUTION_VALID, extract_execution
 
             for ticker in sorted(payload["execution"]):
-                # Check per-ticker gate status first
+                # Per-ticker gate status governs (fail-closed on absence)
                 ticker_gate = per_ticker_gate.get(ticker, {})
                 if ticker_gate.get("status") != "bind":
                     gate_reason = ticker_gate.get("reason", "not in gate")
@@ -2074,13 +1983,14 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                     continue
                 orders = [o for o in orders if o.ticker != ticker]
                 orders.extend(block_orders)
+                bound_tickers.add(ticker)
 
         # PM orders size explicitly and bypass the legacy cash-derived slice
         # math — but the account cash still caps them. A block asking for
         # more than the account can cover clamps to the cash-based share
         # count (the broker would otherwise reject or the paper margin fill
         # an unintended oversize).
-        if binding_active:
+        if bound_tickers:
             from dataclasses import replace as replace_order
             for i, o in enumerate(orders):
                 if (o.reason == "pm-execution" and o.action == "BUY"
@@ -2194,7 +2104,7 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 import decision_cards
                 outcomes = _execution_outcomes(
                     payload, orders, reports, holdings, gate_info,
-                    binding_active)
+                    bound_tickers)
                 for outcome in outcomes.values():
                     decision_cards.append_outcome(cfg["results_dir"], outcome)
             except Exception as exc:  # noqa: BLE001
