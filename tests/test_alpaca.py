@@ -967,3 +967,53 @@ def test_sell_resume_skipped_for_floor_limit(broker):
     assert stop_req.type.value == "stop"
     assert stop_req.qty == 8
     assert reports[0]["filled"] == 0
+
+
+def test_remainder_stop_retries_through_held_for_orders_race(broker):
+    """DXCM 2026-09-09: a just-cancelled sell leaves shares in Alpaca's
+    held_for_orders accounting — the immediate re-anchor stop for the full
+    position is rejected 403 ('available: 7'). The re-anchor must retry
+    (the cancel settles within seconds) instead of leaving the position
+    naked."""
+    b, mock_client, _ = broker
+    stop = MagicMock()
+    stop.id = "stop-1"
+    mock_client.submit_order.side_effect = [
+        Exception('{"code":40310000,"message":"insufficient qty available '
+                  '(requested: 9, available: 7)"}'),
+        stop]
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="DXCM", qty="9")]
+    with patch("alpaca_broker.time.sleep"):
+        ok = b._submit_remainder_stop("DXCM", 9, 81.4)
+    assert ok is True
+    assert mock_client.submit_order.call_count == 2
+    req = mock_client.submit_order.call_args_list[1][0][0]
+    assert req.qty == 9 and req.stop_price == 81.4
+
+
+def test_remainder_stop_gives_up_after_bounded_retries(broker):
+    """Persistent rejection: bounded attempts, then a loud False — the
+    caller logs the naked position instead of hanging or raising."""
+    b, mock_client, _ = broker
+    mock_client.submit_order.side_effect = Exception("403 forever")
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="DXCM", qty="9")]
+    with patch("alpaca_broker.time.sleep"):
+        ok = b._submit_remainder_stop("DXCM", 9, 81.4)
+    assert ok is False
+    assert mock_client.submit_order.call_count == 3  # bounded
+
+
+def test_remainder_stop_stops_retrying_when_position_gone(broker):
+    """If the position empties between retries there is nothing to
+    protect — stop retrying, place nothing (would short the account)."""
+    b, mock_client, _ = broker
+    mock_client.submit_order.side_effect = [Exception("403")]
+    mock_client.get_all_positions.side_effect = [
+        [MagicMock(symbol="DXCM", qty="9")],
+        [MagicMock(symbol="DXCM", qty="0")]]
+    with patch("alpaca_broker.time.sleep"):
+        ok = b._submit_remainder_stop("DXCM", 9, 81.4)
+    assert ok is False
+    assert mock_client.submit_order.call_count == 1

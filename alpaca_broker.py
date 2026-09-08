@@ -237,19 +237,13 @@ class AlpacaBroker:
                 # and the position is intact. The real position query guards
                 # the case where the sell actually landed despite the
                 # exception (flat -> nothing to protect).
-                if o.action == "SELL" and o.stop_price is not None:
-                    remain = self._position_qty(o.ticker)
-                    if remain > 0:
-                        self._client.submit_order(StopOrderRequest(
-                            symbol=o.ticker, qty=remain, side=OrderSide.SELL,
-                            type=OrderType.STOP, stop_price=o.stop_price,
-                            time_in_force=TimeInForce.GTC,
-                            extended_hours=False,
-                        ))
+                if (o.action == "SELL" and o.stop_price is not None
+                        and self._submit_remainder_stop(o.ticker, o.shares,
+                                                        o.stop_price)):
                         logger.error(
                             "submit failed for %s (%s); re-anchored GTC stop "
-                            "%.2f for the intact position (%d shares)",
-                            o.ticker, exc, o.stop_price, remain)
+                            "%.2f for the intact position",
+                            o.ticker, exc, o.stop_price)
                 reports.append({"ticker": o.ticker, "action": o.action,
                                 "shares": o.shares, "filled": 0, "avg_price": 0.0})
                 continue
@@ -400,21 +394,13 @@ class AlpacaBroker:
                     # Leftover-stop cleanup (full exits keep their belt-and-
                     # braces cleanup; never cancels the fresh stop below).
                     self._cancel_open_stops(o.ticker)
-                    if o.stop_price is not None:
-                        remain = self._position_qty(o.ticker)
-                        if remain and remain > 0:
-                            stop_request = StopOrderRequest(
-                                symbol=o.ticker, qty=remain,
-                                side=OrderSide.SELL,
-                                type=OrderType.STOP,
-                                stop_price=o.stop_price,
-                                time_in_force=TimeInForce.GTC,
-                                extended_hours=False,
-                            )
-                            self._client.submit_order(stop_request)
+                    if (o.stop_price is not None
+                            and self._submit_remainder_stop(o.ticker,
+                                                            o.shares,
+                                                            o.stop_price)):
                             logger.info(
-                                "re-anchored GTC stop %s for %s remainder "
-                                "(%d shares)", o.stop_price, o.ticker, remain)
+                                "re-anchored GTC stop %s for %s remainder",
+                                o.stop_price, o.ticker)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
             reports.append({"ticker": o.ticker, "action": o.action,
@@ -494,6 +480,36 @@ class AlpacaBroker:
             logger.warning("could not fetch position qty for %s: %s",
                            symbol, exc)
         return 0
+
+    def _submit_remainder_stop(self, symbol: str, qty: int,
+                               stop_price: float) -> bool:
+        """Submit the remainder GTC stop with bounded retries.
+
+        A just-cancelled sell can leave shares in Alpaca's held_for_orders
+        accounting for a few seconds (DXCM 2026-09-09: the re-anchor stop
+        for 9 shares was rejected 403 "available: 7" while the cancelled
+        sell's 2 shares were still reserved) — and the position can change
+        between tries. Re-query the position per attempt and size to it;
+        up to 3 attempts, 2s apart. Returns True when a stop is resting.
+        """
+        for attempt in range(3):
+            remain = self._position_qty(symbol)
+            if remain < 1:
+                return False  # nothing left to protect
+            try:
+                self._client.submit_order(StopOrderRequest(
+                    symbol=symbol, qty=remain, side=OrderSide.SELL,
+                    type=OrderType.STOP, stop_price=stop_price,
+                    time_in_force=TimeInForce.GTC, extended_hours=False,
+                ))
+                return True
+            except Exception as exc:  # noqa: BLE001 — retry below
+                logger.warning("remainder stop for %s attempt %d failed: %s",
+                               symbol, attempt + 1, exc)
+                time.sleep(2)
+        logger.error("remainder stop for %s NOT placed after retries — "
+                     "position unprotected", symbol)
+        return False
 
     def cancel_stops_for(self, tickers: list[str]) -> dict[str, list[dict]]:
         """Cancel resting GTC stops for symbols being sold (exit guard).
