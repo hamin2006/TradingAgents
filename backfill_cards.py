@@ -254,6 +254,8 @@ def build_outcomes(tickers: list[str], logs_root: Path, cards_root: Path,
             date_str = (as_of_d - dt.timedelta(days=offset)).isoformat()
             if date_str not in card_dates or date_str in done_dates:
                 continue
+            if not (logs_root / f"executed_{date_str}.json").exists():
+                continue  # engine never ran that day: nothing to reconcile
             payload = load_ratings_payload(logs_root, date_str)
             if not payload.get("ratings", {}).get(ticker):
                 continue

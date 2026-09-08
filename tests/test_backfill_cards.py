@@ -308,6 +308,12 @@ class TestOutcomesBackfill:
                            "executive_summary": "trim", "investment_thesis": "t",
                            "execution": None})
         self._v2_ratings(logs, "2026-09-08", {"HPE": "Underweight"}, {})
+        self._executed_file(
+            logs, "2026-09-08",
+            [{"ticker": "HPE", "action": "SELL", "shares": 13,
+              "reason": "rating exit", "stop_price": None}],
+            [{"ticker": "HPE", "action": "SELL", "shares": 13, "filled": 1,
+              "avg_price": 52.75}])
         out = build_outcomes(["HPE"], logs, logs, days_back=1,
                              as_of="2026-09-08",
                              notes={"HPE": "stop re-armed @ 50.08 manually"})
@@ -322,6 +328,12 @@ class TestOutcomesBackfill:
                            "executive_summary": "trim", "investment_thesis": "t",
                            "execution": None})
         self._v2_ratings(logs, "2026-09-08", {"HPE": "Underweight"}, {})
+        self._executed_file(
+            logs, "2026-09-08",
+            [{"ticker": "HPE", "action": "SELL", "shares": 13,
+              "reason": "rating exit", "stop_price": None}],
+            [{"ticker": "HPE", "action": "SELL", "shares": 13, "filled": 1,
+              "avg_price": 52.75}])
         first = backfill_outcomes(["HPE"], logs, logs, days_back=1,
                                   as_of="2026-09-08", dry_run=False)
         second = backfill_outcomes(["HPE"], logs, logs, days_back=1,
@@ -349,3 +361,17 @@ class TestOutcomesBackfill:
         out = build_outcomes(["DELL"], logs, logs, days_back=1,
                              as_of="2026-09-08")
         assert out[0]["stop_anchored"] == 482.21
+
+    def test_outcomes_require_executed_log(self, logs):
+        """A day with no executed_{date}.json gets NO outcome: the engine
+        may not have run at all, and 'no orders' would be fabricated."""
+        from backfill_cards import build_outcomes
+        from decision_cards import append_card
+        append_card(logs, {"date": "2026-09-08", "ticker": "HPE",
+                           "rating": "Underweight", "ref_close": None,
+                           "schema_version": 1,
+                           "executive_summary": "trim", "investment_thesis": "t",
+                           "execution": None})
+        self._v2_ratings(logs, "2026-09-08", {"HPE": "Underweight"}, {})
+        assert build_outcomes(["HPE"], logs, logs, days_back=1,
+                              as_of="2026-09-08") == []
