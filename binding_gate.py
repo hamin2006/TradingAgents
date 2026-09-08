@@ -55,6 +55,7 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
     counts = {"valid": 0, "invalid": 0, "absent": 0, "empty_on_buy": 0,
               "engine_fallback": 0}
     preview: list[dict] = []
+    per_ticker: dict[str, dict] = {}  # NEW: per-ticker gate status
 
     payload = _load_ratings(results_dir, date_str)
     if payload is None:
@@ -71,6 +72,7 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
             if status != EXECUTION_VALID:
                 counts["invalid"] += 1
                 reasons.append(f"{ticker}: invalid execution block ({reason})")
+                per_ticker[ticker] = {"status": "legacy", "reason": reason}
                 continue
             counts["valid"] += 1
             orders, clamps = orders_from_execution(
@@ -85,8 +87,9 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
                                                   50.0)))
             if orders is None:
                 counts["engine_fallback"] += 1
-                reasons.append(f"{ticker}: block not honorable by the engine "
-                               "(legacy fallback)")
+                fallback_reason = "block not honorable by the engine"
+                reasons.append(f"{ticker}: {fallback_reason}")
+                per_ticker[ticker] = {"status": "legacy", "reason": fallback_reason}
                 continue
             preview.append({
                 "ticker": ticker,
@@ -102,10 +105,15 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
                 # HELD buy-rated name is a legitimate maintain (E2E 09-05:
                 # HPE OW with 13 shares, "no additions at $52.00").
                 counts["empty_on_buy"] += 1
-                reasons.append(f"{ticker}: empty execution orders on a "
-                               f"{rating} rating with no position held")
+                empty_reason = "empty execution orders on a " \
+                    f"{rating} rating with no position held"
+                reasons.append(f"{ticker}: {empty_reason}")
+                per_ticker[ticker] = {"status": "legacy", "reason": empty_reason}
             elif not orders and ticker in holdings:
                 counts["valid"] += 0  # explicit no-order on held = deliberate
+                per_ticker[ticker] = {"status": "bind", "reason": None}
+            else:
+                per_ticker[ticker] = {"status": "bind", "reason": None}
 
     verdict = GATE_PASS if not reasons else GATE_FAIL
     result = {
@@ -114,6 +122,7 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
         "reasons": reasons,
         "counts": counts,
         "preview": preview,
+        "per_ticker": per_ticker,  # NEW: per-ticker binding verdicts
     }
     if write:
         path = gate_path(results_dir, date_str)

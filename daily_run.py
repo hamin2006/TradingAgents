@@ -854,6 +854,99 @@ def _ensure_tape_and_events() -> None:
         return base
 
     resolve_with_extras._wrapped_original = original
+
+
+
+# --- Stop sweep (no-naked invariant) -----------------------------------------
+#
+# Any held ticker without a resting GTC stop gets one at last_close *
+# (1 - stop_loss_pct/100). Covers fill-unknown races (cancel-vs-fill left
+# a filled buy unstopped), manual trades, and any future hole. Must be
+# failure-safe (broker down → skip with a warning, never block analyze)
+# and idempotent (already-stopped tickers are left alone).
+
+def _ensure_stop_sweep(cfg: dict) -> None:
+    """Sweep holdings and attach missing GTC stops before the analyze batch.
+
+    Failure-safe: broker errors skip the sweep with a warning; never block
+    the analyze run. Idempotent: tickers with existing stops are left alone.
+    """
+    try:
+        stop_loss_pct = float(cfg.get("stop_loss_pct", 8.0))
+        broker = create_broker(cfg)
+        try:
+            broker.connect()
+            holdings, _ = broker.get_positions_and_cash()
+            if not holdings:
+                return  # nothing to sweep
+
+            # Query resting GTC stops
+            from alpaca.trading.enums import QueryOrderStatus
+            from alpaca.trading.requests import GetOrdersRequest
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                limit=100,  # should cover all open stops
+            )
+            open_orders = broker._client.get_orders(filter=req)
+            stopped_tickers = {
+                o.symbol for o in open_orders
+                if o.type.value == "stop" and o.time_in_force.value == "gtc"
+            }
+
+            # For each held ticker without a stop, attach one
+            for ticker, shares in holdings.items():
+                if ticker in stopped_tickers:
+                    continue
+                # Get last close to calculate stop price
+                last_close_px = _last_close(ticker)
+                if last_close_px is None or last_close_px <= 0:
+                    logger.warning(
+                        "stop sweep: no last close for %s; skipping", ticker)
+                    continue
+                stop_px = round(last_close_px * (1 - stop_loss_pct / 100), 2)
+
+                # Submit GTC stop
+                from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+                from alpaca.trading.requests import StopOrderRequest
+                stop_req = StopOrderRequest(
+                    symbol=ticker,
+                    qty=shares,
+                    side=OrderSide.SELL,
+                    type=OrderType.STOP,
+                    stop_price=stop_px,
+                    time_in_force=TimeInForce.GTC,
+                    extended_hours=False,
+                )
+                broker._client.submit_order(stop_req)
+                logger.info(
+                    "stop sweep: attached GTC stop %.2f for %s (%d shares)",
+                    stop_px, ticker, shares)
+        finally:
+            broker.disconnect()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stop sweep failed: %s (continuing analyze)", exc)
+
+
+def _ensure_tape_and_events() -> None:
+    """Append market-tape and corporate-events blocks to the instrument
+    context every agent receives (idempotent, revertible)."""
+    global _TAFE_PATCHED, _TAFE_ORIGINAL
+    if _TAFE_PATCHED:
+        return
+    import tradingagents.graph.trading_graph as tg_mod
+
+    _TAFE_ORIGINAL = tg_mod.TradingAgentsGraph.resolve_instrument_context
+    original = _TAFE_ORIGINAL
+
+    def resolve_with_extras(self, ticker: str, asset_type: str = "stock") -> str:
+        base = original(self, ticker, asset_type)
+        if asset_type == "stock":
+            extras = _instrument_extras(ticker)
+            if extras:
+                return f"{base}\n\n{extras}".strip()
+        return base
+
+    resolve_with_extras._wrapped_original = original
     tg_mod.TradingAgentsGraph.resolve_instrument_context = resolve_with_extras
     _TAFE_PATCHED = True
 
@@ -1208,8 +1301,10 @@ def _clear_pm_capture() -> None:
 def _ensure_pm_execution_schema(cfg: dict) -> None:
     """Repoint the framework's PortfolioDecision to our execution-bearing
     subclass (both import sites) and wrap the structured invocation so the
-    parsed PM decision is captured. Only when ``execution_intent`` is on;
-    off = today's behavior byte-identical. Idempotent; ``_reset_*`` restores.
+    parsed PM decision is captured. Also append the execution contract
+    disclosure to the PM prompt template. Only when ``execution_intent``
+    is on; off = today's behavior byte-identical. Idempotent; ``_reset_*``
+    restores.
     """
     global _PM_SCHEMA_PATCHED, _PM_CARDS_ENABLED, _PM_ORIGINAL_DECISION
     _PM_CARDS_ENABLED = bool(cfg.get("execution_intent", False))
@@ -1230,6 +1325,111 @@ def _ensure_pm_execution_schema(cfg: dict) -> None:
     # portfolio manager factory captured at module import time.
     schemas_mod.PortfolioDecision = ExecutionPortfolioDecision
     pm_agents_mod.PortfolioDecision = ExecutionPortfolioDecision
+
+    # Wrap the PM node factory to inject the execution contract into its prompt
+    original_factory = pm_agents_mod.create_portfolio_manager
+    def create_portfolio_manager_with_contract(llm):
+        node = original_factory(llm)
+        # Wrap the node to inject contract disclosure
+        def node_with_contract(state):
+            # Call original node but intercept the structured call to prepend contract
+            return node(state)
+        # Patch the PM prompt inside the factory's closure by wrapping the node
+        # Actually, we need to patch it differently - let's wrap at the prompt level
+        return node
+
+    # Better approach: patch the create function to inject contract into prompt template
+    def pm_factory_with_contract(llm):
+        from tradingagents.agents.utils.instrument_context import get_instrument_context_from_state
+        from tradingagents.constants import NO_EXTERNAL_TOOLS
+        from tradingagents.localization import get_language_instruction
+
+        from tradingagents.agents.utils.structured import bind_structured
+
+        structured_llm = bind_structured(llm, ExecutionPortfolioDecision, "Portfolio Manager")
+
+        # Execution contract disclosure text
+        CONTRACT_DISCLOSURE = """
+---
+**Execution Contract** (binding when execution blocks are enabled):
+- You hold positions per the "Portfolio context (ground truth)" block above.
+- Every ticker you rate MUST carry an `execution` block with an `orders` list.
+- `orders: []` on a ticker you HOLD is valid (deliberate maintain).
+- `orders: []` on a ticker you DON'T hold but rate Buy/Overweight is an ENGINE FAILURE: either size an entry (shares OR value_usd) or reconsider the rating. The gate halts binding for the day on such blocks.
+- Full exit: `shares` equal to held quantity. Partial trim: fewer shares (or `fraction_held`); set `stop_px` for the remainder.
+- `limit_px` on SELL is a floor (day-expiry if never reached); buys get +2% protection ceiling automatically.
+- Orders are day-expiry, fill at/after 09:30 ET; `stop_px` becomes a broker-side GTC stop for remainder/fill protection.
+"""
+
+        def portfolio_manager_node(state) -> dict:
+            instrument_context = get_instrument_context_from_state(state)
+            history = state["risk_debate_state"]["history"]
+            risk_debate_state = state["risk_debate_state"]
+            research_plan = state["investment_plan"]
+            trader_plan = state["trader_investment_plan"]
+            past_context = state.get("past_context", "")
+            lessons_line = (
+                f"- Lessons from prior decisions and outcomes:\n{past_context}\n"
+                if past_context
+                else ""
+            )
+
+            prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
+
+{instrument_context}
+
+---
+
+**Rating Scale** (use exactly one):
+- **Buy**: Strong conviction to enter or add to position
+- **Overweight**: Favorable outlook, gradually increase exposure
+- **Hold**: Maintain current position, no action needed
+- **Underweight**: Reduce exposure, take partial profits
+- **Sell**: Exit position or avoid entry
+
+**Context:**
+- Research Manager's investment plan: **{research_plan}**
+- Trader's transaction proposal: **{trader_plan}**
+{lessons_line}
+**Risk Analysts Debate History:**
+{history}
+
+---
+
+Be decisive and ground every conclusion in specific evidence from the analysts.
+{CONTRACT_DISCLOSURE}
+{NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
+
+            final_trade_decision = structured_mod.invoke_structured_or_freetext(
+                structured_llm,
+                llm,
+                prompt,
+                _render_pm_decision,
+                "Portfolio Manager",
+            )
+
+            new_risk_debate_state = {
+                "judge_decision": final_trade_decision,
+                "history": risk_debate_state["history"],
+                "aggressive_history": risk_debate_state["aggressive_history"],
+                "conservative_history": risk_debate_state["conservative_history"],
+                "neutral_history": risk_debate_state["neutral_history"],
+                "latest_speaker": "Judge",
+                "current_aggressive_response": risk_debate_state["current_aggressive_response"],
+                "current_conservative_response": risk_debate_state["current_conservative_response"],
+                "current_neutral_response": risk_debate_state["current_neutral_response"],
+                "count": risk_debate_state["count"],
+            }
+
+            return {
+                "risk_debate_state": new_risk_debate_state,
+                "final_trade_decision": final_trade_decision,
+            }
+
+        return portfolio_manager_node
+
+    pm_factory_with_contract._wrapped_original = original_factory
+    pm_agents_mod.create_portfolio_manager = pm_factory_with_contract
 
     original = structured_mod.invoke_structured_or_freetext
 
@@ -1257,25 +1457,37 @@ def _ensure_pm_execution_schema(cfg: dict) -> None:
     # `execution` but no capture happened through the PM's own import).
     for mod in (pm_agents_mod,
                 _import_module("tradingagents.agents.managers.research_manager"),
-                _import_module("tradingagents.agents.trader.trader"),
+                _import_module("tradingagents.agents.traders.trader"),
                 _import_module("tradingagents.agents.analysts.sentiment_analyst")):
         if getattr(mod, "invoke_structured_or_freetext", None) is original:
             mod.invoke_structured_or_freetext = with_capture
 
 
+def _render_pm_decision(decision):
+    """Render helper for the wrapped PM factory."""
+    from tradingagents.agents.managers.portfolio_manager import render_pm_decision
+    return render_pm_decision(decision)
+
+
 def _reset_pm_execution_schema() -> None:
-    """Restore the original class + invocation for tests / later processes."""
+    """Restore the original class + invocation + factory for tests / later processes."""
     global _PM_SCHEMA_PATCHED, _PM_CARDS_ENABLED, _PM_ORIGINAL_DECISION
     import tradingagents.agents.managers.portfolio_manager as pm_agents_mod
     import tradingagents.agents.schemas as schemas_mod
     import tradingagents.agents.utils.structured as structured_mod
+
+    # Restore factory
+    wrapped_factory = getattr(pm_agents_mod.create_portfolio_manager,
+                               "_wrapped_original", None)
+    if wrapped_factory is not None:
+        pm_agents_mod.create_portfolio_manager = wrapped_factory
 
     current = getattr(structured_mod.invoke_structured_or_freetext,
                       "_wrapped_original", None)
     if current is not None:
         for mod in (structured_mod, pm_agents_mod,
                     _import_module("tradingagents.agents.managers.research_manager"),
-                    _import_module("tradingagents.agents.trader.trader"),
+                    _import_module("tradingagents.agents.traders.trader"),
                     _import_module("tradingagents.agents.analysts.sentiment_analyst")):
             mod.invoke_structured_or_freetext = current
     original = _PM_ORIGINAL_DECISION
@@ -1564,6 +1776,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_portfolio_context(cfg)
     _ensure_edgar_fundamentals(cfg)
     _ensure_tape_and_events()
+    _ensure_stop_sweep(cfg)  # No-naked invariant: before analyze batch starts
     if cfg.get("execution_intent", False):
         _EXECUTION_MAP.clear()
         _ensure_pm_execution_schema(cfg)
@@ -1820,16 +2033,23 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
 
         # PM execution binding (phase 2): per-ticker execution blocks from
         # the ratings file (schema_version 2) replace the legacy tier orders
-        # for their tickers. present-valid + orders -> binding orders;
-        # explicit empty -> NO order today (overrides legacy, including a
-        # rating exit); invalid / absent / block the engine cannot honor ->
-        # the legacy compute_orders path for that ticker only.
+        # for their tickers. Per-ticker gate status determines which tickers
+        # bind: gate says "bind" + valid block -> binding orders; gate says
+        # "legacy" OR invalid/absent block -> legacy compute_orders path.
+        per_ticker_gate = (gate_info or {}).get("per_ticker", {})
         if binding_active and isinstance(
                 payload.get("execution"), dict):
             from decisions import orders_from_execution as orders_from_block
             from pm_execution import EXECUTION_VALID, extract_execution
 
             for ticker in sorted(payload["execution"]):
+                # Check per-ticker gate status first
+                ticker_gate = per_ticker_gate.get(ticker, {})
+                if ticker_gate.get("status") != "bind":
+                    gate_reason = ticker_gate.get("reason", "not in gate")
+                    logger.info("%s: gate says legacy (%s)", ticker, gate_reason)
+                    continue
+
                 status, intent, reason = extract_execution(
                     {"execution": payload["execution"][ticker]})
                 if status != EXECUTION_VALID:

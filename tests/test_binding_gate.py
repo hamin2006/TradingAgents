@@ -128,3 +128,71 @@ class TestPath:
         result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
                           holdings={"HPE": 13}, last_close={"HPE": 52.0})
         assert result["verdict"] == GATE_PASS
+
+
+class TestPerTickerGate:
+    """Per-ticker gate status tests (Task A: fail-closed gate)."""
+
+    def test_per_ticker_status_present_in_result(self, gate_cfg):
+        _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": _buy_block()})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={}, last_close={"HPE": 54.25})
+        assert "per_ticker" in result
+        assert isinstance(result["per_ticker"], dict)
+
+    def test_valid_block_gets_bind_status(self, gate_cfg):
+        _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": _buy_block()})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={}, last_close={"HPE": 54.25})
+        assert result["per_ticker"]["HPE"]["status"] == "bind"
+        assert result["per_ticker"]["HPE"]["reason"] is None
+
+    def test_invalid_block_gets_legacy_status(self, gate_cfg):
+        _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": {
+            "orders": [{"kind": "BUY", "shares": 5, "value_usd": 100.0}]}})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={}, last_close={"HPE": 54.25})
+        assert result["per_ticker"]["HPE"]["status"] == "legacy"
+        # The error message contains both field names
+        assert "value_usd" in result["per_ticker"]["HPE"]["reason"]
+        assert "shares" in result["per_ticker"]["HPE"]["reason"]
+
+    def test_empty_on_unheld_buy_gets_legacy_status(self, gate_cfg):
+        _ratings_file(gate_cfg, {"HPE": "Buy"}, {"HPE": {"orders": []}})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={}, last_close={"HPE": 54.25})
+        assert result["per_ticker"]["HPE"]["status"] == "legacy"
+        assert "empty execution orders" in result["per_ticker"]["HPE"]["reason"]
+
+    def test_engine_fallback_gets_legacy_status(self, gate_cfg):
+        _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": _buy_block()})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={}, last_close={})  # no close -> fallback
+        assert result["per_ticker"]["HPE"]["status"] == "legacy"
+        assert "not honorable" in result["per_ticker"]["HPE"]["reason"]
+
+    def test_mixed_tickers_bind_and_legacy(self, gate_cfg):
+        """One bad ticker doesn't poison the day - good tickers bind."""
+        _ratings_file(gate_cfg,
+                      {"HPE": "Overweight", "DELL": "Buy", "EL": "Underweight"},
+                      {"HPE": _buy_block(), "DELL": {"orders": []},
+                       "EL": _sell_block()})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={"EL": 8},
+                          last_close={"HPE": 54.25, "DELL": 120.0, "EL": 101.15})
+        # HPE and EL are good -> bind
+        assert result["per_ticker"]["HPE"]["status"] == "bind"
+        assert result["per_ticker"]["EL"]["status"] == "bind"
+        # DELL has empty orders on unheld Buy -> legacy
+        assert result["per_ticker"]["DELL"]["status"] == "legacy"
+        # Day verdict is still FAIL (has reasons), but per_ticker allows selective binding
+        assert result["verdict"] == GATE_FAIL
+        assert any("DELL" in r for r in result["reasons"])
+
+    def test_empty_on_held_gets_bind_status(self, gate_cfg):
+        """Empty orders on a held ticker = deliberate maintain -> bind."""
+        _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": {"orders": []}})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={"HPE": 13}, last_close={"HPE": 52.0})
+        assert result["per_ticker"]["HPE"]["status"] == "bind"
+        assert result["per_ticker"]["HPE"]["reason"] is None

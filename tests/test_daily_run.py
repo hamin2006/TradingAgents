@@ -1838,3 +1838,186 @@ def test_run_execute_dry_run_writes_no_outcomes(cfg):
         mock_today.return_value = __import__("datetime").date(2026, 8, 31)
         run_execute(cfg, dry_run=True)
     mock_append.assert_not_called()
+
+
+
+def test_run_execute_per_ticker_gate_binds_selectively():
+    """Per-ticker gate allows good blocks to bind while bad blocks fall
+    back to legacy, without poisoning the whole day."""
+    import json
+    from pathlib import Path
+
+    from daily_run import load_watchlist_config, run_execute
+
+    cfg = load_watchlist_config()
+    cfg["pm_execution"] = True
+    results_dir = Path(cfg["results_dir"])
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create ratings with mixed good/bad blocks
+    ratings = {"HPE": "Overweight", "DELL": "Buy", "EL": "Underweight"}
+    execution = {
+        "HPE": {"orders": [{"kind": "BUY", "value_usd": 200.0}]},  # good
+        "DELL": {"orders": []},  # empty on unheld Buy -> legacy
+        "EL": {"orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5}]}  # good
+    }
+    _ratings_file(cfg, ratings, execution)
+
+    # Create gate artifact with per_ticker status
+    gate = {
+        "date": "2026-09-05",
+        "verdict": "FAIL",  # day verdict fails (has DELL reason)
+        "reasons": ["DELL: empty execution orders on a Buy rating with no position held"],
+        "counts": {"valid": 2, "invalid": 0, "empty_on_buy": 1, "engine_fallback": 0},
+        "preview": [],
+        "per_ticker": {
+            "HPE": {"status": "bind", "reason": None},
+            "DELL": {"status": "legacy", "reason": "empty execution orders on a Buy rating with no position held"},
+            "EL": {"status": "bind", "reason": None}
+        }
+    }
+    gate_path = results_dir / "binding_gate_2026-09-05.json"
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+
+    broker = _exec_broker()
+    broker.get_positions_and_cash.return_value = ({"EL": 8}, 10000.0)
+    broker.place_market_orders.return_value = [
+        {"ticker": "HPE", "action": "BUY", "shares": 3, "filled": 3, "avg_price": 54.25},
+        {"ticker": "DELL", "action": "BUY", "shares": 1, "filled": 1, "avg_price": 120.0},
+        {"ticker": "EL", "action": "SELL", "shares": 2, "filled": 2, "avg_price": 101.15}
+    ]
+
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", side_effect=lambda t: {"HPE": 54.25, "DELL": 120.0, "EL": 101.15}.get(t)), \
+         patch("daily_run._seconds_until_open", return_value=0.0):
+        rc = run_execute(cfg)
+
+    assert rc == 0
+    # HPE and EL should have PM orders executed (bind status)
+    # DELL should have legacy tier orders executed (legacy status)
+    orders_placed = broker.place_market_orders.call_args[0][0]
+    # HPE bound, EL bound, DELL legacy fallback
+    assert any(o.ticker == "HPE" and o.reason == "pm-execution" for o in orders_placed)
+    assert any(o.ticker == "EL" and o.reason == "pm-execution" for o in orders_placed)
+    # DELL goes legacy (tier-based reason, not pm-execution)
+    dell_orders = [o for o in orders_placed if o.ticker == "DELL"]
+    assert all(o.reason != "pm-execution" for o in dell_orders)
+
+
+
+def test_stop_sweep_attaches_missing_stops():
+    """Stop sweep queries broker for holdings+stops and attaches GTC stops
+    for held tickers that lack them."""
+    from unittest.mock import MagicMock
+
+    from daily_run import _ensure_stop_sweep
+
+    cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
+
+    broker = MagicMock()
+    broker._client = MagicMock()
+    # Holdings: AAPL and TSLA
+    broker.get_positions_and_cash.return_value = ({"AAPL": 10, "TSLA": 5}, 10000.0)
+    # Open orders: only AAPL has a stop
+    stop_order = MagicMock()
+    stop_order.symbol = "AAPL"
+    stop_order.type.value = "stop"
+    stop_order.time_in_force.value = "gtc"
+    broker._client.get_orders.return_value = [stop_order]
+
+    with patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", side_effect=lambda t: {"AAPL": 150.0, "TSLA": 200.0}.get(t)):
+        _ensure_stop_sweep(cfg)
+
+    # Should only attach stop for TSLA (AAPL already has one)
+    assert broker._client.submit_order.call_count == 1
+    submitted_req = broker._client.submit_order.call_args[0][0]
+    assert submitted_req.symbol == "TSLA"
+    assert submitted_req.qty == 5
+    assert submitted_req.type.value == "stop"
+    # stop_px = 200.0 * (1 - 8/100) = 200.0 * 0.92 = 184.0
+    assert submitted_req.stop_price == 184.0
+    assert submitted_req.time_in_force.value == "gtc"
+
+
+def test_stop_sweep_skips_when_no_last_close():
+    """Stop sweep skips a ticker when no last close is available."""
+    from unittest.mock import MagicMock
+
+    from daily_run import _ensure_stop_sweep
+
+    cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
+
+    broker = MagicMock()
+    broker._client = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 10}, 10000.0)
+    broker._client.get_orders.return_value = []
+
+    with patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=None):
+        _ensure_stop_sweep(cfg)
+
+    # Should not submit any order (no last close)
+    broker._client.submit_order.assert_not_called()
+
+
+def test_stop_sweep_failure_safe():
+    """Stop sweep must not block analyze even if broker fails."""
+    from unittest.mock import MagicMock
+
+    from daily_run import _ensure_stop_sweep
+
+    cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
+
+    broker = MagicMock()
+    broker.connect.side_effect = Exception("broker down")
+
+    with patch("daily_run.create_broker", return_value=broker):
+        # Should not raise; logs warning and continues
+        _ensure_stop_sweep(cfg)
+
+
+def test_stop_sweep_idempotent():
+    """Stop sweep is idempotent: already-stopped tickers are left alone."""
+    from unittest.mock import MagicMock
+
+    from daily_run import _ensure_stop_sweep
+
+    cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
+
+    broker = MagicMock()
+    broker._client = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 10}, 10000.0)
+    # AAPL already has a GTC stop
+    stop_order = MagicMock()
+    stop_order.symbol = "AAPL"
+    stop_order.type.value = "stop"
+    stop_order.time_in_force.value = "gtc"
+    broker._client.get_orders.return_value = [stop_order]
+
+    with patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=150.0):
+        _ensure_stop_sweep(cfg)
+
+    # Should not submit any order (already stopped)
+    broker._client.submit_order.assert_not_called()
+
+
+def test_stop_sweep_skips_when_no_holdings():
+    """Stop sweep does nothing when there are no holdings."""
+    from unittest.mock import MagicMock
+
+    from daily_run import _ensure_stop_sweep
+
+    cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 10000.0)
+
+    with patch("daily_run.create_broker", return_value=broker):
+        _ensure_stop_sweep(cfg)
+
+    # Should not query orders or submit anything
+    broker._client.get_orders.assert_not_called()
+    broker._client.submit_order.assert_not_called()
