@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from daily_run import main, run_analyze, run_execute
+from decisions import Order
 
 
 @pytest.fixture
@@ -1677,3 +1678,60 @@ class TestBindingGateHonoring:
         assert _run_exec(cfg, broker) == 0
         orders = broker.place_market_orders.call_args[0][0]
         assert (orders[0].action, orders[0].shares) == ("SELL", 2)  # binds
+
+
+def test_anchor_sell_remainders_covers_full_exit_at_original_stop():
+    """A legacy FULL-EXIT sell (shares == holdings) must get its remainder
+    anchored too — the broker re-anchors on a partial fill or a final-round
+    death, but only when stop_price is set. HPE 2026-09-08: 1/13 filled,
+    remainder shed, stop disarmed -> 12 shares naked overnight."""
+    from daily_run import _anchor_sell_remainders
+
+    orders = [Order(ticker="HPE", action="SELL", shares=13, reason="rating exit")]
+    _anchor_sell_remainders(
+        orders, {"HPE": 13}, {"HPE": [{"stop_price": 50.08, "qty": 13}]},
+        {"HPE": 54.25}, 8.0)
+    assert orders[0].stop_price == 50.08
+
+
+def test_anchor_sell_remainders_falls_back_to_stop_loss_pct():
+    """No cancelled original stop on record -> the standard -8% stop."""
+    from daily_run import _anchor_sell_remainders
+
+    orders = [Order(ticker="DASH", action="SELL", shares=3, reason="rating exit")]
+    _anchor_sell_remainders(orders, {"DASH": 3}, {}, {"DASH": 222.0}, 8.0)
+    assert orders[0].stop_price == pytest.approx(204.24)
+
+
+def test_anchor_sell_remainders_leaves_explicit_pm_stop():
+    """A PM execution block carries its own stop — never overwritten."""
+    from daily_run import _anchor_sell_remainders
+
+    orders = [Order(ticker="EL", action="SELL", shares=2, reason="pm-execution",
+                    stop_price=95.6)]
+    _anchor_sell_remainders(
+        orders, {"EL": 8}, {"EL": [{"stop_price": 90.0, "qty": 8}]},
+        {"EL": 100.0}, 8.0)
+    assert orders[0].stop_price == 95.6
+
+
+def test_anchor_sell_remainders_keeps_partial_intent_anchor():
+    """The original partial-intent behavior (shares < holdings) is the same
+    rule seen from the other side — regression lock."""
+    from daily_run import _anchor_sell_remainders
+
+    orders = [Order(ticker="EL", action="SELL", shares=2, reason="pm-execution")]
+    _anchor_sell_remainders(orders, {"EL": 8}, {}, {"EL": 100.0}, 8.0)
+    assert orders[0].stop_price == pytest.approx(92.0)
+
+
+def test_anchor_sell_remainders_without_levels_leaves_order_untouched(caplog):
+    """No original stop and no last close -> nothing to anchor with; the
+    order passes through (logged loudly) rather than guessing a level."""
+    from daily_run import _anchor_sell_remainders
+
+    orders = [Order(ticker="XYZ", action="SELL", shares=5, reason="rating exit")]
+    with caplog.at_level("WARNING", logger="daily_run"):
+        _anchor_sell_remainders(orders, {"XYZ": 5}, {}, {}, 8.0)
+    assert orders[0].stop_price is None
+    assert "XYZ" in caplog.text

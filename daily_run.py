@@ -1641,6 +1641,44 @@ def _seconds_until_open(now: datetime | None = None) -> float:
     return 0.0
 
 
+def _anchor_sell_remainders(orders: list, holdings: dict, cancelled: dict,
+                            last_close: dict, stop_loss_pct: float) -> None:
+    """Anchor every sell's remainder stop so a held position can never sit
+    naked between runs.
+
+    Any sell on a held ticker whose stop was disarmed pre-open must carry a
+    re-anchor level: the broker attaches a GTC stop for the still-held
+    shares when the sell partially fills (remainder shed) or dies unfilled
+    on its final round. Legacy full exits (shares == holdings) need this
+    exactly as much as PM partial sells — HPE 2026-09-08: 1/13 filled,
+    remainder shed, no anchor -> 12 shares naked. Level: the ORIGINAL
+    cancelled stop, else the standard -stop_loss_pct% stop. PM blocks with
+    explicit stops pass through untouched; with neither level source the
+    order passes through (logged loudly) rather than guessing.
+    """
+    from dataclasses import replace as replace_order
+    for i, o in enumerate(orders):
+        if (o.action != "SELL" or o.stop_price is not None
+                or holdings.get(o.ticker, 0) <= 0):
+            continue
+        stops = cancelled.get(o.ticker) or []
+        if stops and stops[0].get("stop_price"):
+            logger.info("%s: sell remainder anchored at original stop %.2f",
+                        o.ticker, stops[0]["stop_price"])
+            orders[i] = replace_order(o, stop_price=stops[0]["stop_price"])
+        elif last_close.get(o.ticker):
+            default = round(last_close[o.ticker] * (1 - stop_loss_pct / 100), 2)
+            logger.warning("%s: sell has no original stop on record; "
+                           "anchoring remainder at the standard stop %.2f",
+                           o.ticker, default)
+            orders[i] = replace_order(o, stop_price=default)
+        else:
+            logger.error("%s: sell remainder has no anchor source (no "
+                         "cancelled stop, no last close) — the position "
+                         "will be unprotected if the sell does not fully "
+                         "fill", o.ticker)
+
+
 def run_execute(cfg: dict, dry_run: bool = False) -> int:
     if DISABLE_TRADING_FILE.exists() or not cfg.get("trading_enabled", True):
         logger.warning("trading disabled (kill switch); no orders placed")
@@ -1831,33 +1869,14 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 logger.warning("stop disarm failed for %s: %s", sells, exc)
             if not isinstance(cancelled, dict):
                 cancelled = {}
-        # Partial-sell remainder re-anchor fallback: a partial SELL without a
-        # PM stop re-anchors the remainder at the ORIGINAL cancelled stop
-        # level (spec: PM stop_px if given, else the cancelled original stop).
-        # Last line: no original stop found -> the standard -8% stop, so a
-        # remainder is never left naked between runs.
-        from dataclasses import replace as replace_order
-        for i, o in enumerate(orders):
-            if (o.action == "SELL" and o.stop_price is None
-                    and o.shares < holdings.get(o.ticker, 0)):
-                stops = cancelled.get(o.ticker) or []
-                if stops and stops[0].get("stop_price"):
-                    logger.info(
-                        "%s: partial sell of %d/%d re-anchors remainder "
-                        "at original stop %.2f", o.ticker, o.shares,
-                        holdings.get(o.ticker, 0), stops[0]["stop_price"])
-                    orders[i] = replace_order(o, stop_price=stops[0]["stop_price"])
-                elif last_close.get(o.ticker):
-                    default = round(
-                        last_close[o.ticker]
-                        * (1 - float(cfg.get("stop_loss_pct", 8.0)) / 100),
-                        2)
-                    logger.warning(
-                        "%s: partial sell of %d/%d has no PM stop and no "
-                        "original stop found; re-anchoring remainder at "
-                        "the standard stop %.2f", o.ticker, o.shares,
-                        holdings.get(o.ticker, 0), default)
-                    orders[i] = replace_order(o, stop_price=default)
+        # Sell remainder anchoring: EVERY sell on a held ticker (legacy full
+        # exits and PM partials alike) carries a re-anchor level, so the
+        # broker can protect still-held shares after a partial fill or a
+        # final-round death — the stop was disarmed pre-open and must never
+        # stay disarmed while shares remain.
+        _anchor_sell_remainders(
+            orders, holdings, cancelled, last_close,
+            float(cfg.get("stop_loss_pct", 8.0)))
 
         wait = _seconds_until_open()
         if wait > 0 and not dry_run:

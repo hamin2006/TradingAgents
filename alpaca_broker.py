@@ -231,6 +231,24 @@ class AlpacaBroker:
         # original order so reports keep the caller's sequence.
         for o, submitted, exc in submissions:
             if submitted is None:
+                # Hard submission rejection: no order exists and none is
+                # retried — but a SELL's stop was already disarmed pre-open
+                # and the position is intact. The real position query guards
+                # the case where the sell actually landed despite the
+                # exception (flat -> nothing to protect).
+                if o.action == "SELL" and o.stop_price is not None:
+                    remain = self._position_qty(o.ticker)
+                    if remain > 0:
+                        self._client.submit_order(StopOrderRequest(
+                            symbol=o.ticker, qty=remain, side=OrderSide.SELL,
+                            type=OrderType.STOP, stop_price=o.stop_price,
+                            time_in_force=TimeInForce.GTC,
+                            extended_hours=False,
+                        ))
+                        logger.error(
+                            "submit failed for %s (%s); re-anchored GTC stop "
+                            "%.2f for the intact position (%d shares)",
+                            o.ticker, exc, o.stop_price, remain)
                 reports.append({"ticker": o.ticker, "action": o.action,
                                 "shares": o.shares, "filled": 0, "avg_price": 0.0})
                 continue
@@ -306,13 +324,15 @@ class AlpacaBroker:
                         logger.info("attached GTC stop %s for %s (%d shares)",
                                     o.stop_price, o.ticker, filled)
 
-                # PM execution: a partial-sell remainder (or a partial sell
-                # that never filled and is now definitively dead) must be
+                # Sell protection: a partial-sell remainder (or a sell that
+                # never filled and is now definitively dead) must be
                 # re-anchored — the pre-open disarm already cancelled the
                 # original stop, so skipping this would leave the position
-                # naked between runs. Never attach while a retry is pending
-                # (stop + live retry could double-sell) or when the fill
-                # status is unknown (the order may still fill today).
+                # naked between runs. Covers PM partials AND legacy full
+                # exits (daily_run anchors every sell's remainder level).
+                # Never attach while a retry is pending (stop + live retry
+                # could double-sell) or when the fill status is unknown
+                # (the order may still fill today).
                 if (o.action == "SELL" and not fill_unknown
                         and (filled > 0 or (cancelled_dead and final_round))):
                     # Leftover-stop cleanup (full exits keep their belt-and-

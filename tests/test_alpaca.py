@@ -707,3 +707,42 @@ def test_partial_sell_unfilled_first_round_no_premature_stop(broker):
     assert stop_requests == []
     assert len(retryable) == 1
     assert reports[0]["filled"] == 0
+
+
+def test_failed_sell_submission_reattaches_stop_for_intact_position(broker):
+    """A hard submission rejection means no order exists and none is
+    retried — but the stop was disarmed pre-open and the position is
+    intact. The broker must re-anchor a GTC stop (DASH 2026-09-08: exit
+    never filled across both rounds, position left naked overnight)."""
+    b, mock_client, _ = broker
+    mock_client.submit_order.side_effect = [Exception("hard reject"),
+                                            MagicMock()]
+    pos = MagicMock()
+    pos.symbol = "EL"
+    pos.qty = "8"
+    mock_client.get_all_positions.return_value = [pos]
+    with patch("alpaca_broker.time.sleep"):
+        reports = b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=8, reason="rating exit",
+                   stop_price=95.6)])
+    stop_requests = [c[0][0] for c in mock_client.submit_order.call_args_list
+                     if c[0][0].type.value == "stop"]
+    assert len(stop_requests) == 1
+    assert stop_requests[0].qty == 8
+    assert stop_requests[0].stop_price == 95.6
+    assert reports[0]["filled"] == 0
+
+
+def test_failed_sell_submission_with_no_position_attaches_nothing(broker):
+    """If the sell actually landed despite the exception, the real position
+    query shows flat and no stop may be attached (would short the account)."""
+    b, mock_client, _ = broker
+    mock_client.submit_order.side_effect = [Exception("hard reject"),
+                                            MagicMock()]
+    mock_client.get_all_positions.return_value = []
+    with patch("alpaca_broker.time.sleep"):
+        b.place_market_orders(
+            [Order(ticker="EL", action="SELL", shares=8, reason="rating exit",
+                   stop_price=95.6)])
+    assert not any(c[0][0].type.value == "stop"
+                   for c in mock_client.submit_order.call_args_list)
