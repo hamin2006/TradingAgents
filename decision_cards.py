@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 CARD_SCHEMA_VERSION = 1
+OUTCOME_SCHEMA_VERSION = 1
 
 _SAFE_TICKER = re.compile(r"[^A-Za-z0-9.\-]")
 _DATE_FMT = "%Y-%m-%d"
@@ -48,6 +49,50 @@ def append_card(root: str | Path, card: dict) -> Path:
     return path
 
 
+def append_outcome(root: str | Path, outcome: dict) -> Path | None:
+    """Append one ``execution_outcome`` event (what the engine ACTUALLY did).
+
+    Runs after the execute pass; must never raise (execution already
+    happened — a failed write is logged-and-dropped by the caller's store).
+    Returns the path, or None when the write failed.
+    """
+    try:
+        event = {"type": "execution_outcome",
+                 "schema_version": OUTCOME_SCHEMA_VERSION, **outcome}
+        path = cards_file(root, event.get("ticker", ""))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, sort_keys=True) + "\n")
+        return path
+    except OSError:
+        return None
+
+
+def load_outcomes(root: str | Path, ticker: str) -> list[dict]:
+    """All ``execution_outcome`` events for a ticker, oldest first."""
+    path = cards_file(root, ticker)
+    if not path.exists():
+        return []
+    outcomes = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (isinstance(event, dict)
+                        and event.get("type") == "execution_outcome"
+                        and event.get("date")):
+                    outcomes.append(event)
+    except OSError:
+        return []
+    return outcomes
+
+
 def load_cards(root: str | Path, ticker: str) -> list[dict]:
     """All cards for a ticker, oldest first. Malformed lines are skipped —
     a corrupt card never blocks analysis (skip + count)."""
@@ -66,6 +111,8 @@ def load_cards(root: str | Path, ticker: str) -> list[dict]:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(card, dict) and card.get("date") and card.get("ticker"):
+                    if card.get("type") == "execution_outcome":
+                        continue  # outcome events are not cards (flip logic)
                     cards.append(card)
     except OSError:
         return []
@@ -188,16 +235,60 @@ def _actual_lines(card: dict) -> list[str]:
     return lines
 
 
-def render_prior_decisions(ticker: str, cards: list[dict]) -> str:
+def _outcome_line(outcome: dict) -> str:
+    """Deterministic one-line projection of an execution_outcome event."""
+    parts = []
+    if outcome.get("gate_verdict"):
+        state = "ON" if outcome.get("binding_active") else "OFF"
+        parts.append(f"binding {state} (gate {outcome['gate_verdict']})")
+    elif outcome.get("binding_active") is not None:
+        parts.append("binding ON" if outcome.get("binding_active")
+                     else "binding off")
+    actual = outcome.get("actual") or []
+    if actual:
+        segs = []
+        for a in actual:
+            if not isinstance(a, dict):
+                continue
+            text = f"{a.get('action', '?')} {a.get('shares', '?')}"
+            filled = a.get("filled")
+            if filled is not None:
+                text += f" -> {filled} filled"
+            px = a.get("avg_price")
+            if isinstance(px, (int, float)) and px:
+                text += f" @ ${px:.2f}"
+            segs.append(text)
+        if segs:
+            parts.append("; ".join(segs))
+    if not actual:
+        parts.append("no orders")
+    remaining = outcome.get("remaining")
+    if remaining is not None:
+        parts.append(f"{remaining} remain")
+    stop = outcome.get("stop_anchored")
+    if isinstance(stop, (int, float)):
+        parts.append(f"stop ${stop:.2f}")
+    note = outcome.get("note")
+    if note:
+        parts.append(" ".join(str(note).split()))
+    return "outcome: " + "; ".join(parts)
+
+
+def render_prior_decisions(ticker: str, cards: list[dict],
+                           outcomes: list[dict] | None = None) -> str:
     """Framed, dated card block for the PM prompt (empty when no cards).
 
     Renders the full executive summary (bounded by schema design), the
-    deterministic execution-block projection when present, and the
-    machine-recorded actual execution when present. Prior prose is dated +
+    deterministic execution-block projection when present, the
+    machine-recorded actual execution when present, and the day's
+    execution_outcome event (gate verdict, fills, remaining shares) so the
+    PM reads intent AND what actually happened. Prior prose is dated +
     framed as overridable: the anti-anchor is attribution, not truncation.
     """
     if not cards:
         return ""
+    by_date = {o["date"]: o for o in (outcomes or [])
+               if isinstance(o, dict) and o.get("date")}
     lines = [
         f"Prior PM decisions on {ticker} (decided at these dates; they may be "
         "stale — current evidence governs, but if you overturn a prior rating, "
@@ -212,4 +303,7 @@ def render_prior_decisions(ticker: str, cards: list[dict]) -> str:
         lines.append(entry)
         lines.extend("    " + line for line in _execution_lines(card))
         lines.extend("    " + line for line in _actual_lines(card))
+        outcome = by_date.get(card.get("date"))
+        if outcome:
+            lines.append("    " + _outcome_line(outcome))
     return "\n".join(lines)

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
+from binding_gate import GATE_PASS
 from broker import create_broker
 from config import load_watchlist_config
 from decisions import BUY_RATINGS, compute_orders
@@ -1403,7 +1404,9 @@ def _ensure_decision_card_injection(cfg: dict) -> None:
                 root, ticker, _CARDS_MAX_AGE_DAYS, as_of=as_of)
             picked = decision_cards.select_cards_for_injection(
                 fresh, _CARDS_FLIP_MAX)
-            block = decision_cards.render_prior_decisions(ticker, picked)
+            outcomes = decision_cards.load_outcomes(root, ticker)
+            block = decision_cards.render_prior_decisions(
+                ticker, picked, outcomes=outcomes)
         except Exception:  # noqa: BLE001 — cards must never break the prompt
             return ctx
         if not block:
@@ -1679,6 +1682,74 @@ def _anchor_sell_remainders(orders: list, holdings: dict, cancelled: dict,
                          "fill", o.ticker)
 
 
+def _read_gate_artifact(cfg: dict) -> dict | None:
+    """Today's binding-gate artifact (verdict/reasons), or None.
+
+    Read for the execution-outcome record regardless of the ``pm_execution``
+    switch, so the card history shows WHY binding was on/off each day.
+    """
+    from binding_gate import gate_path
+    try:
+        return json.loads(gate_path(cfg["results_dir"],
+                                    _today_str()).read_text(
+                                        encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — a missing/invalid gate is not fatal
+        return None
+
+
+def _execution_outcomes(payload: dict, orders: list, reports: list,
+                        holdings: dict, gate: dict | None,
+                        binding_active: bool) -> dict[str, dict]:
+    """Reconcile intent vs reality, per analyzed ticker.
+
+    For every ticker in the ratings payload (each has a decision card),
+    record what the PM asked for (normalized execution block, or None when
+    absent/invalid), what the engine actually ran (orders + fills), where
+    the book stands afterwards (remaining shares), and the re-anchor level
+    carried for protection. Written as ``execution_outcome`` events so the
+    card history reads 'decided X -> executed Y -> book is Z'.
+    """
+    from pm_execution import EXECUTION_VALID, extract_execution
+
+    by_ticker: dict[str, list] = {}
+    for report in reports:
+        by_ticker.setdefault(report.get("ticker"), []).append(report)
+    sells_by_ticker: dict[str, list] = {}
+    for o in orders:
+        sells_by_ticker.setdefault(o.ticker, []).append(o)
+
+    outcomes: dict[str, dict] = {}
+    for ticker, rating in payload.get("ratings", {}).items():
+        block = (payload.get("execution") or {}).get(ticker)
+        if block is not None:
+            status, intent, _reason = extract_execution(
+                {"execution": block})
+            pm_orders = ([[o.kind, o.shares] for o in intent.orders]
+                         if status == EXECUTION_VALID and intent else None)
+        else:
+            pm_orders = None
+        actual = [{"action": r.get("action"), "shares": r.get("shares"),
+                   "filled": r.get("filled"), "avg_price": r.get("avg_price")}
+                  for r in by_ticker.get(ticker, [])]
+        delta = sum((a["filled"] or 0) * (1 if a["action"] == "BUY" else -1)
+                    for a in actual)
+        stops = [o.stop_price for o in sells_by_ticker.get(ticker, [])
+                 if o.stop_price is not None]
+        outcomes[ticker] = {
+            "date": _today_str(),
+            "ticker": ticker,
+            "rating": rating,
+            "binding_active": bool(binding_active),
+            "gate_verdict": (gate or {}).get("verdict"),
+            "gate_reasons": (gate or {}).get("reasons") or [],
+            "pm_orders": pm_orders,
+            "actual": actual,
+            "remaining": int(holdings.get(ticker, 0)) + delta,
+            "stop_anchored": stops[0] if stops else None,
+        }
+    return outcomes
+
+
 def run_execute(cfg: dict, dry_run: bool = False) -> int:
     if DISABLE_TRADING_FILE.exists() or not cfg.get("trading_enabled", True):
         logger.warning("trading disabled (kill switch); no orders placed")
@@ -1699,6 +1770,7 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
 
     payload = json.loads(ratings_path.read_text(encoding="utf-8"))
 
+    gate_info = _read_gate_artifact(cfg)
     # PM execution binding is fail-closed: it requires BOTH the config switch
     # AND the automated morning gate (binding_gate.py, runs post-analyze) —
     # verdict PASS for today. No gate artifact or any failure = the known-
@@ -1706,22 +1778,16 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
     # never run ungated.
     binding_active = bool(cfg.get("pm_execution", False))
     if binding_active:
-        try:
-            from binding_gate import GATE_PASS, gate_path
-            gate = json.loads(gate_path(cfg["results_dir"],
-                                        _today_str()).read_text(
-                                            encoding="utf-8"))
-            binding_active = gate.get("verdict") == GATE_PASS
-        except (OSError, json.JSONDecodeError):
+        if gate_info is None:
             logger.warning("no binding gate artifact for today; PM execution "
                            "binding NOT active (legacy path)")
             binding_active = False
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("binding gate read failed (%s); PM execution "
-                           "binding NOT active (legacy path)", exc)
+        elif gate_info.get("verdict") == GATE_PASS:
+            logger.info("binding gate PASS — PM execution binding active today")
+        else:
+            logger.warning("binding gate %s; PM execution binding NOT "
+                           "active (legacy path)", gate_info.get("verdict"))
             binding_active = False
-    if binding_active:
-        logger.info("binding gate PASS — PM execution binding active today")
 
     broker = create_broker(cfg)
     try:
@@ -1902,6 +1968,17 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                "paused": paused}
         if not dry_run:
             log_path.write_text(json.dumps(log, indent=2), encoding="utf-8")
+            # Decision-card outcome events: intent + truth in one history.
+            # Never fatal — execution already happened.
+            try:
+                import decision_cards
+                outcomes = _execution_outcomes(
+                    payload, orders, reports, holdings, gate_info,
+                    binding_active)
+                for outcome in outcomes.values():
+                    decision_cards.append_outcome(cfg["results_dir"], outcome)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("execution-outcome write failed: %s", exc)
         return 0
     finally:
         broker.disconnect()

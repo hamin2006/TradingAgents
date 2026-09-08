@@ -1735,3 +1735,106 @@ def test_anchor_sell_remainders_without_levels_leaves_order_untouched(caplog):
         _anchor_sell_remainders(orders, {"XYZ": 5}, {}, {}, 8.0)
     assert orders[0].stop_price is None
     assert "XYZ" in caplog.text
+
+
+def test_execution_outcomes_reconcile_legacy_day():
+    """The 2026-09-08 HPE replay: PM wanted a 2+2 trim, gate FAIL disabled
+    binding, legacy full exit ran and filled 1/13. The outcome must record
+    intent AND what actually happened."""
+    from daily_run import _execution_outcomes
+
+    payload = {"ratings": {"HPE": "Underweight", "DXCM": "Hold"},
+               "execution": {"HPE": {"orders": [
+                   {"kind": "SELL", "shares": 2},
+                   {"kind": "SELL", "shares": 2, "stop_px": 52.0}]}}}
+    orders = [Order(ticker="HPE", action="SELL", shares=13,
+                    reason="rating exit")]
+    reports = [{"ticker": "HPE", "action": "SELL", "shares": 13, "filled": 1,
+                "avg_price": 52.75}]
+    gate = {"verdict": "FAIL",
+            "reasons": ["DELL: empty execution orders on a Buy rating with "
+                        "no position held"]}
+    out = _execution_outcomes(payload, orders, reports,
+                              {"HPE": 13, "DXCM": 9}, gate,
+                              binding_active=False)
+    hpe = out["HPE"]
+    assert hpe["binding_active"] is False
+    assert hpe["gate_verdict"] == "FAIL"
+    assert hpe["gate_reasons"] == gate["reasons"]
+    assert hpe["pm_orders"] == [["SELL", 2], ["SELL", 2]]
+    assert hpe["actual"] == [{"action": "SELL", "shares": 13, "filled": 1,
+                              "avg_price": 52.75}]
+    assert hpe["remaining"] == 12
+    assert hpe["stop_anchored"] is None
+    dxcm = out["DXCM"]
+    assert dxcm["pm_orders"] is None
+    assert dxcm["actual"] == []
+    assert dxcm["remaining"] == 9
+
+
+def test_execution_outcomes_binding_maintain_and_buy():
+    """Binding day: empty block on a held name = honored maintain; a bound
+    buy records its attach-stop level; remaining tracks fills."""
+    from daily_run import _execution_outcomes
+
+    payload = {"ratings": {"DELL": "Buy", "MSFT": "Hold"},
+               "execution": {"MSFT": {"orders": []}}}
+    orders = [Order(ticker="DELL", action="BUY", shares=1,
+                    reason="pm-execution", stop_price=482.21)]
+    reports = [{"ticker": "DELL", "action": "BUY", "shares": 1, "filled": 1,
+                "avg_price": 522.78}]
+    gate = {"verdict": "PASS", "reasons": []}
+    out = _execution_outcomes(payload, orders, reports, {"MSFT": 1}, gate,
+                              binding_active=True)
+    dell = out["DELL"]
+    assert dell["binding_active"] is True
+    assert dell["gate_verdict"] == "PASS"
+    assert dell["pm_orders"] is None  # absent block
+    assert dell["actual"] == [{"action": "BUY", "shares": 1, "filled": 1,
+                               "avg_price": 522.78}]
+    assert dell["remaining"] == 1
+    assert dell["stop_anchored"] == 482.21
+    msft = out["MSFT"]
+    assert msft["pm_orders"] == []  # explicit valid empty block
+    assert msft["actual"] == []
+    assert msft["remaining"] == 1
+    assert msft["stop_anchored"] is None
+
+
+def test_run_execute_appends_outcome_events(cfg):
+    """Execution must write the day's outcome into the per-ticker card
+    store (intent + truth), once per analyzed ticker."""
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    broker = _exec_broker()
+    broker.place_market_orders.return_value = [
+        {"ticker": "AAPL", "action": "BUY", "shares": 10, "filled": 10,
+         "avg_price": 101.5}]
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today, \
+         patch("decision_cards.append_outcome") as mock_append:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        rc = run_execute(cfg)
+    assert rc == 0
+    assert mock_append.call_count == 1
+    outcome = mock_append.call_args[0][1]
+    assert outcome["ticker"] == "AAPL"
+    assert outcome["date"] == "2026-08-31"
+    assert outcome["actual"][0]["filled"] == 10
+    assert outcome["remaining"] == 10
+
+
+def test_run_execute_dry_run_writes_no_outcomes(cfg):
+    _ratings_file(cfg, {"AAPL": "Buy"})
+    broker = _exec_broker()
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today, \
+         patch("decision_cards.append_outcome") as mock_append:
+        mock_today.return_value = __import__("datetime").date(2026, 8, 31)
+        run_execute(cfg, dry_run=True)
+    mock_append.assert_not_called()

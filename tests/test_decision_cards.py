@@ -3,6 +3,7 @@
 
 import pytest
 
+import decision_cards
 from decision_cards import (
     append_card,
     cards_file,
@@ -216,3 +217,70 @@ class TestRenderFullSummaryAndExecution:
         block = render_prior_decisions("DASH", [card])
         assert "actual (legacy engine" in block or "actual" in block
         assert "BUY 3" in block
+
+
+class TestOutcomes:
+    """execution_outcome events: what the engine ACTUALLY did vs the intent."""
+
+    @staticmethod
+    def _outcome(date=DATE, ticker="EL", **kw):
+        o = {"type": "execution_outcome", "schema_version": 1, "date": date,
+             "ticker": ticker, "binding_active": False, "gate_verdict": None,
+             "gate_reasons": [], "pm_orders": None, "actual": [],
+             "remaining": 8, "stop_anchored": None, "note": None}
+        o.update(kw)
+        return o
+
+    def test_append_then_load_roundtrips(self, store):
+        o = self._outcome()
+        decision_cards.append_outcome(store, o)
+        loaded = decision_cards.load_outcomes(store, "EL")
+        assert len(loaded) == 1
+        assert loaded[0]["date"] == DATE
+        assert loaded[0]["remaining"] == 8
+
+    def test_outcomes_are_not_cards(self, store):
+        """Flip logic and latest_card must never see outcome events."""
+        decision_cards.append_outcome(store, self._outcome())
+        assert load_cards(store, "EL") == []
+        assert latest_card(store, "EL") is None
+        decision_cards.append_card(store, _card(DATE, "Hold"))
+        assert len(load_cards(store, "EL")) == 1
+
+    def test_render_appends_outcome_under_matching_date(self, store):
+        o = self._outcome(
+            binding_active=False, gate_verdict="FAIL",
+            gate_reasons=["DELL: empty execution orders"],
+            pm_orders=[["SELL", 2], ["SELL", 2]],
+            actual=[{"action": "SELL", "shares": 13, "filled": 1,
+                     "avg_price": 52.75}],
+            remaining=12)
+        block = decision_cards.render_prior_decisions(
+            "EL", [_card(DATE, "Underweight")], outcomes=[o])
+        assert "outcome:" in block
+        assert "binding OFF (gate FAIL)" in block
+        assert "SELL 13 -> 1 filled @ $52.75" in block
+        assert "12 remain" in block
+
+    def test_render_without_outcomes_unchanged(self, store):
+        """Regression: no outcome events -> identical rendering."""
+        block = decision_cards.render_prior_decisions(
+            "EL", [_card(DATE, "Hold")])
+        assert "outcome:" not in block
+        block2 = decision_cards.render_prior_decisions(
+            "EL", [_card(DATE, "Hold")],
+            outcomes=[self._outcome(date="2026-01-01")])
+        assert block2 == block  # outcome for another date never leaks in
+
+    def test_render_outcome_note_included(self, store):
+        o = self._outcome(note="exit completed manually at 12:18 ET")
+        block = decision_cards.render_prior_decisions(
+            "EL", [_card(DATE, "Hold")], outcomes=[o])
+        assert "exit completed manually" in block
+
+    def test_append_outcome_failure_safe(self, tmp_path):
+        """An outcome write must never raise (execution already done)."""
+        blocker = tmp_path / "afile"
+        blocker.write_text("")
+        root = blocker / "decision_cards"  # parent is a regular file
+        assert decision_cards.append_outcome(str(root), self._outcome()) is None

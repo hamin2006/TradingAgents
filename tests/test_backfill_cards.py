@@ -222,3 +222,130 @@ class TestActualsFromExecutedLog:
         written, skipped = backfill(["DASH"], logs, out, days_back=3,
                                     as_of="2026-09-04")
         assert written == 0 and skipped == 1
+
+
+class TestOutcomesBackfill:
+    """--outcomes mode: append execution_outcome events for post-observe
+    days (cards exist) from executed logs + gate artifacts. Idempotent."""
+
+    @staticmethod
+    def _executed_file(dirpath, date_str, orders, reports):
+        (dirpath / f"executed_{date_str}.json").write_text(json.dumps({
+            "date": date_str, "dry_run": False, "status": "completed",
+            "orders": orders, "reports": reports, "paused": []}))
+
+    @staticmethod
+    def _v2_ratings(dirpath, date_str, ratings, execution):
+        (dirpath / f"ratings_{date_str}.json").write_text(json.dumps({
+            "date": date_str, "schema_version": 2, "ratings": ratings,
+            "execution": execution, "failures": []}))
+
+    def test_outcomes_only_for_tickers_with_cards(self, logs):
+        from decision_cards import append_card
+        append_card(logs, {"date": "2026-09-08", "ticker": "HPE",
+                           "rating": "Underweight", "ref_close": None,
+                           "schema_version": 1,
+                           "executive_summary": "trim", "investment_thesis": "t",
+                           "execution": None})
+        self._v2_ratings(logs, "2026-09-08",
+                         {"HPE": "Underweight", "DXCM": "Hold"},
+                         {"HPE": {"orders": [{"kind": "SELL", "shares": 2},
+                                             {"kind": "SELL", "shares": 2,
+                                              "stop_px": 52.0}]}})
+        self._executed_file(
+            logs, "2026-09-08",
+            [{"ticker": "HPE", "action": "SELL", "shares": 13,
+              "reason": "rating exit", "stop_price": None}],
+            [{"ticker": "HPE", "action": "SELL", "shares": 13, "filled": 1,
+              "avg_price": 52.75}])
+        (logs / "binding_gate_2026-09-08.json").write_text(json.dumps({
+            "date": "2026-09-08", "verdict": "FAIL",
+            "reasons": ["DELL: empty execution orders"], "counts": {},
+            "preview": []}))
+        from backfill_cards import build_outcomes
+        out = build_outcomes(["HPE", "DXCM"], logs, logs, days_back=1,
+                             as_of="2026-09-08")
+        hpe = next(o for o in out if o["ticker"] == "HPE")
+        assert hpe["gate_verdict"] == "FAIL"
+        assert hpe["binding_active"] is False
+        assert hpe["pm_orders"] == [["SELL", 2], ["SELL", 2]]
+        assert hpe["actual"] == [{"action": "SELL", "shares": 13, "filled": 1,
+                                  "avg_price": 52.75}]
+        # DXCM is rated but has NO card that day (pre-observe) -> no outcome;
+        # its truth lives in the card `actual` field, never fabricated here.
+        assert all(o["ticker"] != "DXCM" for o in out)
+
+    def test_no_gate_artifact_is_binding_off_v1_ratings(self, logs):
+        """9/4-era day: no gate artifact, v1 ratings (no execution map)."""
+        from backfill_cards import build_outcomes
+        from decision_cards import append_card
+        append_card(logs, {"date": "2026-09-04", "ticker": "EL",
+                           "rating": "Underweight", "ref_close": None,
+                           "schema_version": 1,
+                           "executive_summary": "exit", "investment_thesis": "t",
+                           "execution": None})
+        _ratings_file(logs, "2026-09-04", {"EL": "Underweight"})
+        self._executed_file(
+            logs, "2026-09-04",
+            [{"ticker": "EL", "action": "SELL", "shares": 8,
+              "reason": "rating exit", "stop_price": None}],
+            [{"ticker": "EL", "action": "SELL", "shares": 8, "filled": 8,
+              "avg_price": 100.4}])
+        out = build_outcomes(["EL"], logs, logs, days_back=1,
+                             as_of="2026-09-04")
+        assert len(out) == 1
+        assert out[0]["gate_verdict"] is None
+        assert out[0]["binding_active"] is False
+        assert out[0]["pm_orders"] is None
+        assert out[0]["actual"][0]["filled"] == 8
+
+    def test_note_passthrough(self, logs):
+        from backfill_cards import build_outcomes
+        from decision_cards import append_card
+        append_card(logs, {"date": "2026-09-08", "ticker": "HPE",
+                           "rating": "Underweight", "ref_close": None,
+                           "schema_version": 1,
+                           "executive_summary": "trim", "investment_thesis": "t",
+                           "execution": None})
+        self._v2_ratings(logs, "2026-09-08", {"HPE": "Underweight"}, {})
+        out = build_outcomes(["HPE"], logs, logs, days_back=1,
+                             as_of="2026-09-08",
+                             notes={"HPE": "stop re-armed @ 50.08 manually"})
+        assert out[0]["note"] == "stop re-armed @ 50.08 manually"
+
+    def test_backfill_outcomes_is_idempotent(self, logs):
+        from backfill_cards import backfill_outcomes
+        from decision_cards import append_card
+        append_card(logs, {"date": "2026-09-08", "ticker": "HPE",
+                           "rating": "Underweight", "ref_close": None,
+                           "schema_version": 1,
+                           "executive_summary": "trim", "investment_thesis": "t",
+                           "execution": None})
+        self._v2_ratings(logs, "2026-09-08", {"HPE": "Underweight"}, {})
+        first = backfill_outcomes(["HPE"], logs, logs, days_back=1,
+                                  as_of="2026-09-08", dry_run=False)
+        second = backfill_outcomes(["HPE"], logs, logs, days_back=1,
+                                   as_of="2026-09-08", dry_run=False)
+        assert first == 1
+        assert second == 0
+
+    def test_stop_anchored_from_executed_order(self, logs):
+        """A recorded stop on the executed order (bound buy attach level)
+        flows into the outcome so the history shows the protection set."""
+        from backfill_cards import build_outcomes
+        from decision_cards import append_card
+        append_card(logs, {"date": "2026-09-08", "ticker": "DELL",
+                           "rating": "Buy", "ref_close": None,
+                           "schema_version": 1,
+                           "executive_summary": "start", "investment_thesis": "t",
+                           "execution": None})
+        self._v2_ratings(logs, "2026-09-08", {"DELL": "Buy"}, {})
+        self._executed_file(
+            logs, "2026-09-08",
+            [{"ticker": "DELL", "action": "BUY", "shares": 1,
+              "reason": "pm-execution", "stop_price": 482.21}],
+            [{"ticker": "DELL", "action": "BUY", "shares": 1, "filled": 1,
+              "avg_price": 522.78}])
+        out = build_outcomes(["DELL"], logs, logs, days_back=1,
+                             as_of="2026-09-08")
+        assert out[0]["stop_anchored"] == 482.21
