@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from binding_gate import GATE_FAIL, GATE_PASS, evaluate, gate_path
+from binding_gate import GATE_FAIL, GATE_PASS, evaluate, gate_path, run
 
 
 def _ratings_file(cfg, ratings, execution=None, day="2026-09-05",
@@ -128,6 +128,66 @@ class TestPath:
         result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
                           holdings={"HPE": 13}, last_close={"HPE": 52.0})
         assert result["verdict"] == GATE_PASS
+
+
+class TestRun:
+    """Chained entrypoint: analyze completion invokes the gate (2026-09-10
+    race: a slow analyze overran the fixed 08:00 ET cron; the artifact stayed
+    an empty FAIL and the day silently executed legacy)."""
+
+    def test_run_snapshots_broker_and_writes_artifact(self, gate_cfg,
+                                                      monkeypatch):
+        _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": _buy_block()})
+        import broker as broker_mod
+        import daily_run
+
+        class FakeBroker:
+            def __init__(self):
+                self.connected = False
+
+            def connect(self):
+                self.connected = True
+
+            def get_positions_and_cash(self):
+                return {}, 10_000.0
+
+            def disconnect(self):
+                self.connected = False
+
+        fake = FakeBroker()
+        monkeypatch.setattr(broker_mod, "create_broker", lambda cfg: fake)
+        monkeypatch.setattr(daily_run, "_last_close", lambda ticker: 54.25)
+
+        result = run(gate_cfg, "2026-09-05")
+
+        assert result["verdict"] == GATE_PASS
+        assert fake.connected is False
+        payload = json.loads(
+            gate_path(gate_cfg["results_dir"], "2026-09-05").read_text())
+        assert payload["verdict"] == GATE_PASS
+
+    def test_run_broker_failure_writes_fail_artifact(self, gate_cfg,
+                                                     monkeypatch):
+        import broker as broker_mod
+
+        class FakeBroker:
+            def connect(self):
+                raise RuntimeError("broker down")
+
+            def disconnect(self):
+                pass
+
+        monkeypatch.setattr(broker_mod, "create_broker",
+                            lambda cfg: FakeBroker())
+
+        result = run(gate_cfg, "2026-09-05")
+
+        assert result["verdict"] == GATE_FAIL
+        assert any("broker snapshot" in r for r in result["reasons"])
+        payload = json.loads(
+            gate_path(gate_cfg["results_dir"], "2026-09-05").read_text())
+        assert payload["verdict"] == GATE_FAIL
+        assert payload["per_ticker"] == {}
 
 
 class TestPerTickerGate:

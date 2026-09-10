@@ -33,6 +33,11 @@ conviction_weights:        # slice multiplier per rating (base = capital / max_p
   Buy: 1.5
   Overweight: 1.0
 analyze_max_workers: 4     # parallel ticker analyses in the morning pass
+max_analyst_tool_rounds: 8 # tool-call rounds per analyst before it must write
+                           # its report (runaway loop guard; 0 disables). At the
+                           # cap the model is told to finalize; one round later
+                           # the phase force-ends. 2026-09-10: 29-round News
+                           # loops (CRL/IQV) pushed the analyze past its gate.
 
 screener:
   universe: sp500

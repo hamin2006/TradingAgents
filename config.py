@@ -15,7 +15,7 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
      "analyze_max_workers", "stop_loss_pct", "conviction_weights",
      "tripwire_gap_pct", "pm_execution", "execution_intent",
      "stop_px_band_pct", "min_order_value_usd", "card_max_age_days",
-     "card_flip_inject_max",
+     "card_flip_inject_max", "max_analyst_tool_rounds",
      "openrouter_provider_pins", "fundamentals_source"]
 )
 
@@ -66,6 +66,12 @@ APP_DEFAULTS = {
     # LLM calls, so threads scale ~linearly; keep this modest to respect
     # provider rate limits (4 = ~10 min per 10 tickers vs ~1.5h sequential).
     "analyze_max_workers": 4,
+    # Tool-calling rounds allowed per analyst per ticker. The model can get
+    # stuck re-issuing the same calls (2026-09-10: 29 News rounds / ~150
+    # calls on CRL+IQV, 1.7-2.0M tokens, the analyze overran its gate
+    # window). At the cap the analyst is told to write its report with the
+    # evidence it has; one round later the phase is force-ended. 0 disables.
+    "max_analyst_tool_rounds": 8,
     "screener": {
         "universe": "sp500",
         "pool_size": 50,

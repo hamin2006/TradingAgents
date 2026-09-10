@@ -392,6 +392,96 @@ def test_analyst_report_passthrough_when_present(factory_name):
     assert out[report_key] == "full report text"
 
 
+# --- analyst tool-round budget (runaway tool-loop guard) ---------------------
+
+def _tool_round_msgs(rounds):
+    from langchain_core.messages import AIMessage, ToolMessage
+    msgs = []
+    for i in range(rounds):
+        msgs.append(AIMessage(content="", tool_calls=[
+            {"name": "fake_tool", "args": {}, "id": f"t{i}"}]))
+        msgs.append(ToolMessage(content="result", tool_call_id=f"t{i}"))
+    return msgs
+
+
+def _state_with_tool_rounds(total):
+    """State as the analyst's conditional sees it: ``total`` AI messages with
+    tool calls, the last one being the just-returned analyst turn."""
+    from langchain_core.messages import AIMessage, HumanMessage
+    msgs = [HumanMessage(content="go")]
+    msgs += _tool_round_msgs(total - 1)
+    msgs.append(AIMessage(content="", tool_calls=[
+        {"name": "fake_tool", "args": {}, "id": "last"}]))
+    return {"messages": msgs}
+
+
+@pytest.mark.parametrize("factory_name", [
+    "create_market_analyst", "create_sentiment_analyst",
+    "create_news_analyst", "create_fundamentals_analyst",
+])
+def test_analyst_tool_budget_nudges_at_cap(factory_name):
+    """At the cap the analyst call gets a final-answer notice appended; below
+    the cap the state passes through untouched."""
+    from langchain_core.messages import HumanMessage
+
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    original_factory = getattr(setup_mod, factory_name)
+    seen = {}
+
+    def fake_node(state):
+        seen["messages"] = list(state["messages"])
+        return {"messages": []}
+
+    daily_run._reset_analyst_tool_budget()
+    setattr(setup_mod, factory_name, lambda llm: fake_node)
+    try:
+        daily_run._ensure_analyst_tool_budget({"max_analyst_tool_rounds": 2})
+        node = getattr(setup_mod, factory_name)(None)
+
+        node({"messages": _state_with_tool_rounds(2)["messages"]})
+        assert isinstance(seen["messages"][-1], HumanMessage)
+        assert "TOOL BUDGET" in seen["messages"][-1].content
+
+        node({"messages": _state_with_tool_rounds(1)["messages"]})
+        assert not isinstance(seen["messages"][-1], HumanMessage)
+    finally:
+        daily_run._reset_analyst_tool_budget()
+        setattr(setup_mod, factory_name, original_factory)
+
+
+def test_analyst_tool_budget_hard_stops_past_cap():
+    """One round past the cap the phase routes to its clear node regardless
+    of tool calls, so a loop can never run away again."""
+    import daily_run
+    from tradingagents.graph.conditional_logic import ConditionalLogic
+
+    daily_run._reset_analyst_tool_budget()
+    try:
+        daily_run._ensure_analyst_tool_budget({"max_analyst_tool_rounds": 2})
+        cl = ConditionalLogic()
+        assert cl.should_continue_news(_state_with_tool_rounds(2)) == "tools_news"
+        assert cl.should_continue_news(
+            _state_with_tool_rounds(3)) == "Msg Clear News"
+    finally:
+        daily_run._reset_analyst_tool_budget()
+    # reset restores the original conditional behaviour
+    assert ConditionalLogic().should_continue_news(
+        _state_with_tool_rounds(99)) == "tools_news"
+
+
+def test_analyst_tool_budget_disabled_when_cap_zero():
+    import daily_run
+
+    daily_run._reset_analyst_tool_budget()
+    try:
+        daily_run._ensure_analyst_tool_budget({"max_analyst_tool_rounds": 0})
+        assert daily_run._ANALYST_TOOL_BUDGET_PATCHED is False
+    finally:
+        daily_run._reset_analyst_tool_budget()
+
+
 # --- reasoning capture (langchain converter drops model_extra) ---------------
 
 def test_ensure_reasoning_capture_keeps_reasoning_in_additional_kwargs():
@@ -738,6 +828,56 @@ def test_run_analyze_failure_is_isolated(cfg):
         payload = run_analyze(cfg, tickers=["AAPL", "MSFT"])
     assert payload["ratings"] == {"MSFT": "Hold"}
     assert payload["failures"] == ["AAPL"]
+
+
+def test_run_analyze_runs_binding_gate_when_pm_execution(cfg):
+    """Gate chaining (2026-09-10 race): a 4h analyze overran the fixed 08:00
+    ET cron, the artifact stayed an empty FAIL, and the day silently ran
+    legacy. With pm_execution on, the gate must run when analyze completes."""
+    cfg["pm_execution"] = True
+
+    class FakeTradingAgentsGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return None, "**Rating**: Buy"
+
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
+         patch("daily_run.TradingMemoryLog") as mock_log, \
+         patch("structured_log.StructuredRunLogger"), \
+         patch("daily_run._run_binding_gate") as gate_mock:
+        mock_log.return_value.load_entries.return_value = []
+        payload = run_analyze(cfg, tickers=["AAPL"])
+    gate_mock.assert_called_once_with(cfg, payload["date"])
+
+
+def test_run_analyze_skips_binding_gate_without_pm_execution(cfg):
+    class FakeTradingAgentsGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return None, "**Rating**: Buy"
+
+    with patch("daily_run.load_watchlist_config", return_value=cfg), \
+         patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
+         patch("daily_run.TradingMemoryLog") as mock_log, \
+         patch("structured_log.StructuredRunLogger"), \
+         patch("daily_run._run_binding_gate") as gate_mock:
+        mock_log.return_value.load_entries.return_value = []
+        run_analyze(cfg, tickers=["AAPL"])
+    gate_mock.assert_not_called()
+
+
+def test_run_binding_gate_swallows_failures(cfg):
+    """A gate crash must never break the analyze run: execute reads the
+    missing artifact and fails closed to legacy."""
+    import daily_run
+
+    with patch("binding_gate.run", side_effect=RuntimeError("boom")):
+        daily_run._run_binding_gate(cfg, "2026-09-05")  # no raise
 
 
 def test_run_execute_kill_switch_blocks(cfg, tmp_path):

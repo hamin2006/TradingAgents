@@ -155,6 +155,18 @@ before the 09:00 ET execute checkpoint. On 2026-09-02 the batch was still
 running at 10:00 ET when the old schedule's power-off fired and the day was
 lost; the current times leave the whole batch + retries a ~1.5h buffer.
 
+**Binding gate (PM execution) — chained to analyze, never scheduled:** when
+`pm_execution: true` the end of `daily_run.py --analyze` runs the gate
+in-process (`binding_gate.run`: broker snapshot + per-ticker verdicts) and
+writes `binding_gate_{date}.json`. There is deliberately **no gate cron**:
+on 2026-09-10 a 4h analyze (runaway News-Analyst tool loops) overran the old
+fixed 08:00 ET gate entry, the artifact stayed an empty FAIL ("no ratings
+file") and the whole day silently executed the legacy path. Chained, the gate
+only runs after the ratings file is written, so it can never race the analyze
+again; if it cannot run, execute fails closed to legacy. The runaway loops
+themselves are bounded by `max_analyst_tool_rounds` (default 8; at the cap the
+analyst is told to finalize, one round later the phase force-ends).
+
 The 04:10 screen refreshes the momentum ranking **every trading day** before the
 04:30 analysis (the scores are deterministic but prices move daily, so a weekly
 snapshot goes stale). It's free (yfinance only, no LLM cost), takes ~10 min, and

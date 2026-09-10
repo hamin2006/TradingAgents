@@ -1142,12 +1142,130 @@ def _reset_analyst_report_recovery() -> None:
     """Restore the analyst factory seams (tests; safe anytime)."""
     global _ANALYST_REPORT_RECOVERY_PATCHED
     if _ANALYST_REPORT_RECOVERY_PATCHED:
+        _reset_analyst_tool_budget()  # budget wraps recovery; reset it first
         import tradingagents.graph.setup as setup_mod
 
         for name, original in _ANALYST_REPORT_RECOVERY_ORIGINALS.items():
             setattr(setup_mod, name, original)
         _ANALYST_REPORT_RECOVERY_ORIGINALS.clear()
         _ANALYST_REPORT_RECOVERY_PATCHED = False
+
+
+# --- analyst tool-round budget (runaway tool-loop guard) ---------------------
+#
+# deepseek-v4-flash can get stuck re-issuing the same tool calls (live
+# 2026-09-10: CRL/IQV News Analysts burned 29 tool rounds / ~150 successful
+# but redundant calls and 1.7-2.0M tokens; the analyze overran its gate
+# window and the day silently ran legacy). The framework has no loop bound —
+# ConditionalLogic routes back to the ToolNode until the model stops asking.
+# Two runtime layers bound it:
+#   1. node wrapper: at `max_analyst_tool_rounds` the analyst call gets a
+#      final-answer notice appended, so the model reports with the evidence
+#      it already has instead of another tool round;
+#   2. conditional wrapper: one round past the cap, the phase is forced to
+#      its clear node (report recovery rebuilds any empty report from
+#      stranded AIMessage text).
+# Worst case per analyst: cap + 1 LLM calls.
+
+_ANALYST_TOOL_BUDGET_PATCHED = False
+_ANALYST_TOOL_BUDGET_FACTORY_ORIGINALS: dict = {}
+_ANALYST_TOOL_BUDGET_CONDITIONAL_ORIGINALS: dict = {}
+
+_ANALYST_TOOL_FACTORIES = (
+    "create_market_analyst", "create_sentiment_analyst",
+    "create_news_analyst", "create_fundamentals_analyst",
+)
+
+_ANALYST_TOOL_CLEAR_LABELS = {
+    "should_continue_market": "Msg Clear Market",
+    "should_continue_social": "Msg Clear Sentiment",
+    "should_continue_news": "Msg Clear News",
+    "should_continue_fundamentals": "Msg Clear Fundamentals",
+}
+
+_TOOL_BUDGET_NOTICE = (
+    "TOOL BUDGET EXHAUSTED for this analysis. Do NOT call any more tools. "
+    "Write your final report now using the evidence already gathered; if a "
+    "data source was unavailable, state that limitation in the report."
+)
+
+
+def _count_tool_rounds(messages) -> int:
+    """AI messages carrying tool calls in this analyst phase.
+
+    Clear nodes delete the previous phase's messages, so the state seen by an
+    analyst node holds exactly its own placeholder + tool-loop messages.
+    """
+    return sum(1 for m in (messages or [])
+               if getattr(m, "type", "") == "ai"
+               and getattr(m, "tool_calls", None))
+
+
+def _reset_analyst_tool_budget() -> None:
+    """Restore the analyst factories + conditional seams (tests; safe)."""
+    global _ANALYST_TOOL_BUDGET_PATCHED
+    if not _ANALYST_TOOL_BUDGET_PATCHED:
+        return
+    import tradingagents.graph.conditional_logic as cl_mod
+    import tradingagents.graph.setup as setup_mod
+
+    for name, original in _ANALYST_TOOL_BUDGET_FACTORY_ORIGINALS.items():
+        setattr(setup_mod, name, original)
+    for name, original in _ANALYST_TOOL_BUDGET_CONDITIONAL_ORIGINALS.items():
+        setattr(cl_mod.ConditionalLogic, name, original)
+    _ANALYST_TOOL_BUDGET_FACTORY_ORIGINALS.clear()
+    _ANALYST_TOOL_BUDGET_CONDITIONAL_ORIGINALS.clear()
+    _ANALYST_TOOL_BUDGET_PATCHED = False
+
+
+def _ensure_analyst_tool_budget(cfg: dict) -> None:
+    """Cap tool-calling rounds per analyst (0 disables; idempotent)."""
+    global _ANALYST_TOOL_BUDGET_PATCHED
+    if _ANALYST_TOOL_BUDGET_PATCHED:
+        return
+    cap = int((cfg or {}).get("max_analyst_tool_rounds", 8))
+    if cap <= 0:
+        return
+    from langchain_core.messages import HumanMessage
+
+    import tradingagents.graph.conditional_logic as cl_mod
+    import tradingagents.graph.setup as setup_mod
+
+    for factory_name in _ANALYST_TOOL_FACTORIES:
+        original_factory = getattr(setup_mod, factory_name)
+
+        def wrapped_factory(llm, _orig=original_factory, _cap=cap):
+            node = _orig(llm)
+
+            def node_with_budget(state):
+                if _count_tool_rounds(state.get("messages")) >= _cap:
+                    messages = list(state.get("messages") or [])
+                    messages.append(HumanMessage(content=_TOOL_BUDGET_NOTICE))
+                    state = {**state, "messages": messages}
+                return node(state)
+
+            node_with_budget._wrapped_original = node
+            return node_with_budget
+
+        wrapped_factory._wrapped_original = original_factory
+        setattr(setup_mod, factory_name, wrapped_factory)
+        _ANALYST_TOOL_BUDGET_FACTORY_ORIGINALS[factory_name] = original_factory
+
+    for method_name, clear_label in _ANALYST_TOOL_CLEAR_LABELS.items():
+        original = getattr(cl_mod.ConditionalLogic, method_name)
+
+        def capped(self, state, _orig=original, _label=clear_label, _cap=cap):
+            out = _orig(self, state)
+            if (isinstance(out, str) and out.startswith("tools_")
+                    and _count_tool_rounds(state.get("messages")) > _cap):
+                return _label
+            return out
+
+        capped._wrapped_original = original
+        setattr(cl_mod.ConditionalLogic, method_name, capped)
+        _ANALYST_TOOL_BUDGET_CONDITIONAL_ORIGINALS[method_name] = original
+
+    _ANALYST_TOOL_BUDGET_PATCHED = True
 
 
 def _ensure_reddit_pacing() -> None:
@@ -1676,6 +1794,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_fred_aliases()
     _ensure_structured_fallback_logging()
     _ensure_analyst_report_recovery()
+    _ensure_analyst_tool_budget(cfg)
     _ensure_reasoning_capture()
     _ensure_portfolio_context(cfg)
     _ensure_edgar_fundamentals(cfg)
@@ -1749,6 +1868,8 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     logger.info("ratings written to %s", path)
+    if cfg.get("pm_execution", False):
+        _run_binding_gate(cfg, payload["date"])
     return payload
 
 
@@ -1812,6 +1933,26 @@ def _read_gate_artifact(cfg: dict) -> dict | None:
                                         encoding="utf-8"))
     except Exception:  # noqa: BLE001 — a missing/invalid gate is not fatal
         return None
+
+
+def _run_binding_gate(cfg: dict, date_str: str | None = None) -> None:
+    """Run the automated binding gate as analyze completes (chained).
+
+    The gate must never race the analyze: on 2026-09-10 a 4h run overran the
+    fixed 08:00 ET gate cron, the artifact stayed an empty FAIL ("no ratings
+    file"), and execute silently ran the whole day legacy. Chaining removes
+    the schedule dependency entirely. Failures here are never fatal —
+    execute reads the missing artifact and falls back to legacy.
+    """
+    try:
+        import binding_gate
+        result = binding_gate.run(cfg, date_str)
+        logger.info("binding gate: %s (%d block(s) valid)",
+                    result.get("verdict"),
+                    (result.get("counts") or {}).get("valid", 0))
+    except Exception as exc:  # noqa: BLE001 — execute fails closed without it
+        logger.warning("binding gate failed to run (%s); execute will fall "
+                       "back to legacy", exc)
 
 
 def _execution_outcomes(payload: dict, orders: list, reports: list,
