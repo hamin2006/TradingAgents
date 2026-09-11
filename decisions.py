@@ -23,6 +23,15 @@ class Order:
                                            # (partial): re-anchor the remainder
 
 
+@dataclass(frozen=True)
+class ProtectionIntent:
+    """Desired broker-side protection for one held PM-bound position."""
+
+    ticker: str
+    target_px: float
+    stop_px: float
+
+
 DEFAULT_CONVICTIION_WEIGHTS = {"Buy": 1.5, "Overweight": 1.0}
 
 
@@ -149,6 +158,57 @@ def _clamp_stop(stop_px: float, price: float, band_pct: tuple[float, float],
     clamps.append(f"{ticker}: stop {stop_px:.2f} outside band "
                   f"{lo_px:.2f}..{hi_px:.2f}; clamped to {clamped:.2f}")
     return round(clamped, 2)
+
+
+def protection_from_execution(
+    execution: ExecutionIntent,
+    *,
+    ticker: str,
+    holdings: dict[str, int],
+    last_close: dict[str, float],
+    stop_loss_pct: float,
+    stop_px_band_pct: tuple[float, float],
+    standing_stop_px: float | None = None,
+) -> tuple[ProtectionIntent | None, list[str]]:
+    """Derive and validate an OCO target from a PM execution block.
+
+    A returned protection with non-empty reasons is a diagnostic candidate
+    only: callers must use the reasons to fall back to legacy execution.
+    Keeping it available lets the gate record the target/stop it rejected.
+    """
+    if execution.take_profit_px is None:
+        return None, []
+
+    target = round(float(execution.take_profit_px), 2)
+    price = float(last_close.get(ticker, 0.0) or 0.0)
+    reasons: list[str] = []
+    if int(holdings.get(ticker, 0) or 0) < 1:
+        reasons.append(f"{ticker}: take-profit target on unheld ticker")
+    if price <= 0:
+        reasons.append(f"{ticker}: no reference close for take-profit validation")
+    elif target <= price:
+        reasons.append(f"{ticker}: take-profit target must exceed reference close")
+
+    sell_stop = next((o.stop_px for o in execution.orders
+                      if o.kind.value == "SELL" and o.stop_px is not None),
+                     None)
+    if sell_stop is not None:
+        if price > 0:
+            stop = _clamp_stop(float(sell_stop), price, stop_px_band_pct,
+                               [], ticker)
+        else:
+            stop = round(float(sell_stop), 2)
+    elif standing_stop_px is not None and float(standing_stop_px) > 0:
+        stop = round(float(standing_stop_px), 2)
+    elif price > 0:
+        stop = round(price * (1 - stop_loss_pct / 100), 2)
+    else:
+        return None, reasons
+
+    protection = ProtectionIntent(ticker=ticker, target_px=target, stop_px=stop)
+    if stop >= target - 0.01:
+        reasons.append(f"{ticker}: OCO stop must be at least $0.01 below target")
+    return protection, reasons
 
 
 def orders_from_execution(

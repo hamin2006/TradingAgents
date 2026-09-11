@@ -1054,3 +1054,109 @@ def test_get_filled_stop_orders_filters_by_fill_window_type_and_status(broker):
     assert fills[0]["symbol"] == "ZBRA"
     assert fills[0]["qty"] == 1
     assert fills[0]["avg_price"] == pytest.approx(336.08)
+
+
+def test_resting_protection_reads_oco_parent_leg_and_standalone_stop(broker):
+    """The flat broker view hides an OCO stop leg. Nested parsing must treat
+    both the parent OCO and a plain GTC stop as one symbol's protection."""
+    b, mock_client, _ = broker
+    oco_leg = MagicMock(symbol="AAPL", type="stop", stop_price="92.0",
+                        qty="3", status="held")
+    oco_parent = MagicMock(symbol="AAPL", type="limit", order_class="oco",
+                           limit_price="120.0", qty="3", id="oco-1",
+                           status="new", legs=[oco_leg])
+    plain_stop = MagicMock(symbol="MSFT", type="stop", stop_price="400.0",
+                           qty="2", id="stop-1", status="new", legs=[])
+    mock_client.get_orders.return_value = [oco_parent, plain_stop]
+
+    resting = b.get_resting_protection()
+
+    assert resting == {
+        "AAPL": [{"kind": "oco", "order_id": "oco-1", "qty": 3,
+                  "target_price": 120.0, "stop_price": 92.0}],
+        "MSFT": [{"kind": "stop", "order_id": "stop-1", "qty": 2,
+                  "stop_price": 400.0}],
+    }
+
+
+def test_cancel_protection_for_cancels_oco_parent_and_returns_leg_stop(broker):
+    """An open SELL plus an OCO must cancel the parent, whose broker-side
+    cascade removes the invisible stop leg and preserves its anchor level."""
+    b, mock_client, _ = broker
+    oco_leg = MagicMock(symbol="AAPL", type="stop", stop_price="92.0",
+                        qty="3", status="held")
+    oco_parent = MagicMock(symbol="AAPL", type="limit", order_class="oco",
+                           limit_price="120.0", qty="3", id="oco-1",
+                           status="new", legs=[oco_leg])
+    mock_client.get_orders.return_value = [oco_parent]
+
+    cancelled = b.cancel_protection_for(["AAPL"])
+
+    assert cancelled == {"AAPL": [{"stop_price": 92.0, "qty": 3}]}
+    mock_client.cancel_order_by_id.assert_called_once_with("oco-1")
+
+
+def test_place_oco_uses_live_position_and_gtc_request_shape(broker):
+    """An OCO must size to the current position, use both legs, and never
+    request extended-hours execution."""
+    b, mock_client, _ = broker
+    mock_client.get_all_positions.return_value = [MagicMock(symbol="AAPL", qty="3")]
+    mock_client.submit_order.return_value = MagicMock(id="oco-1")
+
+    order_id = b.place_oco("AAPL", 99, 92.0, 120.0)
+
+    request = mock_client.submit_order.call_args[0][0]
+    assert order_id == "oco-1"
+    assert request.symbol == "AAPL" and request.qty == 3
+    assert request.order_class.value == "oco"
+    assert request.time_in_force.value == "gtc"
+    assert request.extended_hours is False
+    assert request.take_profit.limit_price == 120.0
+    assert request.stop_loss.stop_price == 92.0
+
+
+def test_place_oco_retries_position_reservation_lag(broker):
+    """A just-cancelled order can reserve shares briefly. OCO placement must
+    retry with a fresh position read rather than leave the remainder naked."""
+    b, mock_client, _ = broker
+    mock_client.get_all_positions.return_value = [MagicMock(symbol="AAPL", qty="3")]
+    mock_client.submit_order.side_effect = [
+        Exception("insufficient qty available"), MagicMock(id="oco-2")]
+
+    with patch("alpaca_broker.time.sleep"):
+        order_id = b.place_oco("AAPL", 3, 92.0, 120.0)
+
+    assert order_id == "oco-2"
+    assert mock_client.submit_order.call_count == 2
+    assert mock_client.get_all_positions.call_count == 2
+
+
+def test_filled_exit_orders_classifies_oco_target_and_stop_leg(broker):
+    """Card reconciliation must distinguish a profitable parent fill from
+    an OCO child stop fill; the latter is otherwise invisible in flat data."""
+    from datetime import datetime, timezone
+
+    b, mock_client, _ = broker
+    inside = datetime(2026, 9, 10, 13, 31, tzinfo=timezone.utc)
+    tp_leg = MagicMock(symbol="F", type="stop", order_class="oco",
+                       status="canceled", filled_at=None, legs=[])
+    tp_parent = MagicMock(symbol="F", type="limit", order_class="oco",
+                          status="filled", filled_at=inside, qty="1",
+                          filled_avg_price="13.99", side="sell", legs=[tp_leg])
+    stop_leg = MagicMock(symbol="MSFT", type="stop", order_class="oco",
+                         status="filled", filled_at=inside, qty="2",
+                         filled_avg_price="400.0", side="sell", legs=[])
+    stopped_parent = MagicMock(symbol="MSFT", type="limit", order_class="oco",
+                               status="canceled", filled_at=None, legs=[stop_leg])
+    mock_client.get_orders.return_value = [tp_parent, stopped_parent]
+
+    fills = b.get_filled_exit_orders(
+        datetime(2026, 9, 10, 4, 0, tzinfo=timezone.utc),
+        datetime(2026, 9, 11, 4, 0, tzinfo=timezone.utc))
+
+    assert fills == [
+        {"symbol": "F", "kind": "TP", "qty": 1, "avg_price": 13.99,
+         "filled_at": inside.isoformat()},
+        {"symbol": "MSFT", "kind": "STOP", "qty": 2, "avg_price": 400.0,
+         "filled_at": inside.isoformat()},
+    ]

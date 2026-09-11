@@ -1,8 +1,9 @@
 # PM Take-Profit via Broker-Side OCO Orders (2026-09-11)
 
-Status: **Design approved 2026-09-11** (brainstormed same day; Alpaca support verified
-live on the paper account, including the probe classes below). No implementation plan
-yet — build from this spec when pursued.
+Status: **Implemented locally 2026-09-11** (design approved and prior Alpaca paper
+placement/query/cascade/TP-fill probes retained). Hermetic tests and Ruff are green;
+the rollout probes in §10, especially the OCO stop-leg-fill classification, remain
+required before production reliance.
 
 ## 1. Problem
 

@@ -268,6 +268,15 @@ def _outcome_line(outcome: dict) -> str:
     stop = outcome.get("stop_anchored")
     if isinstance(stop, (int, float)):
         parts.append(f"stop ${stop:.2f}")
+    protection = outcome.get("protection")
+    if isinstance(protection, dict):
+        stop_px = protection.get("stop_px")
+        if protection.get("kind") == "oco":
+            target_px = protection.get("target_px")
+            if isinstance(target_px, (int, float)) and isinstance(stop_px, (int, float)):
+                parts.append(f"OCO target ${target_px:.2f}, stop ${stop_px:.2f}")
+        elif isinstance(stop_px, (int, float)):
+            parts.append(f"resting stop ${stop_px:.2f}")
     note = outcome.get("note")
     if note:
         parts.append(" ".join(str(note).split()))

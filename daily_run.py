@@ -990,18 +990,12 @@ def _ensure_stop_sweep(cfg: dict) -> None:
             if not holdings:
                 return  # nothing to sweep
 
-            # Query resting GTC stops
-            from alpaca.trading.enums import QueryOrderStatus
-            from alpaca.trading.requests import GetOrdersRequest
-            req = GetOrdersRequest(
-                status=QueryOrderStatus.OPEN,
-                limit=100,  # should cover all open stops
-            )
-            open_orders = broker._client.get_orders(filter=req)
-            stopped_tickers = {
-                o.symbol for o in open_orders
-                if o.type.value == "stop" and o.time_in_force.value == "gtc"
-            }
+            # Nested broker snapshot: a flat order query hides the held STOP
+            # child under an OCO parent, which previously caused a second
+            # stop to be attached to an already-protected position.
+            resting = broker.get_resting_protection()
+            stopped_tickers = {ticker for ticker, rows in resting.items()
+                               if rows}
 
             # For each held ticker without a stop, attach one
             for ticker, shares in holdings.items():
@@ -1015,22 +1009,10 @@ def _ensure_stop_sweep(cfg: dict) -> None:
                     continue
                 stop_px = round(last_close_px * (1 - stop_loss_pct / 100), 2)
 
-                # Submit GTC stop
-                from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
-                from alpaca.trading.requests import StopOrderRequest
-                stop_req = StopOrderRequest(
-                    symbol=ticker,
-                    qty=shares,
-                    side=OrderSide.SELL,
-                    type=OrderType.STOP,
-                    stop_price=stop_px,
-                    time_in_force=TimeInForce.GTC,
-                    extended_hours=False,
-                )
-                broker._client.submit_order(stop_req)
-                logger.info(
-                    "stop sweep: attached GTC stop %.2f for %s (%d shares)",
-                    stop_px, ticker, shares)
+                if broker.place_stop(ticker, shares, stop_px):
+                    logger.info(
+                        "stop sweep: attached GTC stop %.2f for %s (%d shares)",
+                        stop_px, ticker, shares)
         finally:
             broker.disconnect()
     except Exception as exc:  # noqa: BLE001
@@ -1572,6 +1554,7 @@ def _ensure_pm_execution_schema(cfg: dict) -> None:
 - Entries are whole-share only: `value_usd` below one share's price sizes to ZERO shares and the gate marks the ticker legacy. For a ticker whose price exceeds your intended dollar amount, size in `shares` (minimum 1); no fractionals.
 - `limit_px` on a SELL is a floor (day-expiry if never reached); buys get a +2% protection ceiling automatically.
 - Orders are day-expiry and fill at/after the 09:30 ET open; `stop_px` becomes a broker-side GTC stop protecting fills and remainders.
+- `take_profit_px` is a held-position-only broker-side GTC target. Re-emit it every day to keep it; it must be above the reference price and at least $0.01 above its stop. Do not use it for a fresh entry or an immediate exit.
 """
 
     original = structured_mod.invoke_structured_or_freetext
@@ -2067,6 +2050,113 @@ def _anchor_sell_remainders(orders: list, holdings: dict, cancelled: dict,
                          "fill", o.ticker)
 
 
+def _reconcile_protection(cfg: dict, broker, intents: dict) -> list[dict]:
+    """Re-affirm PM OCO targets from a fresh post-batch broker snapshot.
+
+    The snapshot is deliberately a hard precondition: a failed query returns
+    no rows and makes no cancellation, so a transient broker failure can
+    never turn stale knowledge into a naked position. Once an OCO has been
+    cancelled, an OCO submit failure immediately tries the retrying plain
+    stop path before this best-effort reconciler returns.
+    """
+    try:
+        positions, _cash = broker.get_positions_and_cash()
+        resting = broker.get_resting_protection()
+        if not isinstance(resting, dict):
+            raise TypeError("resting protection response is not a mapping")
+    except Exception as exc:  # noqa: BLE001 — preserve broker state on doubt
+        logger.warning("protection reconcile skipped (snapshot: %s)", exc)
+        return []
+
+    rows: list[dict] = []
+
+    def cancel_all(ticker: str, existing: list[dict]) -> bool:
+        for protection in existing:
+            try:
+                broker.cancel_protection(protection["order_id"])
+            except Exception as exc:  # noqa: BLE001 — old protection still rests
+                logger.warning("protection reconcile: cannot cancel %s %s: %s",
+                               ticker, protection.get("order_id"), exc)
+                return False
+        return True
+
+    # Any protection on a flat symbol can only create a future short. It is
+    # safe to remove and needs no replacement.
+    for ticker, existing in sorted(resting.items()):
+        if int(positions.get(ticker, 0) or 0) > 0:
+            continue
+        for protection in existing:
+            try:
+                broker.cancel_protection(protection["order_id"])
+            except Exception as exc:  # noqa: BLE001 — retry next execution day
+                logger.warning("protection reconcile: cannot cancel flat %s: %s",
+                               ticker, exc)
+                continue
+            rows.append({"ticker": ticker, "action": "cancel_unheld",
+                         "qty": int(protection.get("qty", 0) or 0)})
+
+    for ticker, qty_value in sorted(positions.items()):
+        qty = int(qty_value or 0)
+        if qty < 1:
+            continue
+        existing = list(resting.get(ticker, []))
+        intent = intents.get(ticker)
+        oco_rows = [row for row in existing if row.get("kind") == "oco"]
+
+        if intent is None:
+            # Re-affirmation is intentionally opt-in. A target omitted by
+            # today's valid PM block becomes a plain stop at the OCO leg's
+            # old level, not an unprotected hold.
+            if not oco_rows:
+                continue
+            stop_px = round(float(oco_rows[0]["stop_price"]), 2)
+            if not cancel_all(ticker, existing):
+                continue
+            try:
+                placed = bool(broker.place_stop(ticker, qty, stop_px))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("protection downgrade stop for %s failed: %s",
+                             ticker, exc)
+                placed = False
+            rows.append({"ticker": ticker,
+                         "action": "downgrade" if placed else "stop_fallback",
+                         "qty": qty, "stop_px": stop_px})
+            continue
+
+        target_px = round(float(intent.target_px), 2)
+        stop_px = round(float(intent.stop_px), 2)
+        matching = (
+            len(existing) == 1 and existing[0].get("kind") == "oco"
+            and int(existing[0].get("qty", 0) or 0) == qty
+            and round(float(existing[0].get("target_price", 0.0)), 2) == target_px
+            and round(float(existing[0].get("stop_price", 0.0)), 2) == stop_px
+        )
+        if matching:
+            rows.append({"ticker": ticker, "action": "oco_keep", "qty": qty,
+                         "target_px": target_px, "stop_px": stop_px})
+            continue
+
+        action = "oco_set" if not existing else "oco_replace"
+        if existing and not cancel_all(ticker, existing):
+            continue
+        try:
+            broker.place_oco(ticker, qty, stop_px, target_px)
+        except Exception as exc:  # noqa: BLE001 — plain stop is the safety net
+            logger.error("OCO placement for %s failed: %s; restoring plain stop",
+                         ticker, exc)
+            try:
+                broker.place_stop(ticker, qty, stop_px)
+            except Exception as stop_exc:  # noqa: BLE001
+                logger.error("plain-stop fallback for %s failed: %s", ticker,
+                             stop_exc)
+            rows.append({"ticker": ticker, "action": "stop_fallback", "qty": qty,
+                         "stop_px": stop_px, "target_px": target_px})
+            continue
+        rows.append({"ticker": ticker, "action": action, "qty": qty,
+                     "target_px": target_px, "stop_px": stop_px})
+    return rows
+
+
 def _read_gate_artifact(cfg: dict) -> dict | None:
     """Today's binding-gate artifact (verdict/reasons), or None.
 
@@ -2151,7 +2241,7 @@ def _reconcile_broker_outcomes(cfg: dict, today: str | None = None) -> int:
         broker = create_broker(cfg)
         broker.connect()
         positions, _cash = broker.get_positions_and_cash()
-        getter = getattr(broker, "get_filled_stop_orders", None)
+        getter = getattr(broker, "get_filled_exit_orders", None)
         if callable(getter):
             start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ET)
             for fill in getter(start, start + timedelta(days=1)):
@@ -2184,15 +2274,20 @@ def _reconcile_broker_outcomes(cfg: dict, today: str | None = None) -> int:
         updated["reconciled_on"] = today
         actual = list(current.get("actual") or [])
         for fill in fills:
-            actual.append({"action": "SELL(STOP)", "shares": fill["qty"],
+            kind = fill.get("kind", "STOP")
+            actual.append({"action": f"SELL({kind})", "shares": fill["qty"],
                            "filled": fill["qty"],
                            "avg_price": fill["avg_price"],
-                           "source": "broker-stop"})
+                           "source": "broker-exit"})
         updated["actual"] = actual
         notes = [str(current["note"])] if current.get("note") else []
         notes.extend(
-            f"broker-side stop filled {f['qty']} {ticker} "
-            f"@ ${f['avg_price']:.2f}" for f in fills)
+            (f"broker-side take-profit filled {f['qty']} {ticker} "
+             f"@ ${f['avg_price']:.2f}")
+            if f.get("kind") == "TP" else
+            (f"broker-side stop filled {f['qty']} {ticker} "
+             f"@ ${f['avg_price']:.2f}")
+            for f in fills)
         if true_remaining != current.get("remaining") and not fills:
             notes.append(
                 f"book reconciled from broker position ({true_remaining} held)")
@@ -2208,7 +2303,8 @@ def _reconcile_broker_outcomes(cfg: dict, today: str | None = None) -> int:
 
 def _execution_outcomes(payload: dict, orders: list, reports: list,
                         holdings: dict, gate: dict | None,
-                        bound_tickers: set[str]) -> dict[str, dict]:
+                        bound_tickers: set[str],
+                        protection_rows: list[dict] | None = None) -> dict[str, dict]:
     """Reconcile intent vs reality, per analyzed ticker.
 
     For every ticker in the ratings payload (each has a decision card),
@@ -2227,6 +2323,11 @@ def _execution_outcomes(payload: dict, orders: list, reports: list,
     for o in orders:
         sells_by_ticker.setdefault(o.ticker, []).append(o)
 
+    protection_by_ticker = {
+        row.get("ticker"): row for row in (protection_rows or [])
+        if isinstance(row, dict) and row.get("ticker")
+    }
+
     outcomes: dict[str, dict] = {}
     for ticker, rating in payload.get("ratings", {}).items():
         block = (payload.get("execution") or {}).get(ticker)
@@ -2244,6 +2345,16 @@ def _execution_outcomes(payload: dict, orders: list, reports: list,
                     for a in actual)
         stops = [o.stop_price for o in sells_by_ticker.get(ticker, [])
                  if o.stop_price is not None]
+        protection_row = protection_by_ticker.get(ticker)
+        protection = None
+        if protection_row and protection_row.get("action", "").startswith("oco_"):
+            protection = {"kind": "oco", "qty": protection_row.get("qty"),
+                          "target_px": protection_row.get("target_px"),
+                          "stop_px": protection_row.get("stop_px")}
+        elif protection_row and protection_row.get("action") in {
+                "downgrade", "stop_fallback"}:
+            protection = {"kind": "stop", "qty": protection_row.get("qty"),
+                          "stop_px": protection_row.get("stop_px")}
         outcomes[ticker] = {
             "date": _today_str(),
             "ticker": ticker,
@@ -2255,6 +2366,7 @@ def _execution_outcomes(payload: dict, orders: list, reports: list,
             "actual": actual,
             "remaining": int(holdings.get(ticker, 0)) + delta,
             "stop_anchored": stops[0] if stops else None,
+            "protection": protection,
         }
     return outcomes
 
@@ -2335,9 +2447,15 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         # "legacy" OR invalid/absent block -> legacy compute_orders path.
         per_ticker_gate = (gate_info or {}).get("per_ticker", {})
         bound_tickers: set[str] = set()
+        protection_intents: dict[str, object] = {}
+        target_snapshot: dict | None = None
+        target_snapshot_failed = False
         if binding_enabled and isinstance(
                 payload.get("execution"), dict):
-            from decisions import orders_from_execution as orders_from_block
+            from decisions import (
+                orders_from_execution as orders_from_block,
+                protection_from_execution,
+            )
             from pm_execution import EXECUTION_VALID, extract_execution
 
             for ticker in sorted(payload["execution"]):
@@ -2370,9 +2488,41 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                     logger.warning("%s: execution block not honorable; "
                                    "legacy path", ticker)
                     continue
+                if intent.take_profit_px is not None and target_snapshot is None \
+                        and not target_snapshot_failed:
+                    try:
+                        target_snapshot = broker.get_resting_protection()
+                        if not isinstance(target_snapshot, dict):
+                            raise TypeError("resting protection is not a mapping")
+                    except Exception as exc:  # noqa: BLE001 — no blind stop change
+                        target_snapshot_failed = True
+                        logger.warning("%s: cannot snapshot existing protection "
+                                       "for take-profit validation (%s); legacy path",
+                                       ticker, exc)
+                if intent.take_profit_px is not None and target_snapshot_failed:
+                    continue
+                standing_stop_px = None
+                if intent.take_profit_px is not None:
+                    standing = (target_snapshot or {}).get(ticker, [])
+                    if standing:
+                        standing_stop_px = standing[0].get("stop_price")
+                protection, protection_reasons = protection_from_execution(
+                    intent, ticker=ticker, holdings=holdings,
+                    last_close=last_close,
+                    stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
+                    stop_px_band_pct=tuple(cfg.get("stop_px_band_pct",
+                                                   [3.0, 25.0])),
+                    standing_stop_px=standing_stop_px)
+                if protection_reasons:
+                    logger.warning("%s: take-profit block not honorable (%s); "
+                                   "legacy path", ticker,
+                                   "; ".join(protection_reasons))
+                    continue
                 orders = [o for o in orders if o.ticker != ticker]
                 orders.extend(block_orders)
                 bound_tickers.add(ticker)
+                if protection is not None:
+                    protection_intents[ticker] = protection
 
         # Cash pass (risk-budget sizing spec 2026-09-11): every buy — PM
         # explicit intents first, then legacy buys by conviction — must fit
@@ -2434,13 +2584,13 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
         # position into an unintended short (EL-class exit, 2026-09-04).
         sells = [o.ticker for o in orders if o.action == "SELL"]
         cancelled = {}
-        if sells and hasattr(broker, "cancel_stops_for") and not dry_run:
-            logger.info("cancelling stops before the open for exit(s): %s",
+        if sells and hasattr(broker, "cancel_protection_for") and not dry_run:
+            logger.info("cancelling protection before the open for exit(s): %s",
                         ", ".join(sells))
             try:
-                cancelled = broker.cancel_stops_for(sells)
+                cancelled = broker.cancel_protection_for(sells)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("stop disarm failed for %s: %s", sells, exc)
+                logger.warning("protection disarm failed for %s: %s", sells, exc)
             if not isinstance(cancelled, dict):
                 cancelled = {}
         # Sell remainder anchoring: EVERY sell on a held ticker (legacy full
@@ -2471,9 +2621,13 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
             }, indent=2), encoding="utf-8")
 
         reports = broker.place_market_orders(orders, dry_run=dry_run)
+        protection_rows = []
+        if not dry_run:
+            protection_rows = _reconcile_protection(
+                cfg, broker, protection_intents)
         log = {"date": _today_str(), "dry_run": dry_run, "status": "completed",
                "orders": [o.__dict__ for o in orders], "reports": reports,
-               "paused": paused}
+               "paused": paused, "protection": protection_rows}
         if not dry_run:
             log_path.write_text(json.dumps(log, indent=2), encoding="utf-8")
             # Decision-card outcome events: intent + truth in one history.
@@ -2482,7 +2636,7 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 import decision_cards
                 outcomes = _execution_outcomes(
                     payload, orders, reports, holdings, gate_info,
-                    bound_tickers)
+                    bound_tickers, protection_rows)
                 for outcome in outcomes.values():
                     decision_cards.append_outcome(cfg["results_dir"], outcome)
             except Exception as exc:  # noqa: BLE001

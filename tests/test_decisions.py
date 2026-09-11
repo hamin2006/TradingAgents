@@ -249,6 +249,68 @@ def _intent(orders, **extra):
         PmOrder(**o) for o in orders], **extra)
 
 
+class TestProtectionFromExecution:
+    """Pure OCO validation: a bad target must bind neither an OCO nor a PM block."""
+
+    @staticmethod
+    def _derive(intent, *, holdings=None, close=100.0,
+                standing_stop_px=None):
+        import decisions
+
+        if holdings is None:
+            holdings = {"AAPL": 4}
+        return decisions.protection_from_execution(
+            intent, ticker="AAPL", holdings=holdings,
+            last_close={"AAPL": close}, stop_loss_pct=8.0,
+            stop_px_band_pct=(3.0, 25.0),
+            standing_stop_px=standing_stop_px)
+
+    def test_absent_target_needs_no_protection_reconcile(self):
+        protection, reasons = self._derive(_intent([]))
+        assert protection is None
+        assert reasons == []
+
+    def test_target_uses_clamped_sell_stop_before_standing_or_default(self):
+        import decisions
+
+        intent = _intent([{"kind": "SELL", "shares": 1, "stop_px": 50.0}],
+                         take_profit_px=120.0)
+        protection, reasons = self._derive(intent, standing_stop_px=89.0)
+        assert protection == decisions.ProtectionIntent(
+            ticker="AAPL", target_px=120.0, stop_px=75.0)
+        assert any("clamped" in reason for reason in reasons) is False
+
+    def test_target_uses_standing_stop_then_default_stop(self):
+        import decisions
+
+        intent = _intent([], take_profit_px=120.0)
+        standing, standing_reasons = self._derive(intent, standing_stop_px=91.5)
+        default, default_reasons = self._derive(intent)
+        assert standing == decisions.ProtectionIntent("AAPL", 120.0, 91.5)
+        assert default == decisions.ProtectionIntent("AAPL", 120.0, 92.0)
+        assert standing_reasons == []
+        assert default_reasons == []
+
+    def test_target_on_unheld_ticker_is_not_honorable(self):
+        protection, reasons = self._derive(
+            _intent([], take_profit_px=120.0), holdings={})
+        assert protection is not None  # retained solely for gate observability
+        assert reasons == ["AAPL: take-profit target on unheld ticker"]
+
+    def test_target_at_or_below_reference_close_is_not_honorable(self):
+        protection, reasons = self._derive(_intent([], take_profit_px=100.0))
+        assert protection is not None  # retained solely for gate observability
+        assert reasons == ["AAPL: take-profit target must exceed reference close"]
+
+    def test_stop_must_be_at_least_one_cent_below_target(self):
+        # A standing broker stop is not re-clamped here; if corrupt broker
+        # state makes it too close to the target, never reissue that OCO.
+        intent = _intent([], take_profit_px=120.0)
+        protection, reasons = self._derive(intent, standing_stop_px=119.995)
+        assert protection is not None
+        assert reasons == ["AAPL: OCO stop must be at least $0.01 below target"]
+
+
 class TestOrdersFromExecutionBuy:
     def test_value_usd_sizes_and_protects(self):
         intent = _intent([{"kind": "BUY", "value_usd": 200.0}])

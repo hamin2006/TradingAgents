@@ -115,6 +115,25 @@ class IBKRBroker:
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not cancel open stops for %s: %s", symbol, exc)
 
+    def get_resting_protection(self) -> dict[str, list[dict]]:
+        raise NotImplementedError("OCO protection is currently Alpaca-only")
+
+    def cancel_protection(self, order_id: str) -> None:
+        raise NotImplementedError("OCO protection is currently Alpaca-only")
+
+    def cancel_protection_for(self, tickers: list[str]) -> dict[str, list[dict]]:
+        raise NotImplementedError("OCO protection is currently Alpaca-only")
+
+    def place_stop(self, symbol: str, qty: int, stop_px: float) -> bool:
+        raise NotImplementedError("OCO protection is currently Alpaca-only")
+
+    def place_oco(self, symbol: str, qty: int, stop_px: float,
+                  target_px: float) -> str:
+        raise NotImplementedError("OCO protection is currently Alpaca-only")
+
+    def get_filled_exit_orders(self, since, until) -> list[dict]:
+        raise NotImplementedError("OCO protection is currently Alpaca-only")
+
     def disconnect(self) -> None:
         if self._ib is not None:
             with contextlib.suppress(Exception):

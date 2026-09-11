@@ -105,3 +105,19 @@ def test_sell_cancels_open_stops(broker):
         b.place_market_orders(
             [Order(ticker="TSLA", action="SELL", shares=40, reason="rating exit")])
     mock_ib.cancelOrder.assert_called_with(open_stop.order)
+
+
+def test_oco_protection_primitives_are_explicitly_unavailable_on_ibkr(broker):
+    """Alpaca is the only active paper backend; an accidental IBKR flip
+    must fail loudly instead of silently leaving a target unprotected."""
+    b, _ = broker
+    for method, args in (
+        (b.get_resting_protection, ()),
+        (b.cancel_protection, ("order-1",)),
+        (b.cancel_protection_for, (["AAPL"],)),
+        (b.place_stop, ("AAPL", 1, 92.0)),
+        (b.place_oco, ("AAPL", 1, 92.0, 120.0)),
+        (b.get_filled_exit_orders, (None, None)),
+    ):
+        with pytest.raises(NotImplementedError):
+            method(*args)

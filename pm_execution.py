@@ -69,6 +69,9 @@ class ExecutionIntent(BaseModel):
     """Today's open-window execution intent. Orders are day-expiry only."""
 
     orders: list[PmOrder] = Field(default_factory=list)
+    # Held-position-only broker-side target. Unlike ``PmOrder.limit_px``,
+    # this rests between daily runs when the PM re-affirms it each morning.
+    take_profit_px: float | None = Field(default=None, gt=0)
     # Advisory only — NEVER executed: close/band semantics differ from the
     # broker's GTC touch stops. Recorded on the decision card.
     invalidation_px: float | None = None

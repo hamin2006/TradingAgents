@@ -46,14 +46,14 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
              last_close: dict[str, float] | None = None,
              write: bool = True) -> dict:
     """Fail-closed evaluation of the morning's ratings for binding."""
-    from decisions import orders_from_execution
+    from decisions import orders_from_execution, protection_from_execution
 
     results_dir = Path(results_dir)
     holdings = holdings or {}
     last_close = last_close or {}
     reasons: list[str] = []
     counts = {"valid": 0, "invalid": 0, "absent": 0, "empty_on_buy": 0,
-              "engine_fallback": 0}
+              "engine_fallback": 0, "protection_invalid": 0}
     preview: list[dict] = []
     per_ticker: dict[str, dict] = {}  # NEW: per-ticker gate status
 
@@ -91,11 +91,30 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
                 reasons.append(f"{ticker}: {fallback_reason}")
                 per_ticker[ticker] = {"status": "legacy", "reason": fallback_reason}
                 continue
+            protection, protection_reasons = protection_from_execution(
+                intent, ticker=ticker, holdings=holdings,
+                last_close=last_close,
+                stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
+                stop_px_band_pct=tuple(cfg.get("stop_px_band_pct",
+                                               [3.0, 25.0])))
+            protection_fields = {
+                "take_profit_px": intent.take_profit_px,
+                "oco_stop_px": protection.stop_px if protection else None,
+            }
+            if protection_reasons:
+                counts["protection_invalid"] += 1
+                protection_reason = "; ".join(protection_reasons)
+                reasons.append(protection_reason)
+                per_ticker[ticker] = {"status": "legacy",
+                                      "reason": protection_reason,
+                                      **protection_fields}
+                continue
             preview.append({
                 "ticker": ticker,
                 "rating": rating,
                 "orders": [(o.action, o.shares) for o in orders],
                 "clamps": clamps,
+                **protection_fields,
             })
             if not orders and rating in ("Buy", "Overweight") \
                     and ticker not in holdings:
@@ -108,12 +127,15 @@ def evaluate(cfg: dict, results_dir: str | Path, date_str: str,
                 empty_reason = "empty execution orders on a " \
                     f"{rating} rating with no position held"
                 reasons.append(f"{ticker}: {empty_reason}")
-                per_ticker[ticker] = {"status": "legacy", "reason": empty_reason}
+                per_ticker[ticker] = {"status": "legacy", "reason": empty_reason,
+                                      **protection_fields}
             elif not orders and ticker in holdings:
                 counts["valid"] += 0  # explicit no-order on held = deliberate
-                per_ticker[ticker] = {"status": "bind", "reason": None}
+                per_ticker[ticker] = {"status": "bind", "reason": None,
+                                      **protection_fields}
             else:
-                per_ticker[ticker] = {"status": "bind", "reason": None}
+                per_ticker[ticker] = {"status": "bind", "reason": None,
+                                      **protection_fields}
 
     verdict = GATE_PASS if not reasons else GATE_FAIL
     result = {

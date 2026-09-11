@@ -78,6 +78,17 @@ class TestExecutionIntent:
         assert intent.invalidation_px == 95.6
         assert "catalyst" in intent.future_notes
 
+    def test_take_profit_must_be_positive(self):
+        """A zero/negative target would become an invalid broker OCO leg."""
+        for target in (0.0, -1.0):
+            with pytest.raises(ValidationError, match="take_profit_px"):
+                ExecutionIntent(orders=[], take_profit_px=target)
+
+    def test_take_profit_parses_on_an_empty_held_maintain_block(self):
+        """A target is position-level, so it must not require a day order."""
+        intent = ExecutionIntent(orders=[], take_profit_px=120.25)
+        assert intent.take_profit_px == 120.25
+
 
 class TestExecutionPortfolioDecision:
     def test_subclasses_framework_decision(self):

@@ -30,12 +30,20 @@ import time
 from datetime import timedelta
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import (
+    OrderClass,
+    OrderSide,
+    OrderType,
+    QueryOrderStatus,
+    TimeInForce,
+)
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    StopLossRequest,
     StopOrderRequest,
+    TakeProfitRequest,
 )
 
 from decisions import Order
@@ -482,6 +490,126 @@ class AlpacaBroker:
                            symbol, exc)
         return 0
 
+    @staticmethod
+    def _order_value(order, name: str) -> str:
+        """Normalized Alpaca enum/string field for real models and test fakes."""
+        value = getattr(order, name, None)
+        value = getattr(value, "value", value)
+        return str(value or "").lower()
+
+    @staticmethod
+    def _order_float(order, name: str) -> float:
+        try:
+            return float(getattr(order, name, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _order_qty(order) -> int:
+        try:
+            return int(float(getattr(order, "qty", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def get_resting_protection(self) -> dict[str, list[dict]]:
+        """Nested open-order snapshot of standalone stops and OCO parents.
+
+        Alpaca's flat query omits an OCO's held STOP child.  Consumers use
+        this single nested snapshot for sweep, disarm, and post-fill OCO
+        reconciliation so that one position is never protected twice.
+        """
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True,
+                                   limit=500)
+        protection: dict[str, list[dict]] = {}
+        for order in self._client.get_orders(request):
+            kind = self._order_value(order, "order_class")
+            order_type = self._order_value(order, "type")
+            symbol = str(getattr(order, "symbol", "") or "")
+            if not symbol:
+                continue
+            if kind == "oco":
+                leg = next((candidate for candidate in
+                            (getattr(order, "legs", None) or [])
+                            if self._order_value(candidate, "type") == "stop"),
+                           None)
+                if leg is None:
+                    logger.warning("open OCO %s for %s has no stop leg",
+                                   getattr(order, "id", "?"), symbol)
+                    continue
+                target = self._order_float(order, "limit_price")
+                stop = self._order_float(leg, "stop_price")
+                qty = self._order_qty(order) or self._order_qty(leg)
+                if not target or not stop or qty < 1:
+                    logger.warning("open OCO %s for %s has invalid protection data",
+                                   getattr(order, "id", "?"), symbol)
+                    continue
+                protection.setdefault(symbol, []).append({
+                    "kind": "oco", "order_id": str(order.id), "qty": qty,
+                    "target_price": target, "stop_price": stop,
+                })
+            elif order_type == "stop":
+                stop = self._order_float(order, "stop_price")
+                qty = self._order_qty(order)
+                if stop and qty > 0:
+                    protection.setdefault(symbol, []).append({
+                        "kind": "stop", "order_id": str(order.id), "qty": qty,
+                        "stop_price": stop,
+                    })
+        return protection
+
+    def cancel_protection(self, order_id: str) -> None:
+        """Cancel one standalone stop or OCO parent (parent cascades legs)."""
+        self._client.cancel_order_by_id(order_id)
+
+    def cancel_protection_for(self, tickers: list[str]) -> dict[str, list[dict]]:
+        """Disarm protection for open-window exits and return stop anchors."""
+        cancelled: dict[str, list[dict]] = {}
+        resting = self.get_resting_protection()
+        for ticker in tickers:
+            for protection in resting.get(ticker, []):
+                try:
+                    self.cancel_protection(protection["order_id"])
+                except Exception as exc:  # noqa: BLE001 — do not claim disarm
+                    logger.warning("could not cancel %s protection %s: %s",
+                                   ticker, protection["order_id"], exc)
+                    continue
+                logger.info("cancelled %s protection %s for %s",
+                            protection["kind"], protection["order_id"], ticker)
+                cancelled.setdefault(ticker, []).append({
+                    "stop_price": protection["stop_price"],
+                    "qty": protection["qty"],
+                })
+        return cancelled
+
+    def place_stop(self, symbol: str, qty: int, stop_px: float) -> bool:
+        """Place a GTC stop with the existing position-lag retry guard."""
+        return self._submit_remainder_stop(symbol, qty, stop_px)
+
+    def place_oco(self, symbol: str, qty: int, stop_px: float,
+                  target_px: float) -> str:
+        """Place a GTC sell OCO, sized from the live position on each retry."""
+        last_error: Exception | None = None
+        for attempt in range(3):
+            remain = self._position_qty(symbol)
+            if remain < 1:
+                raise RuntimeError(f"no position remains to protect for {symbol}")
+            try:
+                submitted = self._client.submit_order(LimitOrderRequest(
+                    symbol=symbol, qty=remain, side=OrderSide.SELL,
+                    type=OrderType.LIMIT, limit_price=target_px,
+                    order_class=OrderClass.OCO,
+                    take_profit=TakeProfitRequest(limit_price=target_px),
+                    stop_loss=StopLossRequest(stop_price=stop_px),
+                    time_in_force=TimeInForce.GTC, extended_hours=False,
+                ))
+                return str(submitted.id)
+            except Exception as exc:  # noqa: BLE001 — held-for-orders lag
+                last_error = exc
+                logger.warning("OCO for %s attempt %d failed: %s", symbol,
+                               attempt + 1, exc)
+                time.sleep(2)
+        raise RuntimeError(f"OCO for {symbol} failed after retries: {last_error}")
+
     def _submit_remainder_stop(self, symbol: str, qty: int,
                                stop_price: float) -> bool:
         """Submit the remainder GTC stop with bounded retries.
@@ -513,45 +641,16 @@ class AlpacaBroker:
         return False
 
     def cancel_stops_for(self, tickers: list[str]) -> dict[str, list[dict]]:
-        """Cancel resting GTC stops for symbols being sold (exit guard).
-
-        Called by the execute pass BEFORE the market opens: if a rating exit
-        sells at the open while its stop is still resting, a gap through the
-        stop level could fill BOTH orders at the auction (stop + market
-        sell) and double-sell the position into an unintended short.
-
-        Returns {ticker: [{"stop_price", "qty"}]} of the cancelled stops so
-        a partial-sell remainder can be re-anchored at the original level.
-        """
-        cancelled: dict[str, list[dict]] = {}
-        for ticker in tickers:
-            stops = self._cancel_open_stops(ticker)
-            if stops:
-                cancelled[ticker] = stops
-        return cancelled
+        """Backward-compatible name for the nested-aware exit disarm."""
+        return self.cancel_protection_for(tickers)
 
     def _cancel_open_stops(self, symbol: str) -> list[dict]:
-        """Cancel leftover stop orders for a symbol; return what was cancelled."""
-        cancelled = []
-        try:
-            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-            for order in self._client.get_orders(request):
-                if (order.symbol == symbol and order.type == "stop"):
-                    try:
-                        stop_price = float(getattr(order, "stop_price", 0.0) or 0.0)
-                    except (TypeError, ValueError):
-                        stop_price = 0.0
-                    try:
-                        qty = int(getattr(order, "qty", 0) or 0)
-                    except (TypeError, ValueError):
-                        qty = 0
-                    self._client.cancel_order_by_id(order.id)
-                    logger.info("cancelled leftover stop %s for %s", order.id,
-                                symbol)
-                    cancelled.append({"stop_price": stop_price, "qty": qty})
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("could not cancel open stops for %s: %s", symbol, exc)
-        return cancelled
+        """Backward-compatible private alias for nested-aware cleanup."""
+        return self._cancel_open_protection(symbol)
+
+    def _cancel_open_protection(self, symbol: str) -> list[dict]:
+        """Cancel an open standalone stop or OCO parent for one symbol."""
+        return self.cancel_protection_for([symbol]).get(symbol, [])
 
     def disconnect(self) -> None:
         pass  # stateless REST client; nothing to tear down
@@ -588,4 +687,41 @@ class AlpacaBroker:
                               "filled_at": filled_at.isoformat()})
         except Exception as exc:  # noqa: BLE001 — reconciliation is best-effort
             logger.warning("could not fetch filled stop orders: %s", exc)
+        return fills
+
+    def get_filled_exit_orders(self, since, until) -> list[dict]:
+        """Nested broker exits, classified as a stop or OCO take-profit fill."""
+        fills: list[dict] = []
+        try:
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED, limit=500,
+                after=since - timedelta(days=180), nested=True)
+
+            def collect(order) -> None:
+                order_type = self._order_value(order, "type")
+                order_class = self._order_value(order, "order_class")
+                status = self._order_value(order, "status")
+                if order_type == "stop":
+                    kind = "STOP"
+                elif order_type == "limit" and order_class == "oco":
+                    kind = "TP"
+                else:
+                    kind = None
+                filled_at = getattr(order, "filled_at", None)
+                if kind and status == "filled" and filled_at is not None \
+                        and since <= filled_at < until:
+                    qty = self._order_qty(order)
+                    avg_price = self._order_float(order, "filled_avg_price")
+                    symbol = str(getattr(order, "symbol", "") or "")
+                    if symbol and qty > 0 and avg_price > 0:
+                        fills.append({"symbol": symbol, "kind": kind,
+                                      "qty": qty, "avg_price": avg_price,
+                                      "filled_at": filled_at.isoformat()})
+                for leg in getattr(order, "legs", None) or []:
+                    collect(leg)
+
+            for order in self._client.get_orders(request):
+                collect(order)
+        except Exception as exc:  # noqa: BLE001 — reconciliation is best-effort
+            logger.warning("could not fetch filled exit orders: %s", exc)
         return fills

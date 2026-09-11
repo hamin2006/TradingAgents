@@ -103,6 +103,42 @@ class TestEvaluate:
                           holdings={"EL": 8}, last_close={"EL": 101.15})
         assert result["verdict"] == GATE_PASS
 
+    def test_target_on_unheld_ticker_falls_back_and_records_candidate(self, gate_cfg):
+        """Fresh-entry OCO brackets are unsafe/out of scope: legacy owns it."""
+        _ratings_file(gate_cfg, {"AAPL": "Hold"}, {"AAPL": {
+            "orders": [], "take_profit_px": 120.0}})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={}, last_close={"AAPL": 100.0})
+        status = result["per_ticker"]["AAPL"]
+        assert status["status"] == "legacy"
+        assert "unheld" in status["reason"]
+        assert status["take_profit_px"] == 120.0
+        assert status["oco_stop_px"] == 92.0
+
+    def test_held_target_is_bindable_and_visible_in_preview(self, gate_cfg):
+        _ratings_file(gate_cfg, {"AAPL": "Hold"}, {"AAPL": {
+            "orders": [], "take_profit_px": 120.0}})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={"AAPL": 3}, last_close={"AAPL": 100.0})
+        assert result["per_ticker"]["AAPL"]["status"] == "bind"
+        preview = next(row for row in result["preview"]
+                       if row["ticker"] == "AAPL")
+        assert preview["take_profit_px"] == 120.0
+        assert preview["oco_stop_px"] == 92.0
+
+    def test_marketable_target_falls_back_and_records_derived_stop(self, gate_cfg):
+        """A target at the reference price would fill immediately; the PM
+        must express that decision as a normal SELL rather than an OCO."""
+        _ratings_file(gate_cfg, {"AAPL": "Hold"}, {"AAPL": {
+            "orders": [], "take_profit_px": 100.0}})
+        result = evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",
+                          holdings={"AAPL": 3}, last_close={"AAPL": 100.0})
+        status = result["per_ticker"]["AAPL"]
+        assert status["status"] == "legacy"
+        assert "exceed reference" in status["reason"]
+        assert status["take_profit_px"] == 100.0
+        assert status["oco_stop_px"] == 92.0
+
     def test_gate_file_written(self, gate_cfg, tmp_path):
         _ratings_file(gate_cfg, {"HPE": "Overweight"}, {"HPE": _buy_block()})
         evaluate(gate_cfg, gate_cfg["results_dir"], "2026-09-05",

@@ -1021,9 +1021,9 @@ def test_reconcile_broker_outcomes_corrects_stop_fills(cfg):
     results = _write_outcome_day(cfg)
     broker = MagicMock()
     broker.get_positions_and_cash.return_value = ({"DXCM": 9}, 7000.0)
-    broker.get_filled_stop_orders.return_value = [
-        {"symbol": "ZBRA", "qty": 1, "avg_price": 336.08,
-         "filled_at": "2026-09-10T13:31:40+00:00", "side": "sell"}]
+    broker.get_filled_exit_orders.return_value = [
+        {"symbol": "ZBRA", "kind": "STOP", "qty": 1, "avg_price": 336.08,
+         "filled_at": "2026-09-10T13:31:40+00:00"}]
 
     with patch("daily_run._seconds_until_open", return_value=1000.0), \
          patch("daily_run.create_broker", return_value=broker):
@@ -1038,7 +1038,7 @@ def test_reconcile_broker_outcomes_corrects_stop_fills(cfg):
     latest = zbra[-1]
     assert latest["remaining"] == 0
     assert latest["reconciled"] is True
-    assert any(a.get("source") == "broker-stop" for a in latest["actual"])
+    assert any(a.get("source") == "broker-exit" for a in latest["actual"])
     assert "stop filled" in latest["note"]
     # untouched ticker: still exactly one event, not reconciled
     dxcm = [e for e in load_outcomes(results, "DXCM")
@@ -1053,6 +1053,30 @@ def test_reconcile_broker_outcomes_corrects_stop_fills(cfg):
             cfg, today="2026-09-11") == 0
     assert len([e for e in load_outcomes(results, "ZBRA")
                 if e["date"] == "2026-09-10"]) == 2
+
+
+def test_reconcile_broker_outcomes_renders_oco_take_profit(cfg):
+    """A filled OCO parent is an upside exit, not a stop-loss in the next
+    PM card; the target label preserves the outcome's meaning."""
+    import daily_run
+    from decision_cards import load_outcomes
+
+    results = _write_outcome_day(cfg)
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"DXCM": 9}, 7000.0)
+    broker.get_filled_exit_orders.return_value = [
+        {"symbol": "ZBRA", "kind": "TP", "qty": 1, "avg_price": 345.0,
+         "filled_at": "2026-09-10T17:31:40+00:00"}]
+
+    with patch("daily_run._seconds_until_open", return_value=1000.0), \
+         patch("daily_run.create_broker", return_value=broker):
+        assert daily_run._reconcile_broker_outcomes(
+            cfg, today="2026-09-11") == 1
+
+    latest = load_outcomes(results, "ZBRA")[-1]
+    assert latest["actual"][-1]["action"] == "SELL(TP)"
+    assert latest["actual"][-1]["source"] == "broker-exit"
+    assert "take-profit" in latest["note"]
 
 
 def test_reconcile_broker_outcomes_skips_when_session_open(cfg):
@@ -1364,7 +1388,7 @@ def test_run_execute_skips_wait_in_dry_run(cfg):
     assert slept == []
 
 
-def test_run_execute_cancels_stops_before_open_for_sells(cfg):
+def test_run_execute_cancels_protection_before_open_for_sells(cfg):
     """EL-class exit (2026-09-04): an Underweight on a held position sells at
     the open. The resting GTC stop must be cancelled BEFORE the open — with
     both orders live at the 09:30 auction, a gap through the stop could
@@ -1387,13 +1411,13 @@ def test_run_execute_cancels_stops_before_open_for_sells(cfg):
     assert rc == 0
     # stop cancelled pre-open, and strictly before the market sell
     names = [c[0] for c in broker.method_calls]
-    assert "cancel_stops_for" in names
-    assert names.index("cancel_stops_for") < names.index("place_market_orders")
-    assert broker.cancel_stops_for.call_args[0][0] == ["EL"]
+    assert "cancel_protection_for" in names
+    assert names.index("cancel_protection_for") < names.index("place_market_orders")
+    assert broker.cancel_protection_for.call_args[0][0] == ["EL"]
     assert slept == [1800.0]  # still waited for the open before selling
 
 
-def test_run_execute_does_not_cancel_stops_when_only_buys(cfg):
+def test_run_execute_does_not_cancel_protection_when_only_buys(cfg):
     _ratings_file(cfg, {"AAPL": "Buy"}, day="2026-09-04")
     broker = MagicMock()
     broker.get_positions_and_cash.return_value = ({}, 100_000.0)
@@ -1408,7 +1432,7 @@ def test_run_execute_does_not_cancel_stops_when_only_buys(cfg):
         mock_today.return_value = __import__("datetime").date(2026, 9, 4)
         rc = run_execute(cfg)
     assert rc == 0
-    assert "cancel_stops_for" not in [c[0] for c in broker.method_calls]
+    assert "cancel_protection_for" not in [c[0] for c in broker.method_calls]
 
 
 def test_memory_lock_covers_all_write_paths():
@@ -1873,8 +1897,28 @@ def _exec_broker(cash=10_000.0):
     broker = MagicMock()
     broker.get_positions_and_cash.return_value = ({}, cash)
     broker.cancel_stops_for.return_value = {}
+    broker.cancel_protection_for.return_value = {}
     broker.place_market_orders.return_value = []
     return broker
+
+
+def test_stop_sweep_recognizes_oco_as_existing_protection(cfg):
+    """The OCO stop child is absent from flat orders, but must suppress the
+    sweep's plain-stop placement or the position could be double-sold."""
+    import daily_run
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 3}, 10_000.0)
+    broker.get_resting_protection.return_value = {
+        "AAPL": [{"kind": "oco", "order_id": "oco-1", "qty": 3,
+                  "target_price": 120.0, "stop_price": 92.0}]}
+    broker._client.get_orders.return_value = []
+    with patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0):
+        daily_run._ensure_stop_sweep(cfg)
+    broker.get_resting_protection.assert_called_once()
+    broker._client.submit_order.assert_not_called()
+    broker.place_stop.assert_not_called()
 
 
 def _run_exec(cfg, broker, day="2026-09-04"):
@@ -1921,7 +1965,7 @@ class TestPmExecutionBinding:
         o = orders[0]
         assert (o.action, o.shares, o.protection_price, o.stop_price) == (
             "SELL", 2, 100.5, 95.6)
-        assert broker.cancel_stops_for.call_args[0][0] == ["EL"]
+        assert broker.cancel_protection_for.call_args[0][0] == ["EL"]
 
     def test_explicit_empty_block_overrides_legacy_exit(self, cfg):
         cfg["pm_execution"] = True
@@ -1932,6 +1976,19 @@ class TestPmExecutionBinding:
         assert _run_exec(cfg, broker) == 0
         orders = broker.place_market_orders.call_args[0][0]
         assert orders == []
+
+    def test_execute_rechecks_invalid_target_before_honoring_gate_bind(self, cfg):
+        """A malformed/stale gate artifact cannot turn a rating exit into
+        a no-op: execute re-runs target validation and uses legacy instead."""
+        cfg["pm_execution"] = True
+        _write_gate(cfg, bind=["EL"])
+        _ratings_v2_file(cfg, {"EL": "Underweight"}, {"EL": {
+            "orders": [], "take_profit_px": 99.0}})
+        broker = _exec_broker()
+        broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
+        assert _run_exec(cfg, broker) == 0
+        orders = broker.place_market_orders.call_args[0][0]
+        assert [(o.action, o.shares) for o in orders] == [("SELL", 8)]
 
     def test_invalid_block_falls_back_to_legacy(self, cfg):
         cfg["pm_execution"] = True
@@ -1967,7 +2024,7 @@ class TestPmExecutionBinding:
             "orders": [{"kind": "SELL", "shares": 2, "limit_px": 100.5}]}})
         broker = _exec_broker()
         broker.get_positions_and_cash.return_value = ({"EL": 8}, 8_324.0)
-        broker.cancel_stops_for.return_value = {
+        broker.cancel_protection_for.return_value = {
             "EL": [{"stop_price": 95.6, "qty": 8}]}
         assert _run_exec(cfg, broker) == 0
         orders = broker.place_market_orders.call_args[0][0]
@@ -2186,6 +2243,140 @@ def test_execution_outcomes_binding_maintain_and_buy():
     assert msft["stop_anchored"] is None
 
 
+def test_execution_outcomes_include_resting_oco_protection():
+    """Tomorrow's PM must see the current target/stop, not only today's
+    day orders, so re-affirmation is an informed choice."""
+    from daily_run import _execution_outcomes
+
+    out = _execution_outcomes(
+        {"ratings": {"AAPL": "Hold"}, "execution": {"AAPL": {"orders": []}}},
+        [], [], {"AAPL": 3}, {"verdict": "PASS", "reasons": []},
+        bound_tickers={"AAPL"},
+        protection_rows=[{"ticker": "AAPL", "action": "oco_set", "qty": 3,
+                          "target_px": 120.0, "stop_px": 92.0}])
+    assert out["AAPL"]["protection"] == {
+        "kind": "oco", "target_px": 120.0, "stop_px": 92.0, "qty": 3}
+
+
+def test_reconcile_protection_keeps_matching_oco_without_churn(cfg):
+    """Daily re-affirmation must not cancel/recreate unchanged OCOs; doing
+    so creates an avoidable interval where an overnight position is naked."""
+    from daily_run import _reconcile_protection
+    from decisions import ProtectionIntent
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 3}, 10_000.0)
+    broker.get_resting_protection.return_value = {
+        "AAPL": [{"kind": "oco", "order_id": "oco-1", "qty": 3,
+                  "target_price": 120.0, "stop_price": 92.0}]}
+
+    rows = _reconcile_protection(
+        cfg, broker, {"AAPL": ProtectionIntent("AAPL", 120.0, 92.0)})
+
+    assert rows == [{"ticker": "AAPL", "action": "oco_keep", "qty": 3,
+                     "target_px": 120.0, "stop_px": 92.0}]
+    broker.cancel_protection.assert_not_called()
+    broker.place_oco.assert_not_called()
+
+
+def test_reconcile_protection_replaces_plain_stop_with_oco(cfg):
+    """A valid target upgrades existing stop-only protection after today's
+    fills settle, using the live post-fill share count."""
+    from daily_run import _reconcile_protection
+    from decisions import ProtectionIntent
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 3}, 10_000.0)
+    broker.get_resting_protection.return_value = {
+        "AAPL": [{"kind": "stop", "order_id": "stop-1", "qty": 3,
+                  "stop_price": 92.0}]}
+    broker.place_oco.return_value = "oco-2"
+
+    rows = _reconcile_protection(
+        cfg, broker, {"AAPL": ProtectionIntent("AAPL", 120.0, 92.0)})
+
+    assert rows[0]["action"] == "oco_replace"
+    broker.cancel_protection.assert_called_once_with("stop-1")
+    broker.place_oco.assert_called_once_with("AAPL", 3, 92.0, 120.0)
+
+
+def test_reconcile_protection_downgrades_unreaffirmed_oco_to_stop(cfg):
+    """No target in today's valid block removes only the upside target;
+    the original stop level remains continuously enforced."""
+    from daily_run import _reconcile_protection
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 3}, 10_000.0)
+    broker.get_resting_protection.return_value = {
+        "AAPL": [{"kind": "oco", "order_id": "oco-1", "qty": 3,
+                  "target_price": 120.0, "stop_price": 92.0}]}
+    broker.place_stop.return_value = True
+
+    rows = _reconcile_protection(cfg, broker, {})
+
+    assert rows == [{"ticker": "AAPL", "action": "downgrade", "qty": 3,
+                     "stop_px": 92.0}]
+    broker.cancel_protection.assert_called_once_with("oco-1")
+    broker.place_stop.assert_called_once_with("AAPL", 3, 92.0)
+
+
+def test_reconcile_protection_uses_plain_stop_after_oco_submit_failure(cfg):
+    """A failed OCO request after cancellation must immediately use the
+    retrying plain-stop path; target failure can never make a position naked."""
+    from daily_run import _reconcile_protection
+    from decisions import ProtectionIntent
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 3}, 10_000.0)
+    broker.get_resting_protection.return_value = {}
+    broker.place_oco.side_effect = RuntimeError("OCO rejected")
+    broker.place_stop.return_value = True
+
+    rows = _reconcile_protection(
+        cfg, broker, {"AAPL": ProtectionIntent("AAPL", 120.0, 92.0)})
+
+    assert rows == [{"ticker": "AAPL", "action": "stop_fallback", "qty": 3,
+                     "stop_px": 92.0, "target_px": 120.0}]
+    broker.place_stop.assert_called_once_with("AAPL", 3, 92.0)
+
+
+def test_reconcile_protection_does_not_mutate_after_snapshot_failure(cfg):
+    """The snapshot is the precondition for cancellation; if it fails, no
+    broker-side order may be touched based on stale/incomplete state."""
+    from daily_run import _reconcile_protection
+    from decisions import ProtectionIntent
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 3}, 10_000.0)
+    broker.get_resting_protection.side_effect = RuntimeError("broker down")
+
+    rows = _reconcile_protection(
+        cfg, broker, {"AAPL": ProtectionIntent("AAPL", 120.0, 92.0)})
+
+    assert rows == []
+    broker.cancel_protection.assert_not_called()
+    broker.place_oco.assert_not_called()
+    broker.place_stop.assert_not_called()
+
+
+def test_reconcile_protection_cancels_protection_for_a_flat_symbol(cfg):
+    """A stale broker-side exit on a closed position could short a future
+    re-entry, so it is removed without installing a replacement."""
+    from daily_run import _reconcile_protection
+
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({}, 10_000.0)
+    broker.get_resting_protection.return_value = {
+        "AAPL": [{"kind": "oco", "order_id": "oco-1", "qty": 3,
+                  "target_price": 120.0, "stop_price": 92.0}]}
+
+    rows = _reconcile_protection(cfg, broker, {})
+
+    assert rows == [{"ticker": "AAPL", "action": "cancel_unheld", "qty": 3}]
+    broker.cancel_protection.assert_called_once_with("oco-1")
+    broker.place_stop.assert_not_called()
+
+
 def test_run_execute_appends_outcome_events(cfg):
     """Execution must write the day's outcome into the per-ticker card
     store (intent + truth), once per analyzed ticker."""
@@ -2209,6 +2400,31 @@ def test_run_execute_appends_outcome_events(cfg):
     assert outcome["date"] == "2026-08-31"
     assert outcome["actual"][0]["filled"] == 10
     assert outcome["remaining"] == 10
+
+
+def test_run_execute_reconciles_bound_held_take_profit_into_log_and_card(cfg):
+    """A held PM target creates a resting OCO only after the batch settles,
+    and the executable record plus next-day card expose its exact levels."""
+    cfg["pm_execution"] = True
+    _write_gate(cfg, bind=["AAPL"])
+    _ratings_v2_file(cfg, {"AAPL": "Hold"}, {"AAPL": {
+        "orders": [], "take_profit_px": 120.0}})
+    broker = _exec_broker()
+    broker.get_positions_and_cash.return_value = ({"AAPL": 3}, 10_000.0)
+    broker.get_resting_protection.return_value = {}
+    broker.place_oco.return_value = "oco-1"
+    with patch("daily_run.create_broker", return_value=broker), \
+         patch("daily_run._last_close", return_value=100.0), \
+         patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.TODAY_ET") as mock_today, \
+         patch("decision_cards.append_outcome") as append_outcome:
+        mock_today.return_value = __import__("datetime").date(2026, 9, 4)
+        assert run_execute(cfg) == 0
+
+    log = _executed_payload(cfg, "2026-09-04")
+    assert log["protection"] == [{"ticker": "AAPL", "action": "oco_set", "qty": 3,
+                                   "target_px": 120.0, "stop_px": 92.0}]
+    assert append_outcome.call_args[0][1]["protection"]["kind"] == "oco"
 
 
 def test_run_execute_dry_run_writes_no_outcomes(cfg):
@@ -2307,29 +2523,19 @@ def test_stop_sweep_attaches_missing_stops():
     cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
 
     broker = MagicMock()
-    broker._client = MagicMock()
     # Holdings: AAPL and TSLA
     broker.get_positions_and_cash.return_value = ({"AAPL": 10, "TSLA": 5}, 10000.0)
-    # Open orders: only AAPL has a stop
-    stop_order = MagicMock()
-    stop_order.symbol = "AAPL"
-    stop_order.type.value = "stop"
-    stop_order.time_in_force.value = "gtc"
-    broker._client.get_orders.return_value = [stop_order]
+    # Nested protection snapshot: only AAPL has a stop.
+    broker.get_resting_protection.return_value = {
+        "AAPL": [{"kind": "stop", "order_id": "stop-aapl", "qty": 10,
+                  "stop_price": 138.0}]}
 
     with patch("daily_run.create_broker", return_value=broker), \
          patch("daily_run._last_close", side_effect=lambda t: {"AAPL": 150.0, "TSLA": 200.0}.get(t)):
         _ensure_stop_sweep(cfg)
 
-    # Should only attach stop for TSLA (AAPL already has one)
-    assert broker._client.submit_order.call_count == 1
-    submitted_req = broker._client.submit_order.call_args[0][0]
-    assert submitted_req.symbol == "TSLA"
-    assert submitted_req.qty == 5
-    assert submitted_req.type.value == "stop"
-    # stop_px = 200.0 * (1 - 8/100) = 200.0 * 0.92 = 184.0
-    assert submitted_req.stop_price == 184.0
-    assert submitted_req.time_in_force.value == "gtc"
+    # Should only attach stop for TSLA (AAPL already has one).
+    broker.place_stop.assert_called_once_with("TSLA", 5, 184.0)
 
 
 def test_stop_sweep_skips_when_no_last_close():
@@ -2341,16 +2547,15 @@ def test_stop_sweep_skips_when_no_last_close():
     cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
 
     broker = MagicMock()
-    broker._client = MagicMock()
     broker.get_positions_and_cash.return_value = ({"AAPL": 10}, 10000.0)
-    broker._client.get_orders.return_value = []
+    broker.get_resting_protection.return_value = {}
 
     with patch("daily_run.create_broker", return_value=broker), \
          patch("daily_run._last_close", return_value=None):
         _ensure_stop_sweep(cfg)
 
     # Should not submit any order (no last close)
-    broker._client.submit_order.assert_not_called()
+    broker.place_stop.assert_not_called()
 
 
 def test_stop_sweep_failure_safe():
@@ -2378,21 +2583,18 @@ def test_stop_sweep_idempotent():
     cfg = {"stop_loss_pct": 8.0, "broker": "alpaca", "alpaca": {"paper": True}}
 
     broker = MagicMock()
-    broker._client = MagicMock()
     broker.get_positions_and_cash.return_value = ({"AAPL": 10}, 10000.0)
-    # AAPL already has a GTC stop
-    stop_order = MagicMock()
-    stop_order.symbol = "AAPL"
-    stop_order.type.value = "stop"
-    stop_order.time_in_force.value = "gtc"
-    broker._client.get_orders.return_value = [stop_order]
+    # AAPL already has a GTC stop.
+    broker.get_resting_protection.return_value = {
+        "AAPL": [{"kind": "stop", "order_id": "stop-aapl", "qty": 10,
+                  "stop_price": 138.0}]}
 
     with patch("daily_run.create_broker", return_value=broker), \
          patch("daily_run._last_close", return_value=150.0):
         _ensure_stop_sweep(cfg)
 
     # Should not submit any order (already stopped)
-    broker._client.submit_order.assert_not_called()
+    broker.place_stop.assert_not_called()
 
 
 def test_stop_sweep_skips_when_no_holdings():
@@ -2409,6 +2611,6 @@ def test_stop_sweep_skips_when_no_holdings():
     with patch("daily_run.create_broker", return_value=broker):
         _ensure_stop_sweep(cfg)
 
-    # Should not query orders or submit anything
-    broker._client.get_orders.assert_not_called()
-    broker._client.submit_order.assert_not_called()
+    # Should not query protection or submit anything.
+    broker.get_resting_protection.assert_not_called()
+    broker.place_stop.assert_not_called()

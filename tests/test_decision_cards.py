@@ -278,6 +278,14 @@ class TestOutcomes:
             "EL", [_card(DATE, "Hold")], outcomes=[o])
         assert "exit completed manually" in block
 
+    def test_render_outcome_includes_resting_oco_levels(self, store):
+        o = self._outcome(protection={"kind": "oco", "qty": 3,
+                                      "target_px": 120.0, "stop_px": 92.0})
+        block = decision_cards.render_prior_decisions(
+            "EL", [_card(DATE, "Hold")], outcomes=[o])
+        assert "OCO target $120.00" in block
+        assert "stop $92.00" in block
+
     def test_corrected_outcome_supersedes_in_render(self, store):
         """Reconciliation appends a corrected outcome for the same date; the
         renderer must use the LATEST event (ZBRA 2026-09-10: the card said
