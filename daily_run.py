@@ -737,36 +737,52 @@ def _ensure_edgar_fundamentals(cfg: dict) -> None:
 
         def make_wrapped(tool_name, orig):
             def wrapped(*args, **kwargs):
+                ticker = kwargs.get("ticker", args[0] if args else "")
                 try:
                     if tool_name == "get_fundamentals":
-                        ticker = kwargs.get("ticker", args[0] if args else "")
                         curr_date = kwargs.get("curr_date",
                                                args[1] if len(args) > 1 else "")
                         return fundamentals_edgar.payload_for(ticker, curr_date)
                     freq = kwargs.get("freq", "quarterly")
                     curr_date = kwargs.get("curr_date")
-                    ticker = kwargs.get("ticker", args[0] if args else "")
                     return fundamentals_edgar.statements_for(
                         tool_name, ticker, freq, curr_date)
-                except edgar.EdgarError:
-                    logger.warning("EDGAR fundamentals failed for %s; "
-                                   "falling back to yfinance", tool_name)
+                except edgar.EdgarError as exc:
+                    _report_edgar_fallback(tool_name, ticker, exc)
+                    logger.warning("EDGAR fundamentals failed for %s (%s); "
+                                   "falling back to yfinance", tool_name, ticker)
                     return orig(*args, **kwargs)
                 except Exception as exc:  # noqa: BLE001
                     # The never-dark guarantee covers UNEXPECTED failures too
                     # (latent bugs, freak XBRL shapes raising KeyError deep in
                     # the render path) — an agent must never face a tool error
-                    # with no fundamentals. Loud on purpose: the per-day
+                    # with no fundamentals. Loud on purpose: the per-ticker
                     # fallback count in summary.json surfaces every case.
+                    _report_edgar_fallback(tool_name, ticker, exc)
                     logger.error("EDGAR fundamentals UNEXPECTED failure for "
-                                 "%s (%s: %s); falling back to yfinance",
-                                 tool_name, type(exc).__name__, exc)
+                                 "%s (%s) (%s: %s); falling back to yfinance",
+                                 tool_name, ticker, type(exc).__name__, exc)
                     return orig(*args, **kwargs)
             wrapped._wrapped_original = orig
             return wrapped
 
         tool.func = make_wrapped(name, original)
     _EDGAR_FUNDAMENTALS_PATCHED = True
+
+
+def _report_edgar_fallback(tool_name: str, ticker: str, exc: Exception) -> None:
+    """Count/attribute an EDGAR→yfinance fallback to its ticker (best-effort).
+
+    The structured logger is thread-local; bare runs (tests, smoke) have no
+    active logger and the event is a no-op. Must never break the tool.
+    """
+    try:
+        import structured_log
+        structured_log.emit_edgar_fallback(
+            tool=tool_name, ticker=str(ticker or ""),
+            reason=f"{type(exc).__name__}: {exc}")
+    except Exception:  # noqa: BLE001 — logging must never break the tool
+        pass
 
 
 # --- market tape + corporate events (context injection) ---------------------

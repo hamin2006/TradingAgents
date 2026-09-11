@@ -72,6 +72,7 @@ class TestEdgarFundamentalsInstaller:
         from tradingagents.agents.utils import fundamental_data_tools as fdt
 
         daily_run._reset_edgar_fundamentals()
+        true_orig = fdt.get_fundamentals.func
         fdt.get_fundamentals.func = lambda t, d: "YF-FALLBACK"  # fake original
 
         def boom(_t, _d):
@@ -85,8 +86,7 @@ class TestEdgarFundamentalsInstaller:
             assert out == "YF-FALLBACK"
         finally:
             daily_run._reset_edgar_fundamentals()
-            fdt.get_fundamentals.func = fdt.get_fundamentals.func._wrapped_original \
-                if hasattr(fdt.get_fundamentals.func, "_wrapped_original") else None
+            fdt.get_fundamentals.func = true_orig
 
     def test_unexpected_edgar_error_still_falls_back(self, monkeypatch):
         """The never-dark guarantee covers UNEXPECTED failures too: a latent
@@ -96,6 +96,7 @@ class TestEdgarFundamentalsInstaller:
         from tradingagents.agents.utils import fundamental_data_tools as fdt
 
         daily_run._reset_edgar_fundamentals()
+        true_orig = fdt.get_fundamentals.func
         fdt.get_fundamentals.func = lambda t, d: "YF-FALLBACK"  # fake original
 
         def boom(_t, _d):
@@ -109,8 +110,50 @@ class TestEdgarFundamentalsInstaller:
             assert out == "YF-FALLBACK"
         finally:
             daily_run._reset_edgar_fundamentals()
-            fdt.get_fundamentals.func = fdt.get_fundamentals.func._wrapped_original \
-                if hasattr(fdt.get_fundamentals.func, "_wrapped_original") else None
+            fdt.get_fundamentals.func = true_orig
+
+    @pytest.mark.parametrize("exc", [
+        edgar.EdgarError("only 0 revenue quarters on file"),
+        KeyError("freak XBRL shape"),
+    ])
+    def test_fallback_reports_ticker_to_structured_log(self, monkeypatch,
+                                                       tmp_path, caplog, exc):
+        """Every EDGAR fallback must be attributable to a ticker in the
+        structured log (summary.json ``edgar_fallbacks``) and in the warning
+        line — cron's tool-name-only message forced a full replay to find
+        APA (2026-09-11)."""
+        import logging
+
+        import structured_log
+        from tradingagents.agents.utils import fundamental_data_tools as fdt
+
+        daily_run._reset_edgar_fundamentals()
+        true_orig = fdt.get_fundamentals.func
+        fdt.get_fundamentals.func = lambda t, d: "YF-FALLBACK"
+        logger = structured_log.StructuredRunLogger(
+            ticker="APA", out_dir=str(tmp_path))
+        structured_log.set_active_logger(logger)
+
+        def boom(_t, _d):
+            raise exc
+
+        monkeypatch.setattr(fundamentals_edgar, "payload_for", boom)
+        try:
+            daily_run._ensure_edgar_fundamentals(
+                {"fundamentals_source": "edgar"})
+            with caplog.at_level(logging.WARNING):
+                out = fdt.get_fundamentals.func("APA", "2026-09-11")
+            assert out == "YF-FALLBACK"
+        finally:
+            daily_run._reset_edgar_fundamentals()
+            structured_log.clear_active_logger()
+            fdt.get_fundamentals.func = true_orig
+
+        ev = logger._read_all()[-1]
+        assert ev["type"] == "edgar_fallback"
+        assert ev["ticker"] == "APA"
+        assert ev["tool"] == "get_fundamentals"
+        assert "APA" in "".join(r.getMessage() for r in caplog.records)
 
 
 class TestTapeAndEventsInstaller:

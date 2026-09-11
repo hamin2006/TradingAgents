@@ -180,6 +180,20 @@ def emit_structured_fallback(*, agent: str, error: str,
     run_log.emit_structured_fallback(agent=agent, error=error, mode=mode)
 
 
+def emit_edgar_fallback(*, tool: str, ticker: str, reason: str) -> None:
+    """Emit an edgar_fallback event into the current thread's log.
+
+    Records every EDGAR→yfinance fallback with its ticker so summary.json
+    answers "which tickers ran on yfinance today" without replaying the
+    batch (APA 2026-09-11: an SEC-side hole made the cron line tool-only).
+    No-op outside an analyze run.
+    """
+    run_log = get_active_logger()
+    if run_log is None:
+        return
+    run_log.emit_edgar_fallback(tool=tool, ticker=ticker, reason=reason)
+
+
 def emit_execution_intent(*, status: str, n_orders: int = 0,
                           reason: str | None = None) -> None:
     """Emit an execution_intent event (PM block compliance stream)."""
@@ -223,6 +237,7 @@ class StructuredRunLogger(BaseCallbackHandler):
         self._started_at = time.monotonic()
         self._llm_calls = 0
         self._total_tokens = 0
+        self._edgar_fallbacks = 0
 
     # -- helpers ------------------------------------------------------------
 
@@ -243,6 +258,12 @@ class StructuredRunLogger(BaseCallbackHandler):
                                  mode: str = "retry") -> None:
         self._emit({"type": "structured_fallback", "agent": agent,
                     "error": error, "mode": mode})
+
+    def emit_edgar_fallback(self, *, tool: str, ticker: str,
+                            reason: str = "") -> None:
+        self._edgar_fallbacks += 1
+        self._emit({"type": "edgar_fallback", "agent": "Fundamentals Analyst",
+                    "tool": tool, "ticker": ticker, "reason": reason[:200]})
 
     def emit_execution_intent(self, *, status: str, n_orders: int = 0,
                               reason: str | None = None) -> None:
@@ -408,6 +429,7 @@ class StructuredRunLogger(BaseCallbackHandler):
                     "git_sha": self.git_sha,
                     "total_llm_calls": self._llm_calls,
                     "total_tokens": self._total_tokens,
+                    "edgar_fallbacks": self._edgar_fallbacks,
                     "wall_clock_s": wall})
         summary_path = self.path.parent / "summary.json"
         summary: dict = {}
@@ -420,6 +442,7 @@ class StructuredRunLogger(BaseCallbackHandler):
             "rating": rating,
             "llm_calls": self._llm_calls,
             "total_tokens": self._total_tokens,
+            "edgar_fallbacks": self._edgar_fallbacks,
             "wall_clock_s": wall,
             "git_sha": self.git_sha,
         }

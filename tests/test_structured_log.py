@@ -266,6 +266,32 @@ class TestActiveLogger:
         assert ev["mode"] == "retry"
         assert ev["ticker"] == "AAPL"
 
+    def test_emit_edgar_fallback_event_and_summary(self, logger_fx, tmp_path):
+        """EDGAR fallbacks are attributed per ticker so summary.json shows
+        which tickers silently ran on yfinance (APA 2026-09-11 attribution
+        previously required replaying the whole batch)."""
+        structured_log.set_active_logger(logger_fx)
+        try:
+            structured_log.emit_edgar_fallback(
+                tool="get_fundamentals", ticker="APA",
+                reason="EdgarError: only 0 revenue quarters on file")
+        finally:
+            structured_log.clear_active_logger()
+
+        ev = logger_fx._read_all()[-1]
+        assert ev["type"] == "edgar_fallback"
+        assert ev["ticker"] == "APA"
+        assert ev["tool"] == "get_fundamentals"
+        assert "0 revenue quarters" in ev["reason"]
+
+        logger_fx.finish(rating="Overweight")
+        summary = json.loads(
+            (tmp_path / "summary.json").read_text(encoding="utf-8"))
+        assert summary["AAPL"]["edgar_fallbacks"] == 1
+        run_end = [e for e in logger_fx._read_all()
+                   if e["type"] == "run_end"][-1]
+        assert run_end["edgar_fallbacks"] == 1
+
 
 class TestToolAttribution:
     def test_tools_node_maps_to_analyst(self, logger_fx):
