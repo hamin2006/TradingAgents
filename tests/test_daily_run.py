@@ -880,6 +880,142 @@ def test_run_binding_gate_swallows_failures(cfg):
         daily_run._run_binding_gate(cfg, "2026-09-05")  # no raise
 
 
+# --- broker outcome reconciliation (broker-side stop fills) ------------------
+
+def _outcome_event(ticker, date, remaining, **kw):
+    event = {"type": "execution_outcome", "schema_version": 1, "date": date,
+             "ticker": ticker, "binding_active": False, "gate_verdict": None,
+             "gate_reasons": [], "pm_orders": None, "actual": [],
+             "remaining": remaining, "stop_anchored": None, "note": None}
+    event.update(kw)
+    return event
+
+
+def _write_outcome_day(cfg, day="2026-09-10"):
+    import pathlib
+
+    from decision_cards import append_outcome
+
+    results = pathlib.Path(cfg["results_dir"])
+    results.mkdir(parents=True, exist_ok=True)
+    (results / f"executed_{day}.json").write_text("{}", encoding="utf-8")
+    (results / f"ratings_{day}.json").write_text(
+        json.dumps({"date": day,
+                    "ratings": {"ZBRA": "Hold", "DXCM": "Hold"}}),
+        encoding="utf-8")
+    append_outcome(results, _outcome_event("ZBRA", day, 1))
+    append_outcome(results, _outcome_event("DXCM", day, 9))
+    return results
+
+
+def test_reconcile_broker_outcomes_corrects_stop_fills(cfg):
+    """ZBRA class: the broker-side stop sold the last share after execute
+    wrote '1 remain'. Reconciliation restates the row from broker truth and
+    records the stop fill; idempotent on rerun."""
+    import daily_run
+    from decision_cards import load_outcomes
+
+    results = _write_outcome_day(cfg)
+    broker = MagicMock()
+    broker.get_positions_and_cash.return_value = ({"DXCM": 9}, 7000.0)
+    broker.get_filled_stop_orders.return_value = [
+        {"symbol": "ZBRA", "qty": 1, "avg_price": 336.08,
+         "filled_at": "2026-09-10T13:31:40+00:00", "side": "sell"}]
+
+    with patch("daily_run._seconds_until_open", return_value=1000.0), \
+         patch("daily_run.create_broker", return_value=broker):
+        corrected = daily_run._reconcile_broker_outcomes(cfg,
+                                                         today="2026-09-11")
+    assert corrected == 1
+    broker.connect.assert_called_once()
+    broker.disconnect.assert_called_once()
+
+    zbra = [e for e in load_outcomes(results, "ZBRA")
+            if e["date"] == "2026-09-10"]
+    latest = zbra[-1]
+    assert latest["remaining"] == 0
+    assert latest["reconciled"] is True
+    assert any(a.get("source") == "broker-stop" for a in latest["actual"])
+    assert "stop filled" in latest["note"]
+    # untouched ticker: still exactly one event, not reconciled
+    dxcm = [e for e in load_outcomes(results, "DXCM")
+            if e["date"] == "2026-09-10"]
+    assert len(dxcm) == 1
+    assert dxcm[0].get("reconciled") is None
+
+    # idempotent: rerun makes no changes
+    with patch("daily_run._seconds_until_open", return_value=1000.0), \
+         patch("daily_run.create_broker", return_value=broker):
+        assert daily_run._reconcile_broker_outcomes(
+            cfg, today="2026-09-11") == 0
+    assert len([e for e in load_outcomes(results, "ZBRA")
+                if e["date"] == "2026-09-10"]) == 2
+
+
+def test_reconcile_broker_outcomes_skips_when_session_open(cfg):
+    """Position truth is only valid before the open — a mid-day manual
+    analyze must never restate yesterday's rows from intraday positions."""
+    import daily_run
+
+    _write_outcome_day(cfg)
+    with patch("daily_run._seconds_until_open", return_value=0.0), \
+         patch("daily_run.create_broker") as broker_mock:
+        assert daily_run._reconcile_broker_outcomes(
+            cfg, today="2026-09-11") == 0
+    broker_mock.assert_not_called()
+
+
+def test_reconcile_broker_outcomes_failure_safe(cfg):
+    """Broker trouble must never break analyze — cards keep the
+    execute-time snapshot."""
+    import daily_run
+
+    _write_outcome_day(cfg)
+    with patch("daily_run._seconds_until_open", return_value=1000.0), \
+         patch("daily_run.create_broker",
+               side_effect=RuntimeError("broker down")):
+        assert daily_run._reconcile_broker_outcomes(
+            cfg, today="2026-09-11") == 0
+
+
+def test_reconcile_broker_outcomes_no_previous_day(cfg):
+    import daily_run
+
+    with patch("daily_run._seconds_until_open", return_value=1000.0):
+        assert daily_run._reconcile_broker_outcomes(
+            cfg, today="2026-09-11") == 0
+
+
+def test_run_analyze_reconciles_outcomes_when_execution_intent(cfg):
+    """Reconciliation runs before any PM prompt is built so the morning's
+    cards read the true end-of-day book."""
+    import daily_run
+
+    cfg["execution_intent"] = True
+
+    class FakeTradingAgentsGraph:
+        def __init__(self, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return None, "**Rating**: Hold"
+
+    daily_run._reset_pm_execution_schema()
+    daily_run._reset_decision_card_injection()
+    try:
+        with patch("daily_run.load_watchlist_config", return_value=cfg), \
+             patch("daily_run.TradingAgentsGraph", FakeTradingAgentsGraph), \
+             patch("daily_run.TradingMemoryLog") as mock_log, \
+             patch("structured_log.StructuredRunLogger"), \
+             patch("daily_run._reconcile_broker_outcomes") as reconcile_mock:
+            mock_log.return_value.load_entries.return_value = []
+            run_analyze(cfg, tickers=["AAPL"])
+    finally:
+        daily_run._reset_pm_execution_schema()
+        daily_run._reset_decision_card_injection()
+    reconcile_mock.assert_called_once_with(cfg)
+
+
 def test_run_execute_kill_switch_blocks(cfg, tmp_path):
     (tmp_path / "DISABLE_TRADING").write_text("")
     with patch("daily_run.load_watchlist_config", return_value=cfg), \

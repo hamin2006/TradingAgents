@@ -27,6 +27,7 @@ import contextlib
 import logging
 import os
 import time
+from datetime import timedelta
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
@@ -554,3 +555,37 @@ class AlpacaBroker:
 
     def disconnect(self) -> None:
         pass  # stateless REST client; nothing to tear down
+
+    def get_filled_stop_orders(self, since, until) -> list[dict]:
+        """Broker-side stop fills with ``since <= filled_at < until``.
+
+        Resting GTC stops are not engine orders, so execute-outcome rows
+        cannot see their fills (ZBRA 2026-09-10: the stop sold the last
+        share while the card said "1 remain"). The submitted window is
+        widened because a stop can rest for weeks before it fires — the
+        client-side filter is on FILL time, not submission time.
+        Best-effort: returns [] on any error.
+        """
+        fills: list[dict] = []
+        try:
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED, limit=500,
+                after=since - timedelta(days=180))
+            for order in self._client.get_orders(request):
+                if order.type != "stop" or order.status != "filled":
+                    continue
+                filled_at = getattr(order, "filled_at", None)
+                if filled_at is None or not (since <= filled_at < until):
+                    continue
+                try:
+                    qty = int(float(order.qty))
+                    avg_price = float(order.filled_avg_price)
+                except (TypeError, ValueError):
+                    continue
+                fills.append({"symbol": order.symbol,
+                              "side": str(getattr(order, "side", "sell")),
+                              "qty": qty, "avg_price": avg_price,
+                              "filled_at": filled_at.isoformat()})
+        except Exception as exc:  # noqa: BLE001 — reconciliation is best-effort
+            logger.warning("could not fetch filled stop orders: %s", exc)
+        return fills

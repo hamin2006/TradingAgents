@@ -1,6 +1,7 @@
 """daily_run.py — daily pipeline orchestrator (watchlist assembly first)."""
 
 import argparse
+import contextlib
 import json
 import logging
 import sys
@@ -1818,6 +1819,8 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_tape_and_events()
     _ensure_stop_sweep(cfg)  # No-naked invariant: before analyze batch starts
     if cfg.get("execution_intent", False):
+        _reconcile_broker_outcomes(cfg)  # broker-side fills -> yesterday's cards
+    if cfg.get("execution_intent", False):
         _EXECUTION_MAP.clear()
         _ensure_pm_execution_schema(cfg)
         _ensure_decision_card_injection(cfg)
@@ -1970,6 +1973,110 @@ def _run_binding_gate(cfg: dict, date_str: str | None = None) -> None:
     except Exception as exc:  # noqa: BLE001 — execute fails closed without it
         logger.warning("binding gate failed to run (%s); execute will fall "
                        "back to legacy", exc)
+
+
+def _reconcile_broker_outcomes(cfg: dict, today: str | None = None) -> int:
+    """Correct the latest executed day's outcome rows with broker truth.
+
+    Broker-side GTC stop fills are not engine orders, so the execute pass
+    cannot see them — and they can fire after the outcomes are written
+    (ZBRA 2026-09-10: the card said "1 remain" while the stop had already
+    sold the last share, feeding a stale share count into future PM
+    prompts). Runs at analyze start, before any PM prompt is built, and
+    appends a corrected outcome event (the renderer uses the latest event
+    per date). Idempotent and fail-safe: broker trouble leaves the
+    execute-time snapshot untouched.
+    """
+    from decision_cards import append_outcome, load_outcomes
+
+    if _seconds_until_open() <= 0:
+        logger.info("outcome reconcile skipped: regular session already open "
+                    "(positions are only yesterday-close truth pre-open)")
+        return 0
+    today = today or _today_str()
+    results = Path(cfg["results_dir"])
+    dates = []
+    for path in results.glob("executed_*.json"):
+        date_part = path.stem[len("executed_"):]
+        try:
+            datetime.strptime(date_part, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if date_part < today:
+            dates.append(date_part)
+    if not dates:
+        return 0
+    date_str = max(dates)
+
+    try:
+        payload = json.loads(
+            (results / f"ratings_{date_str}.json").read_text(encoding="utf-8"))
+        tickers = sorted(payload.get("ratings", {}))
+    except (OSError, ValueError):
+        logger.warning("outcome reconcile: no ratings for %s; skipping",
+                       date_str)
+        return 0
+
+    positions: dict = {}
+    fills_by_symbol: dict[str, list[dict]] = {}
+    broker = None
+    try:
+        broker = create_broker(cfg)
+        broker.connect()
+        positions, _cash = broker.get_positions_and_cash()
+        getter = getattr(broker, "get_filled_stop_orders", None)
+        if callable(getter):
+            start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ET)
+            for fill in getter(start, start + timedelta(days=1)):
+                fills_by_symbol.setdefault(fill["symbol"], []).append(fill)
+    except Exception as exc:  # noqa: BLE001 — reconciliation is best-effort
+        logger.warning("outcome reconcile skipped (broker: %s); cards keep "
+                       "the execute-time snapshot", exc)
+        return 0
+    finally:
+        if broker is not None:
+            with contextlib.suppress(Exception):  # disconnect noise is not fatal
+                broker.disconnect()
+
+    corrected = 0
+    for ticker in tickers:
+        events = [e for e in load_outcomes(results, ticker)
+                  if e.get("date") == date_str]
+        if not events:
+            continue
+        current = events[-1]
+        if current.get("reconciled"):
+            continue
+        true_remaining = int(positions.get(ticker, 0) or 0)
+        fills = fills_by_symbol.get(ticker, [])
+        if true_remaining == current.get("remaining") and not fills:
+            continue
+        updated = dict(current)
+        updated["remaining"] = true_remaining
+        updated["reconciled"] = True
+        updated["reconciled_on"] = today
+        actual = list(current.get("actual") or [])
+        for fill in fills:
+            actual.append({"action": "SELL(STOP)", "shares": fill["qty"],
+                           "filled": fill["qty"],
+                           "avg_price": fill["avg_price"],
+                           "source": "broker-stop"})
+        updated["actual"] = actual
+        notes = [str(current["note"])] if current.get("note") else []
+        notes.extend(
+            f"broker-side stop filled {f['qty']} {ticker} "
+            f"@ ${f['avg_price']:.2f}" for f in fills)
+        if true_remaining != current.get("remaining") and not fills:
+            notes.append(
+                f"book reconciled from broker position ({true_remaining} held)")
+        if notes:
+            updated["note"] = "; ".join(notes)
+        append_outcome(results, updated)
+        corrected += 1
+    if corrected:
+        logger.info("outcome reconcile: corrected %d ticker(s) for %s",
+                    corrected, date_str)
+    return corrected
 
 
 def _execution_outcomes(payload: dict, orders: list, reports: list,

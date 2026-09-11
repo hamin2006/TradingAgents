@@ -278,6 +278,27 @@ class TestOutcomes:
             "EL", [_card(DATE, "Hold")], outcomes=[o])
         assert "exit completed manually" in block
 
+    def test_corrected_outcome_supersedes_in_render(self, store):
+        """Reconciliation appends a corrected outcome for the same date; the
+        renderer must use the LATEST event (ZBRA 2026-09-10: the card said
+        '1 remain' while the broker-side stop had already sold it)."""
+        original = self._outcome(remaining=1)
+        corrected = self._outcome(
+            remaining=0, reconciled=True,
+            actual=[{"action": "SELL(STOP)", "shares": 1, "filled": 1,
+                     "avg_price": 336.08, "source": "broker-stop"}],
+            note="broker-side stop filled 1 EL @ $336.08")
+        decision_cards.append_outcome(store, original)
+        decision_cards.append_outcome(store, corrected)
+
+        block = decision_cards.render_prior_decisions(
+            "EL", [_card(DATE, "Hold")],
+            outcomes=decision_cards.load_outcomes(store, "EL"))
+
+        assert "0 remain" in block
+        assert "1 remain" not in block
+        assert "broker-side stop filled" in block
+
     def test_append_outcome_failure_safe(self, tmp_path):
         """An outcome write must never raise (execution already done)."""
         blocker = tmp_path / "afile"

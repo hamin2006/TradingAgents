@@ -1017,3 +1017,40 @@ def test_remainder_stop_stops_retrying_when_position_gone(broker):
         ok = b._submit_remainder_stop("DXCM", 9, 81.4)
     assert ok is False
     assert mock_client.submit_order.call_count == 1
+
+
+def test_get_filled_stop_orders_filters_by_fill_window_type_and_status(broker):
+    """Reconciliation needs broker-side stop fills by FILL time (a stop can
+    be submitted weeks before it fires), excluding non-stop and unfilled."""
+    from datetime import datetime, timezone
+
+    b, mock_client, _ = broker
+
+    def order(symbol, type_, status, filled_at, qty="1", px="336.08"):
+        o = MagicMock()
+        o.symbol = symbol
+        o.type = type_
+        o.status = status
+        o.filled_at = filled_at
+        o.qty = qty
+        o.filled_avg_price = px
+        o.side = "sell"
+        return o
+
+    inside = datetime(2026, 9, 10, 13, 31, tzinfo=timezone.utc)
+    outside = datetime(2026, 9, 8, 13, 31, tzinfo=timezone.utc)
+    mock_client.get_orders.return_value = [
+        order("ZBRA", "stop", "filled", inside),
+        order("ZBRA", "stop", "filled", outside),
+        order("DELL", "limit", "filled", inside),
+        order("HPE", "stop", "canceled", None),
+    ]
+    since = datetime(2026, 9, 10, 4, 0, tzinfo=timezone.utc)
+    until = datetime(2026, 9, 11, 4, 0, tzinfo=timezone.utc)
+
+    fills = b.get_filled_stop_orders(since, until)
+
+    assert len(fills) == 1
+    assert fills[0]["symbol"] == "ZBRA"
+    assert fills[0]["qty"] == 1
+    assert fills[0]["avg_price"] == pytest.approx(336.08)
