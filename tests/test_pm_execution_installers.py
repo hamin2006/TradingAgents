@@ -134,6 +134,32 @@ class TestSchemaSwapInstaller:
         assert "`limit_px` on a SELL is a floor" in prompt
         assert "day-expiry" in prompt
 
+    def test_contract_disclosure_requires_whole_share_entries(self, pm_cfg):
+        """MU/SNDK class (live 2026-09-10/11): a dollar entry below one
+        share's price sizes to 0 shares, reads as empty-on-buy, and the gate
+        marks the ticker legacy. The disclosure must state the whole-share
+        minimum and the shares alternative."""
+        daily_run._PM_SCHEMA_PATCHED = False
+        daily_run._ensure_pm_execution_schema(pm_cfg)
+
+        captured = []
+
+        from types import SimpleNamespace
+        fake_decision = SimpleNamespace(
+            model_dump=lambda mode="json": {"rating": "Hold"})
+
+        class FakeStructured:
+            def invoke(self, prompt):
+                captured.append(prompt)
+                return fake_decision
+
+        structured_mod.invoke_structured_or_freetext(
+            FakeStructured(), object(), "PM body", lambda d: "x",
+            "Portfolio Manager")
+        prompt = captured[0]
+        assert "whole-share only" in prompt
+        assert "minimum 1" in prompt
+
     def test_contract_disclosure_pm_only(self, pm_cfg):
         """Other agents' prompts pass through untouched."""
         daily_run._PM_SCHEMA_PATCHED = False

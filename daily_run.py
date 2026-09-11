@@ -1458,6 +1458,7 @@ def _ensure_pm_execution_schema(cfg: dict) -> None:
 - `orders: []` on a ticker you HOLD is valid (a deliberate maintain decision).
 - `orders: []` on a ticker you DON'T hold but rate Buy/Overweight is an ENGINE FAILURE: either size an entry (shares OR value_usd) or reconsider the rating. The gate marks such blocks legacy (that ticker will not bind today).
 - Full exit: `shares` equal to the held quantity. Partial trim: fewer shares (or `fraction_held`); set `stop_px` for the remainder.
+- Entries are whole-share only: `value_usd` below one share's price sizes to ZERO shares and the gate marks the ticker legacy. For a ticker whose price exceeds your intended dollar amount, size in `shares` (minimum 1); no fractionals.
 - `limit_px` on a SELL is a floor (day-expiry if never reached); buys get a +2% protection ceiling automatically.
 - Orders are day-expiry and fill at/after the 09:30 ET open; `stop_px` becomes a broker-side GTC stop protecting fills and remainders.
 """

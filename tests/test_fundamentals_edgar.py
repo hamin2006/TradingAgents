@@ -108,6 +108,25 @@ class TestFundamentalsPayload:
     def test_structural_quality_passes_on_sound_payload(self, facts):
         assert fe.structural_quality(facts, "2026-08-01") == []
 
+    def test_including_assessed_tax_revenue_served(self):
+        """VLO class (live 2026-09-11): the filer tags consolidated revenue
+        only under RevenueFromContractWithCustomerIncludingAssessedTax
+        (energy filers include excise taxes). Missing from the chain => 0
+        revenue quarters => the structural gate rejects the payload and the
+        ticker falls back to yfinance every day."""
+        raw = companyfacts()
+        us = raw["facts"]["us-gaap"]
+        us["RevenueFromContractWithCustomerIncludingAssessedTax"] = \
+            us.pop("Revenues")
+        facts = edgar.Facts(raw)
+
+        assert fe.structural_quality(facts, "2026-08-01") == []
+        out = fe.render_fundamentals(facts, "VLO", "2026-08-01",
+                                     price=150.0, identity=_identity(),
+                                     consensus=_consensus())
+        assert "Revenue (TTM)" in out
+        assert "15,990.0" in out
+
     def test_structural_quality_flags_stale_statements(self, facts):
         reasons = fe.structural_quality(facts, "2026-11-15")
         assert any("old" in r for r in reasons)

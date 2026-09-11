@@ -31,6 +31,7 @@ import edgar
 _USD_M = "USD M"
 
 _REVENUE_TAGS = ["RevenueFromContractWithCustomerExcludingAssessedTax",
+                 "RevenueFromContractWithCustomerIncludingAssessedTax",
                  "Revenues", "SalesRevenueNet"]
 _GP_TAGS = ["GrossProfit"]
 _OPINC_TAGS = ["OperatingIncomeLoss"]
