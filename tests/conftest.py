@@ -56,6 +56,19 @@ def _isolate_config():
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
 
 
+@pytest.fixture(autouse=True)
+def _reset_daily_run_memory_patch():
+    """The REVIEW memory-log patch lives on framework classes (installed by
+    run_analyze); reset it after every test so later files see pristine
+    framework behavior (Hold default, no heal)."""
+    yield
+    import sys
+
+    mod = sys.modules.get("daily_run")
+    if mod is not None and getattr(mod, "_MEMORY_REVIEW_PATCHED", False):
+        mod._reset_memory_review_tag()
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()

@@ -392,6 +392,109 @@ def test_analyst_report_passthrough_when_present(factory_name):
     assert out[report_key] == "full report text"
 
 
+# --- empty PM decision retry (PSX class: provider window -> REVIEW) ----------
+
+def test_empty_pm_decision_retries_and_recovers(cfg):
+    """All-provider-error windows produce an empty PM decision (REVIEW, no
+    exception). That must trigger one full retry — MSFT-class recovered on
+    its own; PSX 2026-09-10 silently no-op'd a whole day."""
+    import os
+    import pathlib
+
+    import daily_run
+
+    calls = {"n": 0}
+
+    class FakeGraph:
+        def __init__(self, config=None, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"final_trade_decision": ""}, "REVIEW"
+            return ({"final_trade_decision":
+                     "Rating: Overweight\nRecovered: all provider errors"},
+                    "Overweight")
+
+    with patch("daily_run.TradingAgentsGraph", FakeGraph), \
+         patch("daily_run._write_decision_card"):
+        result = daily_run._analyze_one("PSX", "2026-09-10", cfg)
+
+    assert result == ("PSX", "Overweight", None)
+    assert calls["n"] == 2
+    log_path = (pathlib.Path(os.environ["STRUCTURED_LOG_DIR"])
+                / "2026-09-10" / "PSX.jsonl")
+    events = [json.loads(line)
+              for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert any(e.get("type") == "structured_fallback"
+               and e.get("mode") == "review_retry" for e in events)
+
+
+def test_empty_pm_decision_double_failure_leaves_review(cfg):
+    """A second empty decision must stay the visible REVIEW no-op, never a
+    silent Hold or a fabricated rating."""
+    import daily_run
+
+    class FakeGraph:
+        def __init__(self, config=None, **kwargs):
+            pass
+
+        def propagate(self, ticker, date, asset_type="stock"):
+            return {"final_trade_decision": ""}, "REVIEW"
+
+    with patch("daily_run.TradingAgentsGraph", FakeGraph), \
+         patch("daily_run._write_decision_card"):
+        result = daily_run._analyze_one("PSX", "2026-09-10", cfg)
+
+    assert result == ("PSX", "REVIEW", None)
+
+
+# --- memory-log REVIEW tagging + empty-entry heal ----------------------------
+
+def test_memory_review_patch_tags_review_and_heals_retry(tmp_path):
+    """Framework store_decision defaults unparseable text to Hold; the
+    ratings file says REVIEW. Tag REVIEW honestly, and let a successful
+    retry replace the empty pending entry (idempotency would otherwise
+    keep the empty one forever)."""
+    import daily_run
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+
+    log = TradingMemoryLog({"memory_log_path": str(tmp_path / "memory.md")})
+    daily_run._reset_memory_review_tag()
+    daily_run._ensure_memory_review_tag()
+
+    log.store_decision("PSX", "2026-09-10", "")  # attempt 1: empty decision
+    entries = log.load_entries()
+    assert len(entries) == 1
+    assert entries[0]["rating"] == "REVIEW"
+    assert entries[0]["pending"] is True
+
+    log.store_decision("PSX", "2026-09-10",
+                       "Rating: Overweight\nreal decision text")  # retry
+    entries = log.load_entries()
+    assert len(entries) == 1  # empty entry replaced, no duplicate
+    assert entries[0]["rating"] == "Overweight"
+    assert "real decision text" in entries[0]["decision"]
+
+
+def test_memory_review_patch_uses_header_rating(tmp_path):
+    import daily_run
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+
+    log = TradingMemoryLog({"memory_log_path": str(tmp_path / "memory.md")})
+    daily_run._reset_memory_review_tag()
+    daily_run._ensure_memory_review_tag()
+
+    log.store_decision("VLO", "2026-09-10",
+                       "Rating: Underweight\ncut exposure")
+    assert log.load_entries()[0]["rating"] == "Underweight"
+    # header-less prose (F3 class): REVIEW, never a prose-word guess
+    log.store_decision("VLO", "2026-09-11",
+                       "We should not sell into weakness here.")
+    assert log.load_entries()[-1]["rating"] == "REVIEW"
+
+
 # --- analyst tool-round budget (runaway tool-loop guard) ---------------------
 
 def _tool_round_msgs(rounds):

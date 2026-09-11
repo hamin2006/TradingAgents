@@ -210,6 +210,100 @@ def _ensure_memory_write_lock() -> None:
     _MEMORY_PATCHED = True
 
 
+_MEMORY_REVIEW_PATCHED = False
+_MEMORY_REVIEW_ORIGINALS: dict = {}
+
+
+def _heal_empty_decision_entry(log, ticker: str, trade_date: str,
+                               decision: str) -> None:
+    """Drop a pending entry whose DECISION body is empty when this attempt
+    has real text — the framework's pending-scan idempotency would otherwise
+    keep the empty entry forever, swallowing a successful retry."""
+    text = str(decision or "")
+    path = getattr(log, "_log_path", None)
+    if not text.strip() or path is None or not path.exists():
+        return
+    raw = path.read_text(encoding="utf-8")
+    sep = log._SEPARATOR
+    chunks = [c for c in raw.split(sep) if c.strip()]
+    prefix = f"[{trade_date} | {ticker} |"
+    kept = []
+    healed = False
+    for chunk in chunks:
+        stripped = chunk.strip()
+        first_line = stripped.splitlines()[0] if stripped else ""
+        if (not healed and first_line.startswith(prefix)
+                and first_line.rstrip().endswith("| pending]")):
+            body = ""
+            if "DECISION:\n" in chunk:
+                body = chunk.split("DECISION:\n", 1)[1]
+            if not body.strip():
+                healed = True
+                continue
+        kept.append(chunk)
+    if healed:
+        path.write_text("".join(c + sep for c in kept), encoding="utf-8")
+
+
+def _ensure_memory_review_tag() -> None:
+    """Tag REVIEW days honestly in the memory log and let a retry heal an
+    empty entry.
+
+    The framework's store_decision uses legacy parse_rating (default Hold),
+    so an all-provider-error day (empty decision -> REVIEW, no trade) was
+    archived as a Hold-tier decision and polluted hit-rate analytics. Two
+    idempotent runtime patches:
+      1. memory_mod.parse_rating -> the explicit ``Rating:`` header only
+         (fall back to REVIEW), matching the ratings file's F3 rule;
+      2. a store_decision wrapper -> before appending, drop a pending entry
+         whose DECISION body is empty when the incoming decision has text,
+         so a successful retry replaces it.
+    """
+    global _MEMORY_REVIEW_PATCHED
+    if _MEMORY_REVIEW_PATCHED:
+        return
+    import tradingagents.agents.utils.memory as memory_mod
+
+    original_parse = memory_mod.parse_rating
+
+    def parse_review(text, _default="Hold"):
+        rating = _header_rating(text)
+        return rating if rating else "REVIEW"
+
+    memory_mod.parse_rating = parse_review
+
+    original_store = memory_mod.TradingMemoryLog.store_decision
+
+    def store_with_review(self, *args, **kwargs):
+        ticker = kwargs.get("ticker", args[0] if args else "")
+        trade_date = kwargs.get("trade_date", args[1] if len(args) > 1 else "")
+        decision = kwargs.get("final_trade_decision",
+                              args[2] if len(args) > 2 else "")
+        with _MEMORY_WRITE_LOCK:
+            _heal_empty_decision_entry(self, ticker, trade_date, decision)
+            return original_store(self, *args, **kwargs)
+
+    store_with_review._wrapped_original = original_store
+    memory_mod.TradingMemoryLog.store_decision = store_with_review
+    _MEMORY_REVIEW_ORIGINALS["parse_rating"] = original_parse
+    _MEMORY_REVIEW_ORIGINALS["store_decision"] = original_store
+    _MEMORY_REVIEW_PATCHED = True
+
+
+def _reset_memory_review_tag() -> None:
+    """Restore the framework memory seams (tests; safe anytime)."""
+    global _MEMORY_REVIEW_PATCHED
+    if not _MEMORY_REVIEW_PATCHED:
+        return
+    import tradingagents.agents.utils.memory as memory_mod
+
+    memory_mod.parse_rating = _MEMORY_REVIEW_ORIGINALS["parse_rating"]
+    memory_mod.TradingMemoryLog.store_decision = \
+        _MEMORY_REVIEW_ORIGINALS["store_decision"]
+    _MEMORY_REVIEW_ORIGINALS.clear()
+    _MEMORY_REVIEW_PATCHED = False
+
+
 _REDDIT_LOCK = threading.RLock()  # re-entrant: reddit.py's own 429 retry re-invokes the module attr,
 # which is our wrapper — a plain Lock would deadlock the same-thread re-entry.
 _REDDIT_PATCHED = False
@@ -1686,6 +1780,10 @@ def _reset_decision_card_injection() -> None:
     _CARD_INJECTION_ROOT = None
 
 
+class _EmptyDecisionError(Exception):
+    """PM decision text is empty (all providers errored) — retryable."""
+
+
 def _analyze_one(ticker: str, today_str: str, cfg: dict):
     """Run the full framework pipeline for one ticker with one retry.
 
@@ -1695,20 +1793,36 @@ def _analyze_one(ticker: str, today_str: str, cfg: dict):
     import structured_log
     _clear_pm_capture()  # threads are pooled: never leak a prior ticker's PM
     run_log = structured_log.StructuredRunLogger(ticker=ticker, today=today_str)
-    try:
+
+    def attempt():
+        _clear_pm_capture()
         rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
         _write_decision_card(ticker, today_str, cfg, rating, run_log=run_log)
         run_log.finish(rating=rating)
         return ticker, rating, None
+
+    try:
+        return attempt()
+    except _EmptyDecisionError as exc:
+        # Provider bad window emptied the decision (REVIEW) — unlike other
+        # failures it raised nothing before. Retry once; MSFT-class windows
+        # clear within a minute. A second failure stays the visible REVIEW
+        # no-op rather than a silent Hold or a fabricated rating.
+        logger.warning("empty PM decision for %s (%s); retrying once",
+                       ticker, exc)
+        try:
+            run_log.finish(rating=None)
+            return attempt()
+        except Exception as exc2:  # noqa: BLE001
+            logger.error("retry also empty for %s: %s; leaving REVIEW (no-op)",
+                         ticker, exc2)
+            run_log.finish(rating="REVIEW")
+            return ticker, "REVIEW", None
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis failed for %s: %s", ticker, exc)
         try:
-            _clear_pm_capture()
             run_log.finish(rating=None)
-            rating = _propagate_with_structured_log(ticker, today_str, cfg, run_log)
-            _write_decision_card(ticker, today_str, cfg, rating, run_log=run_log)
-            run_log.finish(rating=rating)
-            return ticker, rating, None
+            return attempt()
         except Exception as exc2:  # noqa: BLE001
             logger.error("retry also failed for %s: %s", ticker, exc2)
             run_log.finish(rating=None)
@@ -1751,7 +1865,19 @@ def _propagate_with_structured_log(ticker: str, today_str: str, cfg: dict,
                        "from prose-word scan; forced REVIEW"),
                 mode="rating_guard")
             return "REVIEW"
-        return extract_rating(signal)
+        rating = extract_rating(signal)
+        if rating == "REVIEW" and not (decision or "").strip():
+            # All structured attempts and the free-text fallback came back
+            # empty (provider bad window). Unlike other failures nothing
+            # raised, so without this the day silently no-op'd (PSX 9/10).
+            logger.warning("%s: empty PM decision; scheduling one retry",
+                           ticker)
+            structured_log.emit_structured_fallback(
+                agent="Portfolio Manager",
+                error="empty final decision; retry scheduled",
+                mode="review_retry")
+            raise _EmptyDecisionError(f"{ticker}: empty PM decision")
+        return rating
     finally:
         structured_log.clear_active_logger()
 
@@ -1801,6 +1927,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
                                        memory_log.load_entries(), cfg, TODAY_ET())
 
     _ensure_memory_write_lock()
+    _ensure_memory_review_tag()  # REVIEW tags + retry-heal for empty decisions
     _ensure_openrouter_pins(cfg.get("openrouter_provider_pins"))
     if not _ensure_reddit_oauth():
         _ensure_reddit_pacing()
