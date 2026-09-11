@@ -18,10 +18,14 @@ openrouter_provider_pins:
   deepseek/deepseek-v4-flash-0731: Relace
   deepseek/deepseek-v4-pro: StreamLake
 
-capital: 10000            # paper capital (matches real paper-account cash)
+capital: 10000            # documentation only since risk-budget sizing (2026-09-11);
+                          # sizing base is real equity (cash + holdings)
 max_positions: 10          # position-count cap AND equal-weight denominator
 max_order_value_cap: 15000 # per-day total buy cap
 stop_loss_pct: 8.0         # broker-side GTC stop on every buy (0 disables)
+risk_budget_pct: 1.2       # equity % risked per fallback position at its stop;
+                           # per-name ceiling = risk_budget_pct / stop_loss_pct
+                           # (15% at defaults) — supersedes the old cash slice
 tripwire_gap_pct: 5.0     # pre-open pause: BUY skipped if pre-market quote is
                           # this % below the reference close (overnight events)
 fundamentals_source: edgar  # "edgar" = SEC companyfacts as-filed statements
@@ -29,7 +33,7 @@ fundamentals_source: edgar  # "edgar" = SEC companyfacts as-filed statements
                             # 2026-09-04); yfinance fallback stays automatic
                             # per ticker (structural quality gate); consensus/
                             # dividends/sector remain Yahoo-labeled
-conviction_weights:        # slice multiplier per rating (base = capital / max_positions)
+conviction_weights:        # position-weight multiplier (base = 1 / max_positions)
   Buy: 1.5
   Overweight: 1.0
 analyze_max_workers: 4     # parallel ticker analyses in the morning pass

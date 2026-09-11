@@ -26,12 +26,26 @@ class Order:
 DEFAULT_CONVICTIION_WEIGHTS = {"Buy": 1.5, "Overweight": 1.0}
 
 
-def compute_orders(ratings, holdings, last_close, capital, max_positions,
+def compute_orders(ratings, holdings, last_close, cash, max_positions,
                    max_order_value_cap=None, entry_protection_pct=2.0,
-                   stop_loss_pct=8.0, conviction_weights=None):
+                   stop_loss_pct=8.0, conviction_weights=None,
+                   risk_budget_pct=1.2):
+    """Legacy fallback sizer (risk-budget, spec 2026-09-11).
+
+    Base is portfolio equity (cash + holdings at the reference close), not a
+    cash-derived slice. Per-name target weight = conviction x (1 /
+    max_positions), trimmed to the risk ceiling = risk_budget_pct /
+    stop_loss_pct (15% at defaults). A too-expensive name still buys one
+    whole share when its weight fits the ceiling — the min-1 rule at the
+    whole-share boundary.
+    """
     orders = []
     weights = conviction_weights or DEFAULT_CONVICTIION_WEIGHTS
-    base_slice = capital / max_positions
+    equity = float(cash) + sum(
+        int(shares) * float(last_close.get(ticker, 0.0) or 0.0)
+        for ticker, shares in holdings.items())
+    risk_ceiling = (risk_budget_pct / stop_loss_pct
+                    if stop_loss_pct and stop_loss_pct > 0 else None)
 
     for ticker, shares in holdings.items():
         if ticker in ratings and ratings[ticker] in SELL_RATINGS:
@@ -39,21 +53,29 @@ def compute_orders(ratings, holdings, last_close, capital, max_positions,
                                 reason="rating exit"))
 
     buys = []
-    for ticker, rating in ratings.items():
-        if ticker in holdings or rating not in BUY_RATINGS:
-            continue
-        price = last_close.get(ticker)
-        if not price:
-            continue
-        slice_value = base_slice * weights.get(rating, 1.0)
-        shares = int(slice_value / price)
-        if shares < 1:
-            continue
-        protection = round(price * (1 + entry_protection_pct / 100), 2)
-        stop = round(price * (1 - stop_loss_pct / 100), 2)
-        buys.append(Order(ticker=ticker, action="BUY", shares=shares,
-                          reason="entry", protection_price=protection,
-                          stop_price=stop))
+    if equity > 0:
+        for ticker, rating in ratings.items():
+            if ticker in holdings or rating not in BUY_RATINGS:
+                continue
+            price = last_close.get(ticker)
+            if not price or price <= 0:
+                continue
+            target_w = weights.get(rating, 1.0) / max_positions
+            if risk_ceiling is None:
+                max_w = min1_w = target_w
+            else:
+                max_w = min(target_w, risk_ceiling)
+                min1_w = risk_ceiling
+            shares = int(max_w * equity / price)
+            if shares < 1 and price <= min1_w * equity:
+                shares = 1
+            if shares < 1:
+                continue
+            protection = round(price * (1 + entry_protection_pct / 100), 2)
+            stop = round(price * (1 - stop_loss_pct / 100), 2)
+            buys.append(Order(ticker=ticker, action="BUY", shares=shares,
+                              reason="entry", protection_price=protection,
+                              stop_price=stop))
 
     if max_order_value_cap is not None:
         while True:
@@ -72,6 +94,41 @@ def compute_orders(ratings, holdings, last_close, capital, max_positions,
         buys = buys[:max(0, slots)]
 
     return orders + buys
+
+
+def apply_cash_budget(orders, cash, last_close, ratings):
+    """Skip buys the account cash cannot cover; PM orders allocate first.
+
+    Deterministic, no shaving (spec 2026-09-11): an order is either kept at
+    its stated size or skipped entirely. Allocation order: PM execution
+    intents, then legacy buys by conviction (Buy before Overweight, ties by
+    ticker). Returns (kept_orders, skipped_buys); non-buy orders are never
+    touched.
+    """
+    buy_positions = [i for i, o in enumerate(orders) if o.action == "BUY"]
+    if not buy_positions:
+        return list(orders), []
+
+    def _rank(i):
+        o = orders[i]
+        return (0 if o.reason == "pm-execution" else 1,
+                0 if ratings.get(o.ticker) == "Buy" else 1,
+                o.ticker)
+
+    remaining = float(cash)
+    keep: set[int] = set()
+    skipped = []
+    for i in sorted(buy_positions, key=_rank):
+        o = orders[i]
+        price = last_close.get(o.ticker)
+        if price and o.shares * price <= remaining:
+            keep.add(i)
+            remaining -= o.shares * price
+        else:
+            skipped.append(o)
+    kept = [o for i, o in enumerate(orders)
+            if o.action != "BUY" or i in keep]
+    return kept, skipped
 
 
 # --- PM execution intent -> binding orders (spec 2026-09-04) -----------------

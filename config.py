@@ -13,6 +13,7 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
     ["seed_watchlist", "capital", "max_positions", "max_order_value_cap",
      "screener", "ibkr", "alpaca", "broker", "trading_enabled",
      "analyze_max_workers", "stop_loss_pct", "conviction_weights",
+     "risk_budget_pct",
      "tripwire_gap_pct", "pm_execution", "execution_intent",
      "stop_px_band_pct", "min_order_value_usd", "card_max_age_days",
      "card_flip_inject_max", "max_analyst_tool_rounds",
@@ -24,12 +25,19 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
 # so the config always carries them, exactly like the framework's own defaults.
 APP_DEFAULTS = {
     "seed_watchlist": [],
+    # Documentation only since risk-budget sizing (2026-09-11): the fallback
+    # sizer uses real portfolio equity (cash + holdings), not this value.
     "capital": 100_000,
     "max_positions": 10,
     "max_order_value_cap": None,
     # Broker-side stop-loss attached to every buy (GTC, % below last close).
     # Enforced 24/7 by the broker between daily runs. 0 disables.
     "stop_loss_pct": 8.0,
+    # Risk-budget sizing (spec 2026-09-11): equity % risked per fallback
+    # position at its stop; the per-name ceiling weight is
+    # risk_budget_pct / stop_loss_pct (15% at defaults). Replaced the old
+    # cash-derived `capital / max_positions` slice.
+    "risk_budget_pct": 1.2,
     # Overnight-move tripwire at execute time (pct below the reference
     # close that pauses a BUY; 0 disables). Catches material events between
     # the analysis cutoff and the 09:30 open via the pre-market quote.
@@ -53,8 +61,9 @@ APP_DEFAULTS = {
     "card_max_age_days": 21,
     # Fresh cards injected when the latest two card ratings differ (flip).
     "card_flip_inject_max": 3,
-    # Conviction-scaled sizing: slice multiplier per rating (base = capital /
-    # max_positions). A Buy gets 1.5x an Overweight's exposure.
+    # Conviction-scaled sizing: position-weight multiplier (target weight =
+    # multiplier / max_positions, trimmed to the risk ceiling). A Buy gets
+    # 1.5x an Overweight's exposure.
     "conviction_weights": {"Buy": 1.5, "Overweight": 1.0},
     # OpenRouter provider pinning: model slug -> provider name. Injects the
     # provider routing body (allow_fallbacks=false) into every request for

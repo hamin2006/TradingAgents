@@ -1,14 +1,17 @@
 """tests/test_decisions.py"""
-from decisions import compute_orders, orders_from_execution
+from decisions import Order, apply_cash_budget, compute_orders, orders_from_execution
 from pm_execution import ExecutionIntent, PmOrder
 
 RATINGS = {"AAPL": "Buy", "MSFT": "Hold", "NVDA": "Overweight", "TSLA": "Sell"}
 HOLDINGS = {"TSLA": 40}
 CLOSE = {"AAPL": 100.0, "MSFT": 200.0, "NVDA": 150.0, "TSLA": 250.0}
+CASH = 100_000.0
+MAX_POS = 10
+# defaults: risk_budget_pct=1.2 / stop_loss_pct=8 -> 15% risk ceiling
 
 
 def test_sell_held_on_sell_rating():
-    orders = compute_orders(RATINGS, HOLDINGS, CLOSE, capital=100_000, max_positions=10)
+    orders = compute_orders(RATINGS, HOLDINGS, CLOSE, cash=100_000, max_positions=10)
     sell = [o for o in orders if o.action == "SELL"]
     assert len(sell) == 1
     assert sell[0].ticker == "TSLA" and sell[0].shares == 40
@@ -16,10 +19,11 @@ def test_sell_held_on_sell_rating():
 
 
 def test_buy_not_held_on_buy_rating_with_protection():
-    orders = compute_orders(RATINGS, HOLDINGS, CLOSE, capital=100_000, max_positions=10)
+    orders = compute_orders(RATINGS, HOLDINGS, CLOSE, cash=100_000, max_positions=10)
     buys = {o.ticker: o for o in orders if o.action == "BUY"}
     assert set(buys) == {"AAPL", "NVDA"}
-    assert buys["AAPL"].shares == 150   # 100_000 / 10 x 1.5 / 100.0 (conviction Buy)
+    # equity = 100_000 cash + 40 TSLA x 250 = 110_000; Buy target 15%
+    assert buys["AAPL"].shares == 165
     assert buys["AAPL"].protection_price == 102.0  # +2%
     assert buys["AAPL"].reason == "entry"
 
@@ -27,7 +31,7 @@ def test_buy_not_held_on_buy_rating_with_protection():
 def test_hold_and_held_buy_produce_no_orders():
     ratings = {"MSFT": "Hold", "AAPL": "Buy"}
     holdings = {"AAPL": 50}
-    orders = compute_orders(ratings, holdings, CLOSE, capital=100_000, max_positions=10)
+    orders = compute_orders(ratings, holdings, CLOSE, cash=100_000, max_positions=10)
     assert orders == []
 
 
@@ -50,23 +54,24 @@ def test_review_rating_on_held_position_keeps_position():
 def test_underweight_held_is_sell():
     ratings = {"NVDA": "Underweight"}
     holdings = {"NVDA": 10}
-    orders = compute_orders(ratings, holdings, CLOSE, capital=100_000, max_positions=10)
+    orders = compute_orders(ratings, holdings, CLOSE, cash=100_000, max_positions=10)
     assert orders[0].action == "SELL"
 
 
 def test_shares_lt_1_skips_buy():
     orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 300_000.0},
-                            capital=100_000, max_positions=10)
-    assert orders == []  # slice = 10_000 -> 0 shares
+                            cash=100_000, max_positions=10)
+    # target 15_000 -> 0 shares; 1 share = 300% >> 15% ceiling -> skip
+    assert orders == []
 
 
 def test_max_order_value_cap_drops_largest_buy():
     ratings = {"AAPL": "Buy", "NVDA": "Buy"}
-    # slice 15_000 each (conviction x1.5) -> AAPL 150@100 = 15_000, NVDA 100@150 = 15_000
-    orders = compute_orders(ratings, {}, CLOSE, capital=100_000, max_positions=10,
+    # Buy target 15% of 100_000 equity -> 15_000 each (AAPL 150@100, NVDA 100@150)
+    orders = compute_orders(ratings, {}, CLOSE, cash=100_000, max_positions=10,
                             max_order_value_cap=31_000)
     assert len([o for o in orders if o.action == "BUY"]) == 2  # total under cap
-    orders = compute_orders(ratings, {}, CLOSE, capital=100_000, max_positions=10,
+    orders = compute_orders(ratings, {}, CLOSE, cash=100_000, max_positions=10,
                             max_order_value_cap=20_000)
     # total 30_000 > 20_000 -> drop the largest-ticket buy (AAPL)
     assert len([o for o in orders if o.action == "BUY"]) == 1
@@ -75,25 +80,25 @@ def test_max_order_value_cap_drops_largest_buy():
 
 def test_missing_rating_or_price_skipped():
     orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0, "MSFT": 200.0},
-                            capital=100_000, max_positions=10)
+                            cash=100_000, max_positions=10)
     assert all(o.ticker == "AAPL" for o in orders)
 
 
 def test_buy_includes_stop_loss():
     orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0},
-                            capital=100_000, max_positions=10)
+                            cash=100_000, max_positions=10)
     assert orders[0].stop_price == 92.0  # last_close * (1 - 8%)
 
 
 def test_stop_loss_pct_configurable():
     orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0},
-                            capital=100_000, max_positions=10, stop_loss_pct=5.0)
+                            cash=100_000, max_positions=10, stop_loss_pct=5.0)
     assert orders[0].stop_price == 95.0
 
 
 def test_sell_has_no_stop():
     orders = compute_orders({"TSLA": "Sell"}, {"TSLA": 40}, {"TSLA": 250.0},
-                            capital=100_000, max_positions=10)
+                            cash=100_000, max_positions=10)
     assert orders[0].action == "SELL"
     assert orders[0].stop_price is None
 
@@ -101,23 +106,25 @@ def test_sell_has_no_stop():
 def test_conviction_scaling_buy_outranks_overweight():
     orders = compute_orders({"AAPL": "Buy", "NVDA": "Overweight"}, {},
                             {"AAPL": 100.0, "NVDA": 100.0},
-                            capital=100_000, max_positions=10)
+                            cash=100_000, max_positions=10)
     by_ticker = {o.ticker: o for o in orders}
     assert by_ticker["AAPL"].shares == 150   # base slice 10k x 1.5 / 100
     assert by_ticker["NVDA"].shares == 100   # base slice x 1.0
 
 
 def test_conviction_weights_configurable():
+    # 2.0x conviction target is 20% -> needs a higher risk budget (25% ceiling)
     orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0},
-                            capital=100_000, max_positions=10,
-                            conviction_weights={"Buy": 2.0})
+                            cash=100_000, max_positions=10,
+                            conviction_weights={"Buy": 2.0},
+                            risk_budget_pct=2.0)
     assert orders[0].shares == 200
 
 
 def test_conviction_cap_still_enforced():
     orders = compute_orders({"AAPL": "Buy", "NVDA": "Overweight"}, {},
                             {"AAPL": 100.0, "NVDA": 100.0},
-                            capital=100_000, max_positions=10,
+                            cash=100_000, max_positions=10,
                             max_order_value_cap=16_000)
     # AAPL 15_000 + NVDA 10_000 = 25_000 > 16_000 -> drop largest (AAPL)
     assert [o.ticker for o in orders] == ["NVDA"]
@@ -129,7 +136,7 @@ def test_position_cap_trims_buys():
     ratings = {f"C{i}": "Buy" for i in range(8)}
     holdings = {f"H{i}": 10 for i in range(7)}
     close = {**{f"C{i}": 100.0 for i in range(8)}, **{f"H{i}": 50.0 for i in range(7)}}
-    orders = compute_orders(ratings, holdings, close, capital=100_000, max_positions=10)
+    orders = compute_orders(ratings, holdings, close, cash=100_000, max_positions=10)
     buys = [o for o in orders if o.action == "BUY"]
     assert len(buys) == 3  # 10 - 7 slots
 
@@ -138,7 +145,7 @@ def test_position_cap_no_buys_when_full():
     ratings = {"C0": "Buy", "C1": "Buy"}
     holdings = {f"H{i}": 10 for i in range(10)}
     close = {"C0": 100.0, "C1": 100.0, **{f"H{i}": 50.0 for i in range(10)}}
-    orders = compute_orders(ratings, holdings, close, capital=100_000, max_positions=10)
+    orders = compute_orders(ratings, holdings, close, cash=100_000, max_positions=10)
     assert [o for o in orders if o.action == "BUY"] == []
 
 
@@ -146,9 +153,95 @@ def test_position_cap_prioritizes_buy_over_overweight():
     ratings = {"A": "Overweight", "B": "Buy"}
     holdings = {f"H{i}": 10 for i in range(9)}  # 1 slot left
     close = {"A": 100.0, "B": 100.0, **{f"H{i}": 50.0 for i in range(9)}}
-    orders = compute_orders(ratings, holdings, close, capital=100_000, max_positions=10)
+    orders = compute_orders(ratings, holdings, close, cash=100_000, max_positions=10)
     buys = [o.ticker for o in orders if o.action == "BUY"]
     assert buys == ["B"]  # conviction wins the last slot
+
+
+def test_sizing_base_is_equity_not_cash():
+    """Risk-budget sizing spec 2026-09-11: the base is portfolio equity
+    (cash + holdings), not the shrinking cash floor."""
+    orders = compute_orders({"AAPL": "Buy"}, {"MSFT": 800},
+                            {"AAPL": 100.0, "MSFT": 100.0},
+                            cash=20_000, max_positions=10)
+    # equity = 20_000 cash + 80_000 MSFT -> Buy 15% = 15_000 -> 150 shares
+    assert orders[0].shares == 150
+
+
+def test_min_one_share_allowed_below_ceiling():
+    """A whole-share gap must not exclude an affordable, risk-sized name:
+    target 10% of 10_000 = 1_000 < 1_200 price, but 1 share = 12% <= 15%."""
+    orders = compute_orders({"NVDA": "Overweight"}, {}, {"NVDA": 1_200.0},
+                            cash=10_000, max_positions=10)
+    assert [(o.ticker, o.shares) for o in orders] == [("NVDA", 1)]
+
+
+def test_min_one_share_refused_above_ceiling():
+    orders = compute_orders({"NVDA": "Overweight"}, {}, {"NVDA": 1_600.0},
+                            cash=10_000, max_positions=10)
+    assert orders == []  # 1 share = 16% > 15% risk ceiling
+
+
+def test_risk_budget_sets_the_ceiling():
+    orders = compute_orders({"AAPL": "Buy"}, {}, {"AAPL": 100.0},
+                            cash=100_000, max_positions=10,
+                            risk_budget_pct=0.8)
+    # ceiling = 0.8 / 8 = 10% trims the 15% Buy target
+    assert orders[0].shares == 100
+
+
+def test_stops_disabled_falls_back_to_target_weight():
+    """With stops off there is no risk distance; the target weight governs
+    (no min-1 rule can exceed it)."""
+    orders = compute_orders({"NVDA": "Overweight"}, {}, {"NVDA": 1_200.0},
+                            cash=10_000, max_positions=10, stop_loss_pct=0.0)
+    assert orders == []
+
+
+def _order(ticker, action, shares, reason="entry"):
+    return Order(ticker=ticker, action=action, shares=shares, reason=reason)
+
+
+def test_cash_budget_keeps_what_fits_and_skips_the_rest():
+    orders = [_order("A", "BUY", 10), _order("B", "BUY", 5)]
+    kept, skipped = apply_cash_budget(
+        orders, 1_200.0, {"A": 100.0, "B": 100.0},
+        {"A": "Buy", "B": "Overweight"})
+    assert [o.ticker for o in kept] == ["A"]
+    assert [o.ticker for o in skipped] == ["B"]
+
+
+def test_cash_budget_pm_orders_allocated_first():
+    orders = [_order("LEGACY", "BUY", 10),
+              _order("PM", "BUY", 10, reason="pm-execution")]
+    kept, skipped = apply_cash_budget(
+        orders, 1_000.0, {"LEGACY": 100.0, "PM": 100.0},
+        {"LEGACY": "Buy", "PM": "Overweight"})
+    assert [o.ticker for o in kept] == ["PM"]
+    assert [o.ticker for o in skipped] == ["LEGACY"]
+
+
+def test_cash_budget_conviction_order_prefers_buy():
+    orders = [_order("OWX", "BUY", 10), _order("BUX", "BUY", 10)]
+    kept, _ = apply_cash_budget(
+        orders, 1_000.0, {"OWX": 100.0, "BUX": 100.0},
+        {"OWX": "Overweight", "BUX": "Buy"})
+    assert [o.ticker for o in kept] == ["BUX"]
+
+
+def test_cash_budget_leaves_sells_untouched():
+    orders = [_order("EL", "SELL", 2), _order("A", "BUY", 1)]
+    kept, skipped = apply_cash_budget(
+        orders, 100.0, {"EL": 100.0, "A": 100.0}, {"A": "Buy"})
+    assert [o.action for o in kept] == ["SELL", "BUY"]
+    assert skipped == []
+
+
+def test_cash_budget_missing_price_is_skipped():
+    orders = [_order("A", "BUY", 1)]
+    kept, skipped = apply_cash_budget(orders, 1_000.0, {}, {"A": "Buy"})
+    assert kept == []
+    assert [o.ticker for o in skipped] == ["A"]
 
 
 def _intent(orders, **extra):

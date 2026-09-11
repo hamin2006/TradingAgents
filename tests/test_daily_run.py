@@ -1471,12 +1471,13 @@ def test_run_execute_dry_run_writes_no_idempotency_file(cfg):
     assert not list(pathlib.Path(cfg["results_dir"]).glob("executed_*.json"))
 
 
-def test_run_execute_caps_capital_by_actual_cash(cfg, caplog):
-    """Configured capital must not exceed the account's real cash."""
+def test_run_execute_sizes_from_equity_base(cfg):
+    """Risk-budget sizing: base is real equity (cash + holdings), never the
+    configured `capital` (documentation only since 2026-09-11)."""
     _ratings_file(cfg, {"AAPL": "Buy"})
     cfg["capital"] = 1_000_000
     broker = MagicMock()
-    broker.get_positions_and_cash.return_value = ({}, 100_000.0)
+    broker.get_positions_and_cash.return_value = ({"MSFT": 500}, 50_000.0)
     broker.place_market_orders.return_value = []
     with patch("daily_run.load_watchlist_config", return_value=cfg), \
          patch("daily_run.create_broker", return_value=broker), \
@@ -1487,8 +1488,7 @@ def test_run_execute_caps_capital_by_actual_cash(cfg, caplog):
         rc = run_execute(cfg)
     assert rc == 0
     orders = broker.place_market_orders.call_args[0][0]
-    assert orders[0].shares == 150  # 100_000 cash cap / 10 positions x 1.5 (Buy) / 100.0
-    assert any("cash" in r.message.lower() for r in caplog.records)
+    assert orders[0].shares == 150  # 15% of 100k equity (50k cash + 50k MSFT)
 
 
 def test_run_execute_missing_last_close_warns_and_skips(cfg, caplog):
@@ -2013,10 +2013,9 @@ class TestPmExecutionBinding:
         orders = broker.place_market_orders.call_args[0][0]
         assert orders[0].stop_price == round(100.0 * 0.92, 2)  # -8% of close
 
-    def test_pm_buy_clamped_to_account_cash(self, cfg):
-        """PM orders size explicitly and bypass the legacy cash-derived slice
-        math — but the account cash still caps them: a block asking for more
-        than the account can cover must clamp, never oversize."""
+    def test_pm_buy_exceeding_cash_is_skipped(self, cfg, caplog):
+        """The cash pass never shaves: a PM buy larger than the available
+        cash is skipped entirely — the block's stated size is all-or-nothing."""
         cfg["pm_execution"] = True
         _write_gate(cfg, bind=["NOW"])
         cfg["capital"] = 100_000
@@ -2025,9 +2024,8 @@ class TestPmExecutionBinding:
         broker = _exec_broker(cash=6_000.0)   # account can only cover ~$6k
         assert _run_exec(cfg, broker) == 0
         orders = broker.place_market_orders.call_args[0][0]
-        assert len(orders) == 1
-        assert orders[0].action == "BUY"
-        assert orders[0].shares * 100.0 <= 6_000.0  # <= cash at $100 close
+        assert orders == []  # 500 sh x $100 = $50k > $6k cash -> skipped
+        assert any("skipped" in r.message.lower() for r in caplog.records)
 
 
 class TestBindingGateHonoring:

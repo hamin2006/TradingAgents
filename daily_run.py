@@ -16,7 +16,7 @@ import yfinance as yf
 
 from broker import create_broker
 from config import load_watchlist_config
-from decisions import BUY_RATINGS, compute_orders
+from decisions import BUY_RATINGS, apply_cash_budget, compute_orders
 from screener import load_pool, load_regime
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.utils.rating import parse_rating
@@ -2313,23 +2313,20 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 logger.warning("no last close for %s; skipping any order for it", ticker)
             last_close[ticker] = price or 0.0
 
-        # Never size against configured capital the account cannot cover;
-        # a rejected order is a silent no-op, a capped size is visible.
-        capital = float(cfg.get("capital", 100_000))
-        if cash < capital:
-            logger.warning("account cash (%.2f) below configured capital (%.2f); "
-                           "sizing against cash", cash, capital)
-            capital = cash
-
+        # Risk-budget sizing (spec 2026-09-11): the base is real portfolio
+        # equity (cash + holdings at the reference close) — config `capital`
+        # is documentation only. Whole shares, min-1 at the whole-share
+        # boundary when the 1-share weight fits the risk ceiling.
         orders = compute_orders(
             payload["ratings"], holdings, last_close,
-            capital=capital,
+            cash=cash,
             max_positions=int(cfg.get("max_positions", 10)),
             max_order_value_cap=cfg.get("max_order_value_cap"),
             entry_protection_pct=float(cfg.get("screener", {}).get(
                 "entry_protection_pct", 2.0)),
             stop_loss_pct=float(cfg.get("stop_loss_pct", 8.0)),
-            conviction_weights=cfg.get("conviction_weights"))
+            conviction_weights=cfg.get("conviction_weights"),
+            risk_budget_pct=float(cfg.get("risk_budget_pct", 1.2)))
 
         # PM execution binding (phase 2): per-ticker execution blocks from
         # the ratings file (schema_version 2) replace the legacy tier orders
@@ -2377,27 +2374,16 @@ def run_execute(cfg: dict, dry_run: bool = False) -> int:
                 orders.extend(block_orders)
                 bound_tickers.add(ticker)
 
-        # PM orders size explicitly and bypass the legacy cash-derived slice
-        # math — but the account cash still caps them. A block asking for
-        # more than the account can cover clamps to the cash-based share
-        # count (the broker would otherwise reject or the paper margin fill
-        # an unintended oversize).
-        if bound_tickers:
-            from dataclasses import replace as replace_order
-            for i, o in enumerate(orders):
-                if (o.reason == "pm-execution" and o.action == "BUY"
-                        and last_close.get(o.ticker)):
-                    max_shares = int(capital / last_close[o.ticker])
-                    if max_shares < 1:
-                        max_shares = 1  # never below one share once priced in
-                    if o.shares > max_shares:
-                        logger.warning(
-                            "%s: PM buy %d shares (~$%.0f) exceeds the account "
-                            "cash-based cap; clamping to %d shares (~$%.0f)",
-                            o.ticker, o.shares,
-                            o.shares * last_close[o.ticker], max_shares,
-                            max_shares * last_close[o.ticker])
-                        orders[i] = replace_order(o, shares=max_shares)
+        # Cash pass (risk-budget sizing spec 2026-09-11): every buy — PM
+        # explicit intents first, then legacy buys by conviction — must fit
+        # the account's real cash. Deterministic all-or-nothing: an order is
+        # skipped, never shaved. Replaces the old per-order cash clamp.
+        orders, skipped_buys = apply_cash_budget(
+            orders, cash, last_close, payload["ratings"])
+        for o in skipped_buys:
+            logger.warning("%s: %s buy (%d sh) skipped — does not fit the "
+                           "available cash (%.2f)", o.ticker, o.reason,
+                           o.shares, cash)
 
         # Overnight-move tripwire: an event between the analysis cutoff and
         # the open (CEO death, disaster, guidance cut) shows up in the
