@@ -17,7 +17,8 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
      "tripwire_gap_pct", "pm_execution", "execution_intent",
      "stop_px_band_pct", "min_order_value_usd", "card_max_age_days",
      "card_flip_inject_max", "max_analyst_tool_rounds",
-     "openrouter_provider_pins", "fundamentals_source"]
+     "openrouter_provider_pins", "fundamentals_source",
+     "remainder_protection_retry_s"]
 )
 
 # App-level defaults for keys the framework does not know about. These live
@@ -38,6 +39,11 @@ APP_DEFAULTS = {
     # risk_budget_pct / stop_loss_pct (15% at defaults). Replaced the old
     # cash-derived `capital / max_positions` slice.
     "risk_budget_pct": 1.2,
+    # Held-for-orders retry deadline for remainder-stop / OCO re-anchoring
+    # (spec 2026-09-15): wall-clock seconds to keep retrying a rejection
+    # that carries Alpaca's held_for_orders reservation count, replacing
+    # the old fixed 3-attempt/6s budget that exhausted on HPQ (2026-09-14/15).
+    "remainder_protection_retry_s": 30.0,
     # Overnight-move tripwire at execute time (pct below the reference
     # close that pauses a BUY; 0 disables). Catches material events between
     # the analysis cutoff and the 09:30 open via the pre-market quote.

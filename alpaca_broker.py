@@ -24,6 +24,7 @@ in watchlist.yaml). ``cfg["alpaca"]["paper"]`` defaults to True.
 """
 
 import contextlib
+import json
 import logging
 import os
 import time
@@ -60,6 +61,39 @@ POLL_INTERVAL_S = 5
 FILL_GRACE_REQUERIES = 3
 FILL_GRACE_INTERVAL_S = 10
 
+# Fallback bound when a submit failure does not carry the held_for_orders
+# shape (an unrelated error, e.g. a network blip) — retry a small fixed
+# number of times rather than burning the full deadline on a race that
+# isn't the one this budget targets.
+_UNRECOGNIZED_ERROR_ATTEMPTS = 3
+_RETRY_POLL_INTERVAL_S = 2
+
+
+def _held_for_orders(exc: Exception) -> int | None:
+    """Parse Alpaca's held_for_orders count from a rejection payload.
+
+    A just-cancelled or just-filled order can leave shares reserved in
+    Alpaca's held_for_orders accounting for a few seconds (DXCM
+    2026-09-09, recurring worse on HPQ/AMD/DELL/VLO/ZBRA 2026-09-15) —
+    the message is JSON-shaped with the exact reservation count. Returns
+    None when the shape is not recognized (a different failure entirely).
+    """
+    try:
+        payload = json.loads(str(exc))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or "held_for_orders" not in payload:
+        return None
+    try:
+        return int(payload["held_for_orders"])
+    except (TypeError, ValueError):
+        return None
+
+
+class _NothingToProtect(Exception):
+    """Sentinel: the position emptied between retries — stop immediately,
+    submitting nothing (would otherwise risk shorting the account)."""
+
 
 def _filled_qty(status) -> int:
     """Order.filled_qty is a str ('' until fills land). Only str values are
@@ -86,6 +120,7 @@ def _filled_avg(status) -> float:
 
 class AlpacaBroker:
     def __init__(self, cfg: dict):
+        self._cfg = cfg
         alpaca_cfg = cfg.get("alpaca", {})
         self.paper = bool(alpaca_cfg.get("paper", True))
         self._client = None
@@ -167,6 +202,7 @@ class AlpacaBroker:
         # limit is self-guarding (it only fills while the price is inside
         # the limit), so the retry catches paper-engine latency-cancels and
         # cap-edge fades without ever chasing a gap beyond the protection.
+        self._naked_remainder_tickers: set[str] = set()
         first_reports, retryable = self._place_batch(orders)
         results = {id(o): r for o, r in zip(orders, first_reports, strict=False)}
         if retryable:
@@ -180,7 +216,56 @@ class AlpacaBroker:
             for o, r in zip(retryable, second_reports, strict=False):
                 results[id(o)] = r
 
+        self._resweep_naked_sell_remainders(orders)
         return [results[id(o)] for o in orders]
+
+    def _resweep_naked_sell_remainders(self, orders: list[Order]) -> None:
+        """One last-resort protection pass after the whole batch resolves.
+
+        2026-09-14/15: HPQ exhausted the remainder-stop retry deadline and
+        stayed naked for hours (recoverable only by next morning's stop
+        sweep or a manual fix). Other orders in the SAME batch cancelling
+        or filling around the same time are a plausible contributor to the
+        held_for_orders contention that caused the exhaustion — checking
+        again after the whole batch has settled, rather than only inside
+        each order's own finalize step, gives the race more real-world time
+        to clear before falling back to tomorrow's sweep.
+
+        Scope is deliberately narrow: only tickers where ``_place_batch``
+        itself already decided protection was owed (passed every existing
+        guard — not fill_unknown, not a pending retry) AND the in-batch
+        attach attempt failed. This never re-derives protection intent from
+        `stop_price` alone, so it can never attach a stop the batch's own
+        fill_unknown / pending-retry guards deliberately withheld (double-
+        sell risk).
+
+        Failure-safe: a broker error here is logged and swallowed, never
+        raised out of place_market_orders (the batch's own reports are
+        unaffected).
+        """
+        naked = getattr(self, "_naked_remainder_tickers", set())
+        if not naked:
+            return
+        try:
+            resting = self.get_resting_protection()
+        except Exception as exc:  # noqa: BLE001 — leave it for tomorrow's sweep
+            logger.warning("resweep skipped (protection snapshot: %s)", exc)
+            return
+        stop_by_ticker = {o.ticker: o.stop_price for o in orders
+                          if o.action == "SELL" and o.stop_price is not None}
+        for ticker in sorted(naked):
+            if resting.get(ticker):
+                continue  # already protected (a later attempt succeeded)
+            remain = self._position_qty(ticker)
+            if remain < 1:
+                continue  # flat; nothing to protect
+            stop_price = stop_by_ticker.get(ticker)
+            if stop_price is None:
+                continue  # no anchor level on record; nothing to resweep with
+            logger.warning("%s: still unprotected after the batch — "
+                           "one resweep attempt", ticker)
+            if self._submit_remainder_stop(ticker, remain, stop_price):
+                logger.info("resweep: re-anchored GTC stop for %s", ticker)
 
     def _place_batch(self, orders: list[Order],
                      final_round: bool = False) -> tuple[list[dict], list[Order]]:
@@ -194,6 +279,8 @@ class AlpacaBroker:
         """
         reports = []
         retryable = []
+        if not hasattr(self, "_naked_remainder_tickers"):
+            self._naked_remainder_tickers = set()  # direct _place_batch use
 
         # Phase 1: submit EVERY order before polling any. Sequential
         # submit+poll per order let each full poll window delay the next
@@ -246,13 +333,15 @@ class AlpacaBroker:
                 # and the position is intact. The real position query guards
                 # the case where the sell actually landed despite the
                 # exception (flat -> nothing to protect).
-                if (o.action == "SELL" and o.stop_price is not None
-                        and self._submit_remainder_stop(o.ticker, o.shares,
-                                                        o.stop_price)):
+                if o.action == "SELL" and o.stop_price is not None:
+                    if self._submit_remainder_stop(o.ticker, o.shares,
+                                                   o.stop_price):
                         logger.error(
                             "submit failed for %s (%s); re-anchored GTC stop "
                             "%.2f for the intact position",
                             o.ticker, exc, o.stop_price)
+                    else:
+                        self._naked_remainder_tickers.add(o.ticker)
                 reports.append({"ticker": o.ticker, "action": o.action,
                                 "shares": o.shares, "filled": 0, "avg_price": 0.0})
                 continue
@@ -403,13 +492,14 @@ class AlpacaBroker:
                     # Leftover-stop cleanup (full exits keep their belt-and-
                     # braces cleanup; never cancels the fresh stop below).
                     self._cancel_open_stops(o.ticker)
-                    if (o.stop_price is not None
-                            and self._submit_remainder_stop(o.ticker,
-                                                            o.shares,
-                                                            o.stop_price)):
+                    if o.stop_price is not None:
+                        if self._submit_remainder_stop(o.ticker, o.shares,
+                                                        o.stop_price):
                             logger.info(
                                 "re-anchored GTC stop %s for %s remainder",
                                 o.stop_price, o.ticker)
+                        else:
+                            self._naked_remainder_tickers.add(o.ticker)
             except Exception as exc:  # noqa: BLE001
                 logger.error("order handling failed for %s: %s", o.ticker, exc)
             reports.append({"ticker": o.ticker, "action": o.action,
@@ -581,6 +671,51 @@ class AlpacaBroker:
                 })
         return cancelled
 
+    def _retry_until_available(self, symbol: str, submit_fn, deadline_s: float):
+        """Retry a submit callable through Alpaca's held_for_orders race.
+
+        2026-09-15: HPQ/AMD/DELL/VLO/ZBRA all hit held_for_orders rejections
+        in one run; the old fixed 3-attempt/6s budget exhausted on HPQ three
+        separate times, leaving it naked for hours. This retries against a
+        wall-clock deadline instead of a fixed count — the rejection payload
+        already carries the exact reservation count, so a recognized race
+        keeps retrying as long as time remains, closing the same-day gap
+        the old budget could not. An unrecognized error (not this race)
+        falls back to a small fixed number of attempts instead of burning
+        the full deadline on an unrelated failure.
+
+        Returns the submit_fn result, or None if the deadline/fallback
+        budget is exhausted. Never raises for a recognized or unrecognized
+        submit failure; the caller decides how to log/react.
+        """
+        deadline: float | None = None
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return submit_fn()
+            except _NothingToProtect:
+                raise  # propagate immediately, never retried
+            except Exception as exc:  # noqa: BLE001 — race-classified below
+                held = _held_for_orders(exc)
+                if held is None:
+                    logger.warning("%s attempt %d failed (unrecognized): %s",
+                                   symbol, attempt, exc)
+                    if attempt >= _UNRECOGNIZED_ERROR_ATTEMPTS:
+                        return None
+                    time.sleep(_RETRY_POLL_INTERVAL_S)
+                    continue
+                logger.warning("%s attempt %d failed (held_for_orders=%d): %s",
+                               symbol, attempt, held, exc)
+                # Deadline clock starts on the first failure, not before the
+                # first attempt — an immediately-successful submit (the
+                # common case) never touches the clock.
+                if deadline is None:
+                    deadline = time.monotonic() + deadline_s
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(_RETRY_POLL_INTERVAL_S)
+
     def place_stop(self, symbol: str, qty: int, stop_px: float) -> bool:
         """Place a GTC stop with the existing position-lag retry guard."""
         return self._submit_remainder_stop(symbol, qty, stop_px)
@@ -588,57 +723,68 @@ class AlpacaBroker:
     def place_oco(self, symbol: str, qty: int, stop_px: float,
                   target_px: float) -> str:
         """Place a GTC sell OCO, sized from the live position on each retry."""
-        last_error: Exception | None = None
-        for attempt in range(3):
+        def submit():
             remain = self._position_qty(symbol)
             if remain < 1:
-                raise RuntimeError(f"no position remains to protect for {symbol}")
-            try:
-                submitted = self._client.submit_order(LimitOrderRequest(
-                    symbol=symbol, qty=remain, side=OrderSide.SELL,
-                    type=OrderType.LIMIT, limit_price=target_px,
-                    order_class=OrderClass.OCO,
-                    take_profit=TakeProfitRequest(limit_price=target_px),
-                    stop_loss=StopLossRequest(stop_price=stop_px),
-                    time_in_force=TimeInForce.GTC, extended_hours=False,
-                ))
-                return str(submitted.id)
-            except Exception as exc:  # noqa: BLE001 — held-for-orders lag
-                last_error = exc
-                logger.warning("OCO for %s attempt %d failed: %s", symbol,
-                               attempt + 1, exc)
-                time.sleep(2)
-        raise RuntimeError(f"OCO for {symbol} failed after retries: {last_error}")
+                raise _NothingToProtect(symbol)
+            submitted = self._client.submit_order(LimitOrderRequest(
+                symbol=symbol, qty=remain, side=OrderSide.SELL,
+                type=OrderType.LIMIT, limit_price=target_px,
+                order_class=OrderClass.OCO,
+                take_profit=TakeProfitRequest(limit_price=target_px),
+                stop_loss=StopLossRequest(stop_price=stop_px),
+                time_in_force=TimeInForce.GTC, extended_hours=False,
+            ))
+            return str(submitted.id)
+
+        try:
+            result = self._retry_until_available(
+                symbol, submit, self._remainder_retry_deadline_s())
+        except _NothingToProtect:
+            raise RuntimeError(f"no position remains to protect for {symbol}") from None
+        if result is None:
+            raise RuntimeError(f"OCO for {symbol} failed after retries")
+        return result
+
+    def _remainder_retry_deadline_s(self) -> float:
+        """Wall-clock budget for the held_for_orders retry (config
+        remainder_protection_retry_s, default 30s — see spec
+        2026-09-15-remainder-protection-retry-hardening-design.md)."""
+        return float(self._cfg.get("remainder_protection_retry_s", 30.0))
 
     def _submit_remainder_stop(self, symbol: str, qty: int,
                                stop_price: float) -> bool:
-        """Submit the remainder GTC stop with bounded retries.
+        """Submit the remainder GTC stop with a held_for_orders-aware retry.
 
         A just-cancelled sell can leave shares in Alpaca's held_for_orders
-        accounting for a few seconds (DXCM 2026-09-09: the re-anchor stop
-        for 9 shares was rejected 403 "available: 7" while the cancelled
-        sell's 2 shares were still reserved) — and the position can change
+        accounting for some seconds (DXCM 2026-09-09; recurring worse on
+        HPQ 2026-09-14/15, exhausting the old fixed 3-attempt/6s budget and
+        leaving the position naked for hours) — and the position can change
         between tries. Re-query the position per attempt and size to it;
-        up to 3 attempts, 2s apart. Returns True when a stop is resting.
+        retry through the shared deadline-based helper. Returns True when a
+        stop is resting.
         """
-        for attempt in range(3):
+        def submit():
             remain = self._position_qty(symbol)
             if remain < 1:
-                return False  # nothing left to protect
-            try:
-                self._client.submit_order(StopOrderRequest(
-                    symbol=symbol, qty=remain, side=OrderSide.SELL,
-                    type=OrderType.STOP, stop_price=stop_price,
-                    time_in_force=TimeInForce.GTC, extended_hours=False,
-                ))
-                return True
-            except Exception as exc:  # noqa: BLE001 — retry below
-                logger.warning("remainder stop for %s attempt %d failed: %s",
-                               symbol, attempt + 1, exc)
-                time.sleep(2)
-        logger.error("remainder stop for %s NOT placed after retries — "
-                     "position unprotected", symbol)
-        return False
+                raise _NothingToProtect(symbol)
+            self._client.submit_order(StopOrderRequest(
+                symbol=symbol, qty=remain, side=OrderSide.SELL,
+                type=OrderType.STOP, stop_price=stop_price,
+                time_in_force=TimeInForce.GTC, extended_hours=False,
+            ))
+            return True
+
+        try:
+            result = self._retry_until_available(
+                symbol, submit, self._remainder_retry_deadline_s())
+        except _NothingToProtect:
+            return False  # nothing left to protect
+        if result is None:
+            logger.error("remainder stop for %s NOT placed after retries — "
+                         "position unprotected", symbol)
+            return False
+        return True
 
     def cancel_stops_for(self, tickers: list[str]) -> dict[str, list[dict]]:
         """Backward-compatible name for the nested-aware exit disarm."""

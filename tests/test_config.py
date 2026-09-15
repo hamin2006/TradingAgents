@@ -39,6 +39,7 @@ def test_defaults_include_app_defaults(tmp_path):
     assert cfg["screener"]["entry_protection_pct"] == 2.0
     assert cfg["max_positions"] == 10
     assert cfg["capital"] == 100_000
+    assert cfg["remainder_protection_retry_s"] == 30.0
 
 
 def test_load_yaml_overrides_and_merges(tmp_path):

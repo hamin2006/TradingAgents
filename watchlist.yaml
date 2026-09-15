@@ -26,6 +26,10 @@ stop_loss_pct: 8.0         # broker-side GTC stop on every buy (0 disables)
 risk_budget_pct: 1.2       # equity % risked per fallback position at its stop;
                            # per-name ceiling = risk_budget_pct / stop_loss_pct
                            # (15% at defaults) — supersedes the old cash slice
+remainder_protection_retry_s: 30.0  # held_for_orders retry deadline for
+                           # remainder-stop / OCO re-anchoring (spec
+                           # 2026-09-15); replaces the old fixed 3-attempt/6s
+                           # budget that exhausted on HPQ 2026-09-14/15
 tripwire_gap_pct: 5.0     # pre-open pause: BUY skipped if pre-market quote is
                           # this % below the reference close (overnight events)
 fundamentals_source: edgar  # "edgar" = SEC companyfacts as-filed statements

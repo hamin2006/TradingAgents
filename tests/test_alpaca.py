@@ -1005,6 +1005,100 @@ def test_remainder_stop_gives_up_after_bounded_retries(broker):
     assert mock_client.submit_order.call_count == 3  # bounded
 
 
+def test_retry_until_available_outlasts_held_for_orders_past_old_budget(broker):
+    """2026-09-15: HPQ exhausted the old fixed 3-attempt/6s budget while
+    held_for_orders was still draining. The deadline-based retry must keep
+    trying — past the old attempt count — as long as the wall clock has
+    not expired, and succeed once the broker accepts."""
+    b, mock_client, _ = broker
+    ok_result = MagicMock()
+    # 5 rejections (more than the old 3-attempt cap), then success.
+    mock_client.submit_order.side_effect = (
+        [Exception('{"code":40310000,"held_for_orders":"3",'
+                   '"available":"19","existing_qty":"22"}')] * 5
+        + [ok_result])
+    ticks = iter([0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        result = b._retry_until_available(
+            "HPQ", lambda: mock_client.submit_order(MagicMock()),
+            deadline_s=30.0)
+    assert result is ok_result
+    assert mock_client.submit_order.call_count == 6
+
+
+def test_retry_until_available_gives_up_at_deadline(broker):
+    """Persistent held_for_orders past the deadline: bounded give-up, no
+    hang, no raise — caller decides how to log/react."""
+    b, mock_client, _ = broker
+    mock_client.submit_order.side_effect = Exception(
+        '{"code":40310000,"held_for_orders":"3","available":"19"}')
+    ticks = iter([0.0, 2.0, 4.0, 30.0, 32.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        result = b._retry_until_available(
+            "HPQ", lambda: mock_client.submit_order(MagicMock()),
+            deadline_s=30.0)
+    assert result is None
+
+
+def test_retry_until_available_falls_back_on_unparseable_error(broker):
+    """An error that doesn't carry the held_for_orders shape is not this
+    known race — retry a small fixed number of times (today's behavior)
+    rather than burning the full deadline on an unrelated failure."""
+    b, mock_client, _ = broker
+    mock_client.submit_order.side_effect = Exception("connection reset")
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: 0.0):
+        result = b._retry_until_available(
+            "HPQ", lambda: mock_client.submit_order(MagicMock()),
+            deadline_s=30.0)
+    assert result is None
+    assert mock_client.submit_order.call_count == 3  # bounded fallback
+
+
+def test_remainder_stop_uses_configured_deadline(broker):
+    """_submit_remainder_stop routes through the shared deadline-based
+    retry using the configured remainder_protection_retry_s (default 30s),
+    not the old fixed 3-attempt cap."""
+    b, mock_client, _ = broker
+    stop = MagicMock()
+    stop.id = "stop-1"
+    mock_client.submit_order.side_effect = (
+        [Exception('{"code":40310000,"held_for_orders":"1",'
+                   '"available":"8","existing_qty":"9"}')] * 4
+        + [stop])
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="DXCM", qty="9")]
+    ticks = iter([0.0, 2.0, 4.0, 6.0, 8.0, 10.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        ok = b._submit_remainder_stop("DXCM", 9, 81.4)
+    assert ok is True
+    assert mock_client.submit_order.call_count == 5  # past the old 3-cap
+
+
+def test_place_oco_uses_shared_retry_helper(broker):
+    """place_oco hits the identical held_for_orders race (2026-09-15: AMD/
+    DELL/VLO/ZBRA) and must retry through the same deadline-based helper,
+    not its own separate fixed 3-attempt loop."""
+    b, mock_client, _ = broker
+    oco = MagicMock()
+    oco.id = "oco-1"
+    mock_client.submit_order.side_effect = (
+        [Exception('{"code":40310000,"held_for_orders":"1",'
+                   '"available":"0","existing_qty":"1"}')] * 4
+        + [oco])
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="AMD", qty="1")]
+    ticks = iter([0.0, 2.0, 4.0, 6.0, 8.0, 10.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        order_id = b.place_oco("AMD", 1, 471.0, 540.0)
+    assert order_id == "oco-1"
+    assert mock_client.submit_order.call_count == 5  # past the old 3-cap
+
+
 def test_remainder_stop_stops_retrying_when_position_gone(broker):
     """If the position empties between retries there is nothing to
     protect — stop retrying, place nothing (would short the account)."""
@@ -1017,6 +1111,100 @@ def test_remainder_stop_stops_retrying_when_position_gone(broker):
         ok = b._submit_remainder_stop("DXCM", 9, 81.4)
     assert ok is False
     assert mock_client.submit_order.call_count == 1
+
+
+def test_place_market_orders_resweeps_naked_sell_remainder_after_batch(broker):
+    """2026-09-14/15: HPQ exhausted the remainder-stop retry and stayed
+    naked for hours, recoverable only by the next morning's stop sweep or a
+    manual fix. After the whole order batch resolves, a still-naked SELL
+    remainder gets one more resweep attempt — other orders' cancels/fills
+    in the same batch can be exactly what was occupying held_for_orders."""
+    b, mock_client, _ = broker
+    sell = MagicMock()
+    sell.id = "sell-1"
+    sell.status = "filled"
+    sell.filled_qty = "3"
+    sell.filled_avg_price = "34.0"
+    # The remainder stop attach inside _place_batch's finalize fails every
+    # time (simulating the retry deadline being exhausted in-batch);
+    # get_orders reports no resting protection until the resweep succeeds.
+    stop_ok = MagicMock()
+    stop_ok.id = "stop-resweep"
+    mock_client.submit_order.side_effect = [
+        sell,
+        Exception('{"code":40310000,"held_for_orders":"2","available":"17"}'),
+        stop_ok]
+    mock_client.get_order_by_id.return_value = sell
+    mock_client.get_orders.return_value = []  # no resting protection yet
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="HPQ", qty="19")]
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.AlpacaBroker._remainder_retry_deadline_s",
+               return_value=0.0):
+        b.place_market_orders(
+            [Order(ticker="HPQ", action="SELL", shares=3,
+                   reason="pm-execution", stop_price=32.47)])
+    stop_requests = [c[0][0] for c in mock_client.submit_order.call_args_list
+                     if c[0][0].type.value == "stop"]
+    assert len(stop_requests) == 2  # in-batch attempt + resweep
+    assert stop_requests[-1].qty == 19
+    assert stop_requests[-1].stop_price == 32.47
+
+
+def test_place_market_orders_resweep_skips_already_protected_ticker(broker):
+    """Idempotent: if the in-batch attach actually succeeded, the resweep
+    must not attach a second, duplicate stop."""
+    b, mock_client, _ = broker
+    sell = MagicMock()
+    sell.id = "sell-1"
+    sell.status = "filled"
+    sell.filled_qty = "3"
+    sell.filled_avg_price = "34.0"
+    stop_ok = MagicMock()
+    stop_ok.id = "stop-1"
+    mock_client.submit_order.side_effect = [sell, stop_ok]
+    mock_client.get_order_by_id.return_value = sell
+    resting_stop = MagicMock()
+    resting_stop.symbol = "HPQ"
+    resting_stop.type = "stop"
+    resting_stop.stop_price = "32.47"
+    resting_stop.qty = "19"
+    mock_client.get_orders.return_value = [resting_stop]
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="HPQ", qty="19")]
+    with patch("alpaca_broker.time.sleep"):
+        b.place_market_orders(
+            [Order(ticker="HPQ", action="SELL", shares=3,
+                   reason="pm-execution", stop_price=32.47)])
+    stop_requests = [c[0][0] for c in mock_client.submit_order.call_args_list
+                     if c[0][0].type.value == "stop"]
+    assert len(stop_requests) == 1  # only the in-batch attach; no resweep dup
+
+
+def test_place_market_orders_resweep_is_failure_safe(broker):
+    """A broker error during the resweep's protection query must not raise
+    out of place_market_orders — log and move on, leave it for tomorrow's
+    stop sweep."""
+    b, mock_client, _ = broker
+    sell = MagicMock()
+    sell.id = "sell-1"
+    sell.status = "filled"
+    sell.filled_qty = "3"
+    sell.filled_avg_price = "34.0"
+    mock_client.submit_order.side_effect = [
+        sell,
+        Exception('{"code":40310000,"held_for_orders":"2","available":"17"}')]
+    mock_client.get_order_by_id.return_value = sell
+    mock_client.get_orders.side_effect = Exception("broker down")
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="HPQ", qty="19")]
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.AlpacaBroker._remainder_retry_deadline_s",
+               return_value=0.0):
+        reports = b.place_market_orders(
+            [Order(ticker="HPQ", action="SELL", shares=3,
+                   reason="pm-execution", stop_price=32.47)])
+    assert reports[0]["filled"] == 3  # the sell report itself is unaffected
 
 
 def test_get_filled_stop_orders_filters_by_fill_window_type_and_status(broker):
