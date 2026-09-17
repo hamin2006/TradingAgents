@@ -1231,6 +1231,44 @@ def _ensure_reasoning_capture() -> None:
     _REASONING_CAPTURE_PATCHED = True
 
 
+_DEEPSEEK_V41_CAPABILITIES_PATCHED = False
+_DEEPSEEK_V41_MODEL_ID = "deepseek-v4.1-flash"
+
+
+def _reset_deepseek_v41_capabilities() -> None:
+    """Remove the deepseek-v4.1-flash capabilities entry (tests; safe anytime,
+    including when never installed)."""
+    global _DEEPSEEK_V41_CAPABILITIES_PATCHED
+    import tradingagents.llm_clients.capabilities as caps
+
+    caps._BY_ID.pop(_DEEPSEEK_V41_MODEL_ID, None)
+    _DEEPSEEK_V41_CAPABILITIES_PATCHED = False
+
+
+def _ensure_deepseek_v41_capabilities() -> None:
+    """Register deepseek/deepseek-v4.1-flash in the frozen capabilities table.
+
+    Released 2026-09-10, same thinking-capable architecture family as
+    deepseek-v4-flash/deepseek-v4-pro (DeepSeek's own release notes; OpenRouter's
+    model page documents thinking mode on by default). The framework's
+    capabilities._BY_ID only has exact-ID entries for the two existing models,
+    so an unmatched "deepseek-v4.1-flash" falls through to _DEFAULT
+    (supports_tool_choice=True, requires_reasoning_content_roundtrip=False) —
+    the same gap class that made deepseek-v4-flash/v4-pro 400 on tool_choice
+    and drop reasoning_content on the multi-turn round-trip before those two
+    were added explicitly. Mirrors the existing _DEEPSEEK_THINKING entry
+    rather than inventing new capability values. Idempotent; never touches
+    any other entry in the table.
+    """
+    global _DEEPSEEK_V41_CAPABILITIES_PATCHED
+    if _DEEPSEEK_V41_CAPABILITIES_PATCHED:
+        return
+    import tradingagents.llm_clients.capabilities as caps
+
+    caps._BY_ID.setdefault(_DEEPSEEK_V41_MODEL_ID, caps._BY_ID["deepseek-v4-flash"])
+    _DEEPSEEK_V41_CAPABILITIES_PATCHED = True
+
+
 def _reset_analyst_report_recovery() -> None:
     """Restore the analyst factory seams (tests; safe anytime)."""
     global _ANALYST_REPORT_RECOVERY_PATCHED
@@ -1923,6 +1961,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_structured_fallback_logging()
     _ensure_analyst_report_recovery()
     _ensure_analyst_tool_budget(cfg)
+    _ensure_deepseek_v41_capabilities()
     _ensure_reasoning_capture()
     _ensure_portfolio_context(cfg)
     _ensure_edgar_fundamentals(cfg)

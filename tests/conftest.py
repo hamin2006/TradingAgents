@@ -69,6 +69,19 @@ def _reset_daily_run_memory_patch():
         mod._reset_memory_review_tag()
 
 
+@pytest.fixture(autouse=True)
+def _reset_deepseek_v41_capabilities_patch():
+    """The deepseek-v4.1-flash capabilities entry lives on the frozen
+    framework's module-level dict (installed by run_analyze); reset it after
+    every test so later files see the pristine, unpatched table."""
+    yield
+    import sys
+
+    mod = sys.modules.get("daily_run")
+    if mod is not None and getattr(mod, "_DEEPSEEK_V41_CAPABILITIES_PATCHED", False):
+        mod._reset_deepseek_v41_capabilities()
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()

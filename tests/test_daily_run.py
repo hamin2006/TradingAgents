@@ -202,6 +202,70 @@ def test_ensure_fred_aliases_discloses_full_map_in_tool_description():
         daily_run._FRED_PATCHED = False
 
 
+# --- deepseek-v4.1-flash capability registration (2026-09-16) ---------------
+
+def test_ensure_deepseek_v41_capabilities_adds_thinking_entry():
+    """deepseek/deepseek-v4.1-flash is unmatched in the framework's frozen
+    capabilities table and falls through to _DEFAULT (supports_tool_choice=
+    True), the same class of gap that made deepseek-v4-flash/v4-pro 400 on
+    tool_choice before they were added explicitly. V4.1-Flash is the same
+    thinking-capable architecture family (DeepSeek's 2026-09-10 release
+    notes; OpenRouter's own model page documents tool/tool_choice support
+    at the gateway, but the reasoning_content round-trip requirement is a
+    DeepSeek wire-protocol property this framework must still declare)."""
+    import daily_run
+    import tradingagents.llm_clients.capabilities as caps
+
+    daily_run._reset_deepseek_v41_capabilities()
+    try:
+        assert "deepseek-v4.1-flash" not in caps._BY_ID
+        daily_run._ensure_deepseek_v41_capabilities()
+        entry = caps._BY_ID["deepseek-v4.1-flash"]
+        assert entry == caps._BY_ID["deepseek-v4-flash"]
+        assert entry.supports_tool_choice is False
+        assert entry.requires_reasoning_content_roundtrip is True
+    finally:
+        daily_run._reset_deepseek_v41_capabilities()
+
+
+def test_ensure_deepseek_v41_capabilities_idempotent():
+    import daily_run
+    import tradingagents.llm_clients.capabilities as caps
+
+    daily_run._reset_deepseek_v41_capabilities()
+    try:
+        daily_run._ensure_deepseek_v41_capabilities()
+        daily_run._ensure_deepseek_v41_capabilities()
+        assert list(caps._BY_ID).count("deepseek-v4.1-flash") == 1
+    finally:
+        daily_run._reset_deepseek_v41_capabilities()
+
+
+def test_reset_deepseek_v41_capabilities_removes_entry_and_is_safe_unpatched():
+    import daily_run
+    import tradingagents.llm_clients.capabilities as caps
+
+    daily_run._reset_deepseek_v41_capabilities()  # safe when never installed
+    daily_run._ensure_deepseek_v41_capabilities()
+    assert "deepseek-v4.1-flash" in caps._BY_ID
+    daily_run._reset_deepseek_v41_capabilities()
+    assert "deepseek-v4.1-flash" not in caps._BY_ID
+
+
+def test_ensure_deepseek_v41_capabilities_does_not_touch_other_entries():
+    import daily_run
+    import tradingagents.llm_clients.capabilities as caps
+
+    daily_run._reset_deepseek_v41_capabilities()
+    before = dict(caps._BY_ID)
+    try:
+        daily_run._ensure_deepseek_v41_capabilities()
+        for key, value in before.items():
+            assert caps._BY_ID[key] == value
+    finally:
+        daily_run._reset_deepseek_v41_capabilities()
+
+
 # --- structured-output fallback visibility + safety (F3) ---------------------
 
 def test_extract_rating_passes_review_through():

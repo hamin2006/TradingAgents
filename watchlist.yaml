@@ -2,8 +2,23 @@
 seed_watchlist: [AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA]   # used until the first screen
 
 llm_provider: openrouter
-quick_think_llm: deepseek/deepseek-v4-flash-0731   # dated snapshot, cheaper prompt pricing
-deep_think_llm: deepseek/deepseek-v4-pro
+quick_think_llm: deepseek/deepseek-v4.1-flash   # released 2026-09-10; outperforms
+deep_think_llm: deepseek/deepseek-v4.1-flash    # both prior v4-flash and v4-pro on
+                          # most benchmarks (DeepSeek + OpenRouter + third-party
+                          # writeups, verified 2026-09-16); capabilities patch
+                          # in daily_run.py (_ensure_deepseek_v41_capabilities)
+                          # declares the same tool_choice/reasoning_content
+                          # quirks as v4-flash/v4-pro since it's the same
+                          # thinking-capable architecture family — smoke-tested
+                          # live (tool call + multi-turn round-trip, no 400s)
+                          # before this switch. NOTE: a discrete PM-only "max
+                          # thinking level" was requested but is NOT wired —
+                          # OpenRouter's reasoning.effort needs a top-level
+                          # request field this framework's _PASSTHROUGH_KWARGS
+                          # allowlist has no slot for, and PM/Research Manager
+                          # share one deep_think_llm with no per-role override;
+                          # both are frozen-framework gaps, not implementable
+                          # via a runtime patch (see AGENTS.md).
 output_language: English
 max_tokens: 15000         # output-token cap forwarded to every provider client:
                           # deepseek-v4-flash runs away uncapped (100K+ token
@@ -15,8 +30,7 @@ max_tokens: 15000         # output-token cap forwarded to every provider client:
 # Pin OpenRouter routing per model slug (multiple hosts serve the same model;
 # pin to the preferred host; fallbacks stay enabled). Unknown models route unpinned.
 openrouter_provider_pins:
-  deepseek/deepseek-v4-flash-0731: Relace
-  deepseek/deepseek-v4-pro: StreamLake
+  deepseek/deepseek-v4.1-flash: Relace
 
 capital: 10000            # documentation only since risk-budget sizing (2026-09-11);
                           # sizing base is real equity (cash + holdings)
