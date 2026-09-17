@@ -82,6 +82,23 @@ def _reset_deepseek_v41_capabilities_patch():
         mod._reset_deepseek_v41_capabilities()
 
 
+@pytest.fixture(autouse=True)
+def _reset_pm_max_reasoning_effort_patch():
+    """The PM reasoning-effort wrap and the extra_body allowlist extension
+    both live on frozen framework module-level state (installed by
+    run_analyze); reset both after every test."""
+    yield
+    import sys
+
+    mod = sys.modules.get("daily_run")
+    if mod is None:
+        return
+    if getattr(mod, "_PM_MAX_REASONING_EFFORT_PATCHED", False):
+        mod._reset_pm_max_reasoning_effort()
+    if getattr(mod, "_OPENROUTER_REASONING_PASSTHROUGH_PATCHED", False):
+        mod._reset_openrouter_reasoning_passthrough()
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()

@@ -18,7 +18,7 @@ _KNOWN_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(
      "stop_px_band_pct", "min_order_value_usd", "card_max_age_days",
      "card_flip_inject_max", "max_analyst_tool_rounds",
      "openrouter_provider_pins", "fundamentals_source",
-     "remainder_protection_retry_s"]
+     "remainder_protection_retry_s", "pm_reasoning_effort"]
 )
 
 # App-level defaults for keys the framework does not know about. These live
@@ -39,6 +39,16 @@ APP_DEFAULTS = {
     # risk_budget_pct / stop_loss_pct (15% at defaults). Replaced the old
     # cash-derived `capital / max_positions` slice.
     "risk_budget_pct": 1.2,
+    # PM-only reasoning-effort override via OpenRouter's unified reasoning
+    # request field (spec 2026-09-17): None = disabled (default). When set
+    # to "low"/"medium"/"high"/"max", raises the deep-thinking model's own
+    # reasoning budget for BOTH agents that share deep_think_llm -- the
+    # Research Manager and the Portfolio Manager (TradingAgentsGraph builds
+    # one instance for both; there is no per-role model slot). Scoped in
+    # daily_run.py to a deepseek/ model on the openrouter provider -- the
+    # only combination verified live to actually move reasoning-token
+    # spend through this project's client.
+    "pm_reasoning_effort": None,
     # Held-for-orders retry deadline for remainder-stop / OCO re-anchoring
     # (spec 2026-09-15): wall-clock seconds to keep retrying a rejection
     # that carries Alpaca's held_for_orders reservation count, replacing

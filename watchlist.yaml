@@ -44,6 +44,15 @@ remainder_protection_retry_s: 30.0  # held_for_orders retry deadline for
                            # remainder-stop / OCO re-anchoring (spec
                            # 2026-09-15); replaces the old fixed 3-attempt/6s
                            # budget that exhausted on HPQ 2026-09-14/15
+pm_reasoning_effort: high  # OpenRouter reasoning.effort override for the
+                           # shared deep-thinking model (Research Manager +
+                           # Portfolio Manager, spec 2026-09-17). NOTE:
+                           # max was tried first live and reliably hit
+                           # finish_reason: length under max_tokens: 15000
+                           # (entire budget spent on reasoning, decision
+                           # truncated); high uses less of the budget
+                           # (~80% vs max's ~95%) -- re-verify live before
+                           # trusting this in production.
 tripwire_gap_pct: 5.0     # pre-open pause: BUY skipped if pre-market quote is
                           # this % below the reference close (overnight events)
 fundamentals_source: edgar  # "edgar" = SEC companyfacts as-filed statements

@@ -1269,6 +1269,128 @@ def _ensure_deepseek_v41_capabilities() -> None:
     _DEEPSEEK_V41_CAPABILITIES_PATCHED = True
 
 
+_OPENROUTER_REASONING_PASSTHROUGH_PATCHED = False
+
+
+def _reset_openrouter_reasoning_passthrough() -> None:
+    """Restore the frozen _PASSTHROUGH_KWARGS tuple (tests; safe anytime,
+    including when never installed)."""
+    global _OPENROUTER_REASONING_PASSTHROUGH_PATCHED
+    import tradingagents.llm_clients.openai_client as oc
+
+    if "extra_body" in oc._PASSTHROUGH_KWARGS:
+        oc._PASSTHROUGH_KWARGS = tuple(
+            k for k in oc._PASSTHROUGH_KWARGS if k != "extra_body")
+    _OPENROUTER_REASONING_PASSTHROUGH_PATCHED = False
+
+
+def _ensure_openrouter_reasoning_passthrough() -> None:
+    """Extend the frozen _PASSTHROUGH_KWARGS allowlist with 'extra_body'.
+
+    LangChain's BaseChatOpenAI carries a genuine extra_body pydantic field
+    ("the recommended way to pass custom parameters that are specific to
+    your OpenAI-compatible API provider") -- exactly OpenRouter's unified
+    reasoning: {"effort": ...} request field. The framework's
+    _PASSTHROUGH_KWARGS is a plain module-level tuple with no slot for it,
+    so a caller-supplied extra_body kwarg is silently dropped before
+    reaching ChatOpenAI. This appends the one missing key; it does nothing
+    on its own until a caller actually passes extra_body (see
+    _ensure_pm_max_reasoning_effort). Idempotent; never removes or reorders
+    existing entries.
+    """
+    global _OPENROUTER_REASONING_PASSTHROUGH_PATCHED
+    if _OPENROUTER_REASONING_PASSTHROUGH_PATCHED:
+        return
+    import tradingagents.llm_clients.openai_client as oc
+
+    if "extra_body" not in oc._PASSTHROUGH_KWARGS:
+        oc._PASSTHROUGH_KWARGS = oc._PASSTHROUGH_KWARGS + ("extra_body",)
+    _OPENROUTER_REASONING_PASSTHROUGH_PATCHED = True
+
+
+_PM_MAX_REASONING_EFFORT_PATCHED = False
+_PM_MAX_REASONING_EFFORT_ORIGINALS: dict[str, object] = {}
+_DEEP_TIER_MAX_EFFORT_FACTORY_NAMES = (
+    "create_research_manager",
+    "create_portfolio_manager",
+)
+
+
+def _reset_pm_max_reasoning_effort() -> None:
+    """Restore create_research_manager/create_portfolio_manager (tests;
+    safe anytime, including when never installed)."""
+    global _PM_MAX_REASONING_EFFORT_PATCHED
+    if _PM_MAX_REASONING_EFFORT_PATCHED:
+        import tradingagents.graph.setup as setup_mod
+
+        for name, original in _PM_MAX_REASONING_EFFORT_ORIGINALS.items():
+            setattr(setup_mod, name, original)
+    _PM_MAX_REASONING_EFFORT_ORIGINALS.clear()
+    _PM_MAX_REASONING_EFFORT_PATCHED = False
+
+
+def _ensure_pm_max_reasoning_effort(cfg: dict) -> None:
+    """Raise the shared deep_thinking_llm's reasoning effort via OpenRouter
+    for both agents that use it -- the Research Manager and the Portfolio
+    Manager (TradingAgentsGraph builds ONE deep_thinking_llm instance shared
+    by both; there is no per-agent-role model slot, so "the deep thinking
+    model" means both roles together).
+
+    Config-gated (pm_reasoning_effort unset = no-op) and scoped to a
+    deepseek/ model on openrouter -- the only combination verified live
+    (2026-09-17: extra_body={"reasoning": {"effort": ...}} measurably moved
+    reasoning-token spend through this project's actual client). A
+    different provider/model would silently receive an unverified
+    parameter, so it is left untouched instead.
+
+    Wraps the ALREADY-CONSTRUCTED create_research_manager and
+    create_portfolio_manager nodes: immediately before each one's own LLM
+    call, it mutates the shared llm's extra_body in place, then restores
+    whatever value was present before (never a hardcoded None) in a
+    finally block. Each ticker's analyze run gets its own
+    TradingAgentsGraph instance (daily_run._analyze_one), so there is no
+    cross-ticker race; the Research Manager and Portfolio Manager run in
+    different graph phases for the same ticker (never concurrently), so
+    the two wraps never fight over the same mutation.
+    """
+    global _PM_MAX_REASONING_EFFORT_PATCHED
+    if _PM_MAX_REASONING_EFFORT_PATCHED:
+        return
+    effort = cfg.get("pm_reasoning_effort")
+    if not effort:
+        return
+    if cfg.get("llm_provider") != "openrouter":
+        return
+    if not str(cfg.get("deep_think_llm", "")).startswith("deepseek/"):
+        return
+    _ensure_openrouter_reasoning_passthrough()
+    import tradingagents.graph.setup as setup_mod
+
+    def make_wrapped(original_factory):
+        def wrapped_factory(llm):
+            node = original_factory(llm)
+
+            def node_with_max_effort(state):
+                prior = getattr(llm, "extra_body", None)
+                llm.extra_body = {"reasoning": {"effort": effort}}
+                try:
+                    return node(state)
+                finally:
+                    llm.extra_body = prior
+
+            node_with_max_effort._wrapped_original = node
+            return node_with_max_effort
+
+        wrapped_factory._wrapped_original = original_factory
+        return wrapped_factory
+
+    for name in _DEEP_TIER_MAX_EFFORT_FACTORY_NAMES:
+        original_factory = getattr(setup_mod, name)
+        setattr(setup_mod, name, make_wrapped(original_factory))
+        _PM_MAX_REASONING_EFFORT_ORIGINALS[name] = original_factory
+    _PM_MAX_REASONING_EFFORT_PATCHED = True
+
+
 def _reset_analyst_report_recovery() -> None:
     """Restore the analyst factory seams (tests; safe anytime)."""
     global _ANALYST_REPORT_RECOVERY_PATCHED
@@ -1964,6 +2086,7 @@ def run_analyze(cfg: dict, tickers: list[str] | None = None) -> dict:
     _ensure_deepseek_v41_capabilities()
     _ensure_reasoning_capture()
     _ensure_portfolio_context(cfg)
+    _ensure_pm_max_reasoning_effort(cfg)  # no-op unless pm_reasoning_effort is set
     _ensure_edgar_fundamentals(cfg)
     _ensure_tape_and_events()
     _ensure_stop_sweep(cfg)  # No-naked invariant: before analyze batch starts

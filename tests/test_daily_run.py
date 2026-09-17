@@ -266,6 +266,146 @@ def test_ensure_deepseek_v41_capabilities_does_not_touch_other_entries():
         daily_run._reset_deepseek_v41_capabilities()
 
 
+# --- PM-only max reasoning effort via OpenRouter (2026-09-17) ---------------
+
+class _EffortRecordingLLM:
+    """Stub LLM with a real extra_body attribute (like ChatOpenAI's) so the
+    wrapper's mutate-then-restore behavior around the PM's own call is
+    directly observable."""
+
+    def __init__(self):
+        self.extra_body = None
+        self.seen_during_call: list = []
+
+    def with_structured_output(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def invoke(self, prompt, *args, **kwargs):
+        from langchain_core.messages import AIMessage
+        self.seen_during_call.append(self.extra_body)
+        return AIMessage(content="ok")
+
+
+def test_ensure_openrouter_reasoning_passthrough_extends_allowlist():
+    import daily_run
+    import tradingagents.llm_clients.openai_client as oc
+
+    daily_run._reset_openrouter_reasoning_passthrough()
+    try:
+        assert "extra_body" not in oc._PASSTHROUGH_KWARGS
+        daily_run._ensure_openrouter_reasoning_passthrough()
+        assert "extra_body" in oc._PASSTHROUGH_KWARGS
+        daily_run._ensure_openrouter_reasoning_passthrough()  # idempotent
+        assert oc._PASSTHROUGH_KWARGS.count("extra_body") == 1
+    finally:
+        daily_run._reset_openrouter_reasoning_passthrough()
+
+
+def test_reset_openrouter_reasoning_passthrough_restores_original_tuple():
+    import daily_run
+    import tradingagents.llm_clients.openai_client as oc
+
+    original = oc._PASSTHROUGH_KWARGS
+    daily_run._ensure_openrouter_reasoning_passthrough()
+    daily_run._reset_openrouter_reasoning_passthrough()
+    assert original == oc._PASSTHROUGH_KWARGS
+    daily_run._reset_openrouter_reasoning_passthrough()  # safe unpatched
+
+
+def test_ensure_pm_max_reasoning_effort_sets_and_restores_extra_body():
+    """The wrapped PM node must set extra_body on the shared deep_thinking_llm
+    only for the duration of its own call, and restore whatever value was
+    present before (not a hardcoded None)."""
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    cfg = {"pm_reasoning_effort": "max", "llm_provider": "openrouter",
+           "deep_think_llm": "deepseek/deepseek-v4.1-flash"}
+    daily_run._reset_pm_max_reasoning_effort()
+    try:
+        daily_run._ensure_pm_max_reasoning_effort(cfg)
+        llm = _EffortRecordingLLM()
+        llm.extra_body = {"prior": "value"}  # something already set
+        node = setup_mod.create_portfolio_manager(llm)
+        state = _tail_state()
+        node(state)
+        assert llm.seen_during_call == [{"reasoning": {"effort": "max"}}]
+        assert llm.extra_body == {"prior": "value"}  # restored after
+    finally:
+        daily_run._reset_pm_max_reasoning_effort()
+
+
+def test_ensure_pm_max_reasoning_effort_also_wraps_research_manager():
+    """The deep thinking model is shared by the Research Manager and the
+    PM -- "the deep thinking model" means both, not PM-only."""
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    cfg = {"pm_reasoning_effort": "max", "llm_provider": "openrouter",
+           "deep_think_llm": "deepseek/deepseek-v4.1-flash"}
+    daily_run._reset_pm_max_reasoning_effort()
+    try:
+        daily_run._ensure_pm_max_reasoning_effort(cfg)
+        llm = _EffortRecordingLLM()
+        node = setup_mod.create_research_manager(llm)
+        state = _tail_state()
+        node(state)
+        assert llm.seen_during_call == [{"reasoning": {"effort": "max"}}]
+        assert llm.extra_body is None  # restored after
+    finally:
+        daily_run._reset_pm_max_reasoning_effort()
+
+
+def test_ensure_pm_max_reasoning_effort_restores_on_exception():
+    import daily_run
+    import tradingagents.graph.setup as setup_mod
+
+    cfg = {"pm_reasoning_effort": "max", "llm_provider": "openrouter",
+           "deep_think_llm": "deepseek/deepseek-v4.1-flash"}
+    daily_run._reset_pm_max_reasoning_effort()
+    try:
+        daily_run._ensure_pm_max_reasoning_effort(cfg)
+
+        class _BoomLLM(_EffortRecordingLLM):
+            def invoke(self, *a, **kw):
+                super().invoke(*a, **kw)
+                raise RuntimeError("boom")
+
+        llm = _BoomLLM()
+        node = setup_mod.create_portfolio_manager(llm)
+        state = _tail_state()
+        with pytest.raises(Exception):  # noqa: B017 - free-text path re-raises
+            node(state)
+        assert llm.extra_body is None  # restored despite the raise
+    finally:
+        daily_run._reset_pm_max_reasoning_effort()
+
+
+def test_ensure_pm_max_reasoning_effort_noop_when_unset():
+    """No config key -> the reasoning-effort wrap is never installed."""
+    import daily_run
+
+    daily_run._reset_pm_max_reasoning_effort()
+    cfg = {"llm_provider": "openrouter",
+           "deep_think_llm": "deepseek/deepseek-v4.1-flash"}
+    daily_run._ensure_pm_max_reasoning_effort(cfg)
+    assert daily_run._PM_MAX_REASONING_EFFORT_PATCHED is False
+    daily_run._reset_pm_max_reasoning_effort()
+
+
+def test_ensure_pm_max_reasoning_effort_noop_for_non_deepseek_model():
+    """Only verified live for deepseek/ on openrouter -- a different model
+    must not silently receive an untested extra_body injection."""
+    import daily_run
+
+    daily_run._reset_pm_max_reasoning_effort()
+    cfg = {"pm_reasoning_effort": "max", "llm_provider": "openrouter",
+           "deep_think_llm": "openai/gpt-5.6"}
+    daily_run._ensure_pm_max_reasoning_effort(cfg)
+    assert daily_run._PM_MAX_REASONING_EFFORT_PATCHED is False
+    daily_run._reset_pm_max_reasoning_effort()
+
+
 # --- structured-output fallback visibility + safety (F3) ---------------------
 
 def test_extract_rating_passes_review_through():
