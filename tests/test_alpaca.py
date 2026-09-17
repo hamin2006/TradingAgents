@@ -76,6 +76,72 @@ def test_place_buy_uses_limit_at_protection_price(broker):
                           "filled": 10, "avg_price": 101.5}
 
 
+def test_buy_stop_attach_retries_through_wash_trade_rejection(broker):
+    """2026-09-17 live: RVTY's filled first BUY tranche's stop attach was
+    rejected 'potential wash trade detected... opposite side limit order
+    exists' because a second, still-open same-symbol BUY tranche was resting
+    concurrently in the same batch. The stop attach must retry through the
+    held_for_orders-aware helper (same as the SELL remainder path) instead
+    of a single unguarded submit_order call."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "filled"
+    entry.filled_qty = "1"
+    entry.filled_avg_price = "147.72"
+    stop = MagicMock()
+    stop.id = "stop-1"
+    mock_client.submit_order.side_effect = [
+        entry,
+        Exception('{"code":40310000,"message":"potential wash trade '
+                  'detected. use complex orders","reject_reason":"opposite '
+                  'side limit order exists. use complex/limit/stop_limit '
+                  'orders"}'),
+        stop]
+    mock_client.get_order_by_id.return_value = entry
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="RVTY", qty="1")]
+    with patch("alpaca_broker.time.sleep"):
+        reports = b.place_market_orders(
+            [Order(ticker="RVTY", action="BUY", shares=1, reason="pm-execution",
+                   protection_price=153.02, stop_price=134.07)])
+    stop_requests = [c[0][0] for c in mock_client.submit_order.call_args_list
+                     if c[0][0].type.value == "stop"]
+    assert len(stop_requests) == 2  # rejected attempt + successful retry
+    assert stop_requests[-1].symbol == "RVTY"
+    assert stop_requests[-1].stop_price == 134.07
+    assert reports[0]["filled"] == 1
+    assert "RVTY" not in b._naked_remainder_tickers  # recovered, no resweep needed
+
+
+def test_buy_stop_attach_exhaustion_is_tracked_for_resweep(broker):
+    """A BUY stop attach that never succeeds must not be silently swallowed
+    by the outer per-order exception handler — it has to land in the same
+    naked-remainder tracking the resweep pass scans, or the position stays
+    unprotected for the rest of the day with no same-run recovery."""
+    b, mock_client, _ = broker
+    entry = MagicMock()
+    entry.id = "order-1"
+    entry.status = "filled"
+    entry.filled_qty = "1"
+    entry.filled_avg_price = "147.72"
+    mock_client.submit_order.side_effect = [
+        entry,
+        Exception('{"code":40310000,"message":"potential wash trade '
+                  'detected"}'),
+    ] + [Exception("still rejected")] * 10
+    mock_client.get_order_by_id.return_value = entry
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="RVTY", qty="1")]
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.AlpacaBroker._remainder_retry_deadline_s",
+               return_value=0.0):
+        b.place_market_orders(
+            [Order(ticker="RVTY", action="BUY", shares=1, reason="pm-execution",
+                   protection_price=153.02, stop_price=134.07)])
+    assert "RVTY" in b._naked_remainder_tickers
+
+
 def test_place_sell_uses_market_order(broker):
     b, mock_client, _ = broker
     submitted = MagicMock()
@@ -513,7 +579,7 @@ def test_multi_order_submitted_then_polled_concurrently(broker):
     order_b = MagicMock()
     order_b.id = "ord-B"
     order_b.status = "new"
-    mock_client.submit_order.side_effect = [order_a, order_b]
+    mock_client.submit_order.side_effect = [order_a, order_b, MagicMock(id="stop-a")]
     new_a = MagicMock(status="new", filled_qty="", filled_avg_price="")
     filled_a = MagicMock(status="filled", filled_qty="3",
                          filled_avg_price="214.85")

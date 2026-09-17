@@ -224,8 +224,12 @@ class AlpacaBroker:
 
         2026-09-14/15: HPQ exhausted the remainder-stop retry deadline and
         stayed naked for hours (recoverable only by next morning's stop
-        sweep or a manual fix). Other orders in the SAME batch cancelling
-        or filling around the same time are a plausible contributor to the
+        sweep or a manual fix). 2026-09-17: RVTY's fresh BUY-entry stop
+        attach hit the identical class of same-symbol collision (a wash-
+        trade rejection from a second, still-open BUY tranche on the same
+        ticker) and is now tracked the same way. Other orders in the SAME
+        batch cancelling or filling around the same time are a plausible
+        contributor to the
         held_for_orders contention that caused the exhaustion — checking
         again after the whole batch has settled, rather than only inside
         each order's own finalize step, gives the race more real-world time
@@ -252,7 +256,7 @@ class AlpacaBroker:
             logger.warning("resweep skipped (protection snapshot: %s)", exc)
             return
         stop_by_ticker = {o.ticker: o.stop_price for o in orders
-                          if o.action == "SELL" and o.stop_price is not None}
+                          if o.stop_price is not None}
         for ticker in sorted(naked):
             if resting.get(ticker):
                 continue  # already protected (a later attempt succeeded)
@@ -407,15 +411,40 @@ class AlpacaBroker:
                         # Two-step: attach the GTC stop-loss only once the entry
                         # filled, so the position is protected 24/7 between runs.
                         # Sized to the FILLED qty — never the intended qty (a
-                        # partial fill must not over-size the stop).
-                        stop_request = StopOrderRequest(
-                            symbol=o.ticker, qty=filled, side=OrderSide.SELL,
-                            type=OrderType.STOP, stop_price=o.stop_price,
-                            time_in_force=TimeInForce.GTC, extended_hours=False,
-                        )
-                        self._client.submit_order(stop_request)
-                        logger.info("attached GTC stop %s for %s (%d shares)",
-                                    o.stop_price, o.ticker, filled)
+                        # partial fill must not over-size the stop). Routed
+                        # through the shared held_for_orders-aware retry:
+                        # 2026-09-17 live, RVTY's stop attach was rejected
+                        # "potential wash trade detected... opposite side
+                        # limit order exists" because a second, still-open
+                        # same-symbol BUY tranche was resting concurrently in
+                        # the same batch — the old unguarded single submit
+                        # left the fresh position naked for the rest of the
+                        # day with no resweep coverage (the outer per-order
+                        # exception handler swallowed it silently).
+                        stop_qty = filled
+                        stop_symbol = o.ticker
+                        stop_price = o.stop_price
+
+                        def submit_stop(symbol=stop_symbol, qty=stop_qty,
+                                        price=stop_price):
+                            self._client.submit_order(StopOrderRequest(
+                                symbol=symbol, qty=qty, side=OrderSide.SELL,
+                                type=OrderType.STOP, stop_price=price,
+                                time_in_force=TimeInForce.GTC, extended_hours=False,
+                            ))
+                            return True
+
+                        result = self._retry_until_available(
+                            stop_symbol, submit_stop,
+                            self._remainder_retry_deadline_s())
+                        if result:
+                            logger.info("attached GTC stop %s for %s (%d shares)",
+                                        o.stop_price, o.ticker, filled)
+                        else:
+                            logger.error(
+                                "entry stop for %s NOT attached after retries "
+                                "— position unprotected", o.ticker)
+                            self._naked_remainder_tickers.add(o.ticker)
 
                 # Sell-resume completion: one bounded resume of the
                 # remainder so the PM's stated quantity is actually
