@@ -95,6 +95,39 @@ class _NothingToProtect(Exception):
     submitting nothing (would otherwise risk shorting the account)."""
 
 
+def _market_price_too_high(exc: Exception) -> float | None:
+    """Parse Alpaca's 'stop price must be less than current price'
+    rejection and return the live market price it reported.
+
+    MPC 2026-09-22 live: a held ticker's original stop is disarmed
+    pre-open, its sell never fills (the same limit-floor-miss class as
+    HPQ/VLO/RVTY), and the remainder-stop re-anchor tries the ORIGINAL,
+    now-stale stop level while the stock has since traded below it.
+    Alpaca refuses a SELL stop at/above the current price outright (it
+    would fire immediately at a guaranteed loss) -- code 42210000, and
+    the message shape carries the exact market_price needed to compute a
+    valid replacement. Returns None when the shape doesn't match (a
+    different rejection entirely, e.g. held_for_orders).
+    """
+    try:
+        payload = json.loads(str(exc))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if "held_for_orders" in payload:
+        return None  # a different, already-classified race
+    if payload.get("code") != 42210000:
+        return None
+    if "stop price must be less than current price" not in str(
+            payload.get("message", "")):
+        return None
+    try:
+        return float(payload["market_price"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
 def _filled_qty(status) -> int:
     """Order.filled_qty is a str ('' until fills land). Only str values are
     real (test fakes without the attribute auto-create MagicMock children,
@@ -752,19 +785,33 @@ class AlpacaBroker:
     def place_oco(self, symbol: str, qty: int, stop_px: float,
                   target_px: float) -> str:
         """Place a GTC sell OCO, sized from the live position on each retry."""
+        state = {"stop_px": stop_px, "reanchored": False}
+
         def submit():
             remain = self._position_qty(symbol)
             if remain < 1:
                 raise _NothingToProtect(symbol)
-            submitted = self._client.submit_order(LimitOrderRequest(
-                symbol=symbol, qty=remain, side=OrderSide.SELL,
-                type=OrderType.LIMIT, limit_price=target_px,
-                order_class=OrderClass.OCO,
-                take_profit=TakeProfitRequest(limit_price=target_px),
-                stop_loss=StopLossRequest(stop_price=stop_px),
-                time_in_force=TimeInForce.GTC, extended_hours=False,
-            ))
-            return str(submitted.id)
+            try:
+                submitted = self._client.submit_order(LimitOrderRequest(
+                    symbol=symbol, qty=remain, side=OrderSide.SELL,
+                    type=OrderType.LIMIT, limit_price=target_px,
+                    order_class=OrderClass.OCO,
+                    take_profit=TakeProfitRequest(limit_price=target_px),
+                    stop_loss=StopLossRequest(stop_price=state["stop_px"]),
+                    time_in_force=TimeInForce.GTC, extended_hours=False,
+                ))
+                return str(submitted.id)
+            except Exception as exc:  # noqa: BLE001 — reanchor-classified below
+                market_price = _market_price_too_high(exc)
+                if market_price is None or state["reanchored"]:
+                    raise  # not this rejection, or already used the one shot
+                state["reanchored"] = True
+                state["stop_px"] = self._reanchored_stop_price(market_price)
+                logger.warning(
+                    "%s OCO stop leg %.2f rejected (market now %.2f) — "
+                    "re-anchoring once to %.2f", symbol, stop_px,
+                    market_price, state["stop_px"])
+                raise
 
         try:
             result = self._retry_until_available(
@@ -781,6 +828,13 @@ class AlpacaBroker:
         2026-09-15-remainder-protection-retry-hardening-design.md)."""
         return float(self._cfg.get("remainder_protection_retry_s", 30.0))
 
+    def _reanchored_stop_price(self, market_price: float) -> float:
+        """Fresh stop level off a live market price, reusing the existing
+        stop_loss_pct convention (same formula _ensure_stop_sweep and the
+        two-step BUY entry path already use) -- no new sizing concept."""
+        stop_loss_pct = float(self._cfg.get("stop_loss_pct", 8.0))
+        return round(market_price * (1 - stop_loss_pct / 100), 2)
+
     def _submit_remainder_stop(self, symbol: str, qty: int,
                                stop_price: float) -> bool:
         """Submit the remainder GTC stop with a held_for_orders-aware retry.
@@ -792,17 +846,38 @@ class AlpacaBroker:
         between tries. Re-query the position per attempt and size to it;
         retry through the shared deadline-based helper. Returns True when a
         stop is resting.
+
+        MPC 2026-09-22 live: the original stop_price can go stale (the
+        stock traded below it while the sell that would have disarmed it
+        never filled) -- Alpaca rejects a SELL stop at/above the current
+        price outright. One corrective retry at a fresh price (market_price
+        * (1 - stop_loss_pct/100)) fires before giving up; never loops
+        re-anchoring more than once (would risk chasing a falling market).
         """
+        state = {"stop_price": stop_price, "reanchored": False}
+
         def submit():
             remain = self._position_qty(symbol)
             if remain < 1:
                 raise _NothingToProtect(symbol)
-            self._client.submit_order(StopOrderRequest(
-                symbol=symbol, qty=remain, side=OrderSide.SELL,
-                type=OrderType.STOP, stop_price=stop_price,
-                time_in_force=TimeInForce.GTC, extended_hours=False,
-            ))
-            return True
+            try:
+                self._client.submit_order(StopOrderRequest(
+                    symbol=symbol, qty=remain, side=OrderSide.SELL,
+                    type=OrderType.STOP, stop_price=state["stop_price"],
+                    time_in_force=TimeInForce.GTC, extended_hours=False,
+                ))
+                return True
+            except Exception as exc:  # noqa: BLE001 — reanchor-classified below
+                market_price = _market_price_too_high(exc)
+                if market_price is None or state["reanchored"]:
+                    raise  # not this rejection, or already used the one shot
+                state["reanchored"] = True
+                state["stop_price"] = self._reanchored_stop_price(market_price)
+                logger.warning(
+                    "%s remainder stop %.2f rejected (market now %.2f) — "
+                    "re-anchoring once to %.2f", symbol, stop_price,
+                    market_price, state["stop_price"])
+                raise
 
         try:
             result = self._retry_until_available(

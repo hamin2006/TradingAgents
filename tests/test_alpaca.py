@@ -1165,6 +1165,110 @@ def test_place_oco_uses_shared_retry_helper(broker):
     assert mock_client.submit_order.call_count == 5  # past the old 3-cap
 
 
+def test_market_price_too_high_parses_the_live_payload_shape():
+    from alpaca_broker import _market_price_too_high
+
+    exc = Exception('{"code":42210000,"market_price":"390.58",'
+                    '"message":"stop price must be less than current '
+                    'price","stop_price":"396"}')
+    assert _market_price_too_high(exc) == 390.58
+
+
+def test_market_price_too_high_returns_none_for_held_for_orders():
+    from alpaca_broker import _market_price_too_high
+
+    exc = Exception('{"code":40310000,"held_for_orders":"1",'
+                    '"available":"8","existing_qty":"9"}')
+    assert _market_price_too_high(exc) is None
+
+
+def test_market_price_too_high_returns_none_for_unrelated_error():
+    from alpaca_broker import _market_price_too_high
+
+    assert _market_price_too_high(Exception("connection reset")) is None
+
+
+def test_remainder_stop_reanchors_once_on_market_price_rejection(broker):
+    """MPC 2026-09-22 live: the sell was disarmed pre-open, never filled,
+    and the remainder-stop re-anchor tried the ORIGINAL stale $396 level
+    while the stock had already traded to ~$390 -- Alpaca rejects a stop
+    at/above the current price outright ('stop price must be less than
+    current price'), and the old code retried the identical invalid price
+    until it gave up, leaving the position naked. One corrective retry at
+    market_price * (1 - stop_loss_pct/100) must fire instead."""
+    b, mock_client, _ = broker
+    b._cfg["stop_loss_pct"] = 8.0
+    stop = MagicMock()
+    stop.id = "stop-1"
+    mock_client.submit_order.side_effect = [
+        Exception('{"code":42210000,"market_price":"390.58",'
+                  '"message":"stop price must be less than current '
+                  'price","stop_price":"396"}'),
+        stop]
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="MPC", qty="1")]
+    with patch("alpaca_broker.time.sleep"):
+        ok = b._submit_remainder_stop("MPC", 1, 396.0)
+    assert ok is True
+    assert mock_client.submit_order.call_count == 2
+    reanchored = mock_client.submit_order.call_args_list[1][0][0]
+    assert reanchored.stop_price == round(390.58 * 0.92, 2)
+
+
+def test_remainder_stop_gives_up_if_reanchor_also_rejected(broker):
+    """The corrective reanchor is a ONE-SHOT -- a second rejection must
+    never trigger a second re-anchor (which would risk chasing a falling
+    market); the outer unrecognized-error fallback budget still bounds
+    total attempts, so this eventually gives up loudly either way."""
+    b, mock_client, _ = broker
+    b._cfg["stop_loss_pct"] = 8.0
+    mock_client.submit_order.side_effect = [
+        Exception('{"code":42210000,"market_price":"390.58",'
+                  '"message":"stop price must be less than current '
+                  'price","stop_price":"396"}'),
+        Exception('{"code":42210000,"market_price":"385.00",'
+                  '"message":"stop price must be less than current '
+                  'price","stop_price":"359.33"}'),
+        Exception('{"code":42210000,"market_price":"380.00",'
+                  '"message":"stop price must be less than current '
+                  'price","stop_price":"359.33"}'),
+    ]
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="MPC", qty="1")]
+    with patch("alpaca_broker.time.sleep"):
+        ok = b._submit_remainder_stop("MPC", 1, 396.0)
+    assert ok is False
+    # exactly one reanchor happened (attempt 1 -> 2); every later attempt
+    # (including the outer fallback's own bound) reuses that SAME corrected
+    # price, never a second correction.
+    prices = [c[0][0].stop_price for c in mock_client.submit_order.call_args_list]
+    assert prices[0] == 396.0
+    assert all(p == round(390.58 * 0.92, 2) for p in prices[1:])
+
+
+def test_place_oco_reanchors_stop_leg_once_on_market_price_rejection(broker):
+    """The identical rejection shape can hit an OCO's stop leg; only the
+    stop leg's price is corrected, the take-profit leg is untouched."""
+    b, mock_client, _ = broker
+    b._cfg["stop_loss_pct"] = 8.0
+    oco = MagicMock()
+    oco.id = "oco-1"
+    mock_client.submit_order.side_effect = [
+        Exception('{"code":42210000,"market_price":"390.58",'
+                  '"message":"stop price must be less than current '
+                  'price","stop_price":"396"}'),
+        oco]
+    mock_client.get_all_positions.return_value = [
+        MagicMock(symbol="MPC", qty="1")]
+    with patch("alpaca_broker.time.sleep"):
+        order_id = b.place_oco("MPC", 1, 396.0, 450.0)
+    assert order_id == "oco-1"
+    assert mock_client.submit_order.call_count == 2
+    reanchored = mock_client.submit_order.call_args_list[1][0][0]
+    assert reanchored.stop_loss.stop_price == round(390.58 * 0.92, 2)
+    assert reanchored.take_profit.limit_price == 450.0  # unchanged
+
+
 def test_remainder_stop_stops_retrying_when_position_gone(broker):
     """If the position empties between retries there is nothing to
     protect — stop retrying, place nothing (would short the account)."""
