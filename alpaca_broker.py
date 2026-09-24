@@ -128,6 +128,30 @@ def _market_price_too_high(exc: Exception) -> float | None:
         return None
 
 
+def _is_wash_trade_race(exc: Exception) -> bool:
+    """Recognize Alpaca's wash-trade rejection as a retriable race, the
+    same category as held_for_orders.
+
+    ILMN 2026-09-24 live: the fresh BUY entry-stop attach (routed through
+    _retry_until_available since the 2026-09-17 RVTY fix) hit this
+    rejection and exhausted the SHORT 3-attempt/6s unrecognized-error
+    fallback while a sibling same-symbol order was still resting -- the
+    fix retries, but not long enough, because this shape isn't recognized
+    as "wait, this resolves on its own" the way held_for_orders is. code
+    40310000 is reused by held_for_orders too, so the message text (not
+    the code alone) disambiguates which race this is.
+    """
+    try:
+        payload = json.loads(str(exc))
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("code") != 40310000:
+        return False
+    return "wash trade" in str(payload.get("message", "")).lower()
+
+
 def _filled_qty(status) -> int:
     """Order.filled_qty is a str ('' until fills land). Only str values are
     real (test fakes without the attribute auto-create MagicMock children,
@@ -734,17 +758,24 @@ class AlpacaBroker:
         return cancelled
 
     def _retry_until_available(self, symbol: str, submit_fn, deadline_s: float):
-        """Retry a submit callable through Alpaca's held_for_orders race.
+        """Retry a submit callable through Alpaca's held_for_orders /
+        wash-trade races.
 
         2026-09-15: HPQ/AMD/DELL/VLO/ZBRA all hit held_for_orders rejections
         in one run; the old fixed 3-attempt/6s budget exhausted on HPQ three
         separate times, leaving it naked for hours. This retries against a
-        wall-clock deadline instead of a fixed count — the rejection payload
-        already carries the exact reservation count, so a recognized race
-        keeps retrying as long as time remains, closing the same-day gap
-        the old budget could not. An unrecognized error (not this race)
-        falls back to a small fixed number of attempts instead of burning
-        the full deadline on an unrelated failure.
+        wall-clock deadline instead of a fixed count — the held_for_orders
+        rejection payload carries the exact reservation count, so a
+        recognized race keeps retrying as long as time remains, closing
+        the same-day gap the old budget could not. 2026-09-24: the
+        wash-trade rejection ("opposite side limit order exists" — a
+        resting sibling order blocking a stop attach, ILMN live) joins the
+        same deadline-based bucket instead of the short fallback; it
+        exhausted that fallback even though the 2026-09-17 fix already
+        routes the BUY entry-stop path through this helper. An
+        unrecognized error (neither race) falls back to a small fixed
+        number of attempts instead of burning the full deadline on an
+        unrelated failure.
 
         Returns the submit_fn result, or None if the deadline/fallback
         budget is exhausted. Never raises for a recognized or unrecognized
@@ -760,15 +791,20 @@ class AlpacaBroker:
                 raise  # propagate immediately, never retried
             except Exception as exc:  # noqa: BLE001 — race-classified below
                 held = _held_for_orders(exc)
-                if held is None:
+                wash_trade = held is None and _is_wash_trade_race(exc)
+                if held is None and not wash_trade:
                     logger.warning("%s attempt %d failed (unrecognized): %s",
                                    symbol, attempt, exc)
                     if attempt >= _UNRECOGNIZED_ERROR_ATTEMPTS:
                         return None
                     time.sleep(_RETRY_POLL_INTERVAL_S)
                     continue
-                logger.warning("%s attempt %d failed (held_for_orders=%d): %s",
-                               symbol, attempt, held, exc)
+                if wash_trade:
+                    logger.warning("%s attempt %d failed (wash_trade_race): %s",
+                                   symbol, attempt, exc)
+                else:
+                    logger.warning("%s attempt %d failed (held_for_orders=%d): %s",
+                                   symbol, attempt, held, exc)
                 # Deadline clock starts on the first failure, not before the
                 # first attempt — an immediately-successful submit (the
                 # common case) never touches the clock.

@@ -1093,6 +1093,82 @@ def test_retry_until_available_outlasts_held_for_orders_past_old_budget(broker):
     assert mock_client.submit_order.call_count == 6
 
 
+def test_is_wash_trade_race_parses_the_live_payload_shape():
+    from alpaca_broker import _is_wash_trade_race
+
+    exc = Exception('{"code":40310000,"existing_order_id":'
+                    '"ca7571be-1423-4a31-884b-505800e0f72c",'
+                    '"message":"potential wash trade detected. use '
+                    'complex orders","reject_reason":"opposite side '
+                    'limit order exists. use complex/limit/stop_limit '
+                    'orders"}')
+    assert _is_wash_trade_race(exc) is True
+
+
+def test_is_wash_trade_race_false_for_held_for_orders():
+    from alpaca_broker import _is_wash_trade_race
+
+    exc = Exception('{"code":40310000,"held_for_orders":"1",'
+                    '"available":"8","existing_qty":"9"}')
+    assert _is_wash_trade_race(exc) is False
+
+
+def test_is_wash_trade_race_false_for_market_price_too_high():
+    from alpaca_broker import _is_wash_trade_race
+
+    exc = Exception('{"code":42210000,"market_price":"390.58",'
+                    '"message":"stop price must be less than current '
+                    'price","stop_price":"396"}')
+    assert _is_wash_trade_race(exc) is False
+
+
+def test_is_wash_trade_race_false_for_unrelated_error():
+    from alpaca_broker import _is_wash_trade_race
+
+    assert _is_wash_trade_race(Exception("connection reset")) is False
+
+
+def test_retry_until_available_outlasts_wash_trade_past_old_budget(broker):
+    """ILMN 2026-09-24: the fresh BUY entry-stop attach exhausted the old
+    3-attempt/6s unrecognized-error fallback while a sibling same-symbol
+    order was still resting, and stayed naked. The wash-trade rejection
+    must now qualify for the same deadline-based retry as
+    held_for_orders, not the short fallback."""
+    b, mock_client, _ = broker
+    ok_result = MagicMock()
+    # 5 rejections (more than the old 3-attempt cap), then success.
+    mock_client.submit_order.side_effect = (
+        [Exception('{"code":40310000,"existing_order_id":"ca7571be",'
+                   '"message":"potential wash trade detected. use '
+                   'complex orders"}')] * 5
+        + [ok_result])
+    ticks = iter([0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        result = b._retry_until_available(
+            "ILMN", lambda: mock_client.submit_order(MagicMock()),
+            deadline_s=30.0)
+    assert result is ok_result
+    assert mock_client.submit_order.call_count == 6  # past the old 3-cap
+
+
+def test_retry_until_available_still_bounded_on_persistent_wash_trade(broker):
+    """A wash-trade rejection that never clears still gives up loudly once
+    the deadline elapses -- widening the classification doesn't remove
+    the bound."""
+    b, mock_client, _ = broker
+    mock_client.submit_order.side_effect = Exception(
+        '{"code":40310000,"existing_order_id":"ca7571be",'
+        '"message":"potential wash trade detected. use complex orders"}')
+    ticks = iter([0.0, 2.0, 4.0, 30.0, 32.0])
+    with patch("alpaca_broker.time.sleep"), \
+         patch("alpaca_broker.time.monotonic", side_effect=lambda: next(ticks)):
+        result = b._retry_until_available(
+            "ILMN", lambda: mock_client.submit_order(MagicMock()),
+            deadline_s=30.0)
+    assert result is None
+
+
 def test_retry_until_available_gives_up_at_deadline(broker):
     """Persistent held_for_orders past the deadline: bounded give-up, no
     hang, no raise — caller decides how to log/react."""
